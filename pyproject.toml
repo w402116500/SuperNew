@@ -1,0 +1,41 @@
+[project]
+name = "ai-customer-service"
+version = "0.1.0"
+description = "基于知识库的 AI 客服"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn>=0.30.0",
+  "python-dotenv>=1.0.1",
+  "python-multipart>=0.0.9",
+  "pydantic>=2.8.0",
+  "requests>=2.32.0",
+  "sqlalchemy>=2.0.36",
+  "psycopg2-binary>=2.9.10",
+  "redis>=5.2.1",
+  "passlib[bcrypt]>=1.7.4",
+  "python-jose[cryptography]>=3.3.0",
+  "langchain>=0.2.14",
+  "langchain-core>=0.2.37",
+  "langchain-community>=0.2.12",
+  "langchain-text-splitters>=0.2.2",
+  "langchain-huggingface>=0.1.0",
+  "langchain-openai>=0.1.22",
+  "langgraph>=0.2.31",
+  "sentence-transformers>=3.0.0",
+  "pymilvus>=2.5.0",
+  "pypdf>=4.3.1",
+  "docx2txt>=0.8",
+  "unstructured",
+  "openpyxl",
+  "tabulate",
+  "msoffcrypto-tool",
+  "beautifulsoup4>=4.12.0",
+  "rich>=14.2.0",
+  "field>=0.2.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
+exclude = ["frontend*", "tests*"]

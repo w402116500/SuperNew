@@ -1,0 +1,13 @@
+{
+  "cases": 12,
+  "successful_cases": 12,
+  "failed_cases": 0,
+  "all_expected_docs_recalled": 12,
+  "all_expected_docs_recall_rate": 1.0,
+  "first_expected_doc_at_1": 10,
+  "all_expected_docs_at_2": 11,
+  "all_expected_docs_at_3": 12,
+  "average_elapsed_seconds": 26.674,
+  "output": "E:\\mystudy\\agent_study\\SuperMew\\output\\rag-evaluations\\baseline-20260811-114900.jsonl",
+  "summary_output": "E:\\mystudy\\agent_study\\SuperMew\\output\\rag-evaluations\\baseline-20260811-114900.summary.json"
+}
