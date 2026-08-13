@@ -1,4 +1,5 @@
 import os
+import shutil
 from pathlib import Path
 
 from backend.indexing import (
@@ -7,26 +8,39 @@ from backend.indexing import (
     ParentChunkStore,
     embedding_service,
 )
+from backend.indexing.ingestion import DocumentIngestionService
 from backend.indexing.milvus_client import get_milvus_store
+from backend.indexing.mineru_client import MineruClient
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR.parent / "data"
 UPLOAD_DIR = DATA_DIR / "documents"
+PARSED_ARTIFACT_DIR = DATA_DIR / "parsed"
+STAGING_DIR = DATA_DIR / ".staging"
 
 # 路由复用同一组 loader、父块仓库和 Milvus 资源，上传与删除不会各自创建不同状态。
 loader = DocumentLoader()
 parent_chunk_store = ParentChunkStore()
 milvus_manager = get_milvus_store()
 milvus_writer = MilvusWriter(embedding_service=embedding_service, milvus_manager=milvus_manager)
+mineru_client = MineruClient()
+ingestion_service = DocumentIngestionService(loader, mineru_client)
 
 
-def delete_document_transactionally(filename: str, job_manager=None, job_id=None) -> int:
+def delete_document_transactionally(
+    filename: str,
+    job_manager=None,
+    job_id=None,
+    *,
+    delete_local_files: bool = True,
+) -> int:
     """
     一致性且事务性地删除文档的所有关联数据（Milvus 2.5+ 新版由服务端自动维护 BM25 索引统计）。
     包含以下步骤：
     1. 初始化 Milvus 集合。
     2. 删除 Milvus 向量数据。
     3. 删除 PostgreSQL 中的 L1/L2 父级分块以及对应的 Redis 缓存。
+    4. 可选地删除原始文件和 MinerU 解析产物包。
     """
     if job_manager and job_id:
         job_manager.update_step(job_id, "prepare", 50, "running", "正在初始化 Milvus 集合")
@@ -69,6 +83,9 @@ def delete_document_transactionally(filename: str, job_manager=None, job_id=None
     if job_manager and job_id:
         job_manager.complete_step(job_id, "parent_store", "父级分块及 Redis 缓存已清空")
 
+    if delete_local_files:
+        remove_document_files(filename)
+
     return chunks_deleted
 
 
@@ -83,4 +100,58 @@ async def save_upload_file(file, file_path: Path) -> None:
 
 
 def ensure_upload_dir() -> None:
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    for directory in (UPLOAD_DIR, PARSED_ARTIFACT_DIR, STAGING_DIR):
+        os.makedirs(directory, exist_ok=True)
+
+
+def source_path_for(filename: str) -> Path:
+    return UPLOAD_DIR / filename
+
+
+def artifact_dir_for(filename: str) -> Path:
+    return PARSED_ARTIFACT_DIR / f"{filename}.mineru"
+
+
+def create_staging_dir(job_id: str) -> Path:
+    ensure_upload_dir()
+    staging_dir = STAGING_DIR / job_id
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    return staging_dir
+
+
+def cleanup_staging_dir(staging_dir: str | Path) -> None:
+    shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def remove_document_files(filename: str) -> None:
+    source_path = source_path_for(filename)
+    artifact_dir = artifact_dir_for(filename)
+    if source_path.exists():
+        source_path.unlink()
+    if artifact_dir.exists():
+        shutil.rmtree(artifact_dir)
+
+
+def promote_staged_document(staging_dir: str | Path, filename: str, has_artifact_bundle: bool) -> Path:
+    """Move a validated staged source and optional MinerU bundle into active storage."""
+    staging_root = Path(staging_dir)
+    staged_source = staging_root / filename
+    if not staged_source.is_file():
+        raise RuntimeError(f"暂存原文件不存在: {staged_source}")
+
+    source_path = source_path_for(filename)
+    artifact_dir = artifact_dir_for(filename)
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    if source_path.exists():
+        source_path.unlink()
+    shutil.move(str(staged_source), str(source_path))
+
+    if has_artifact_bundle:
+        staged_artifact_dir = staging_root / "parsed"
+        if not staged_artifact_dir.is_dir():
+            raise RuntimeError("暂存 MinerU 产物不存在")
+        if artifact_dir.exists():
+            shutil.rmtree(artifact_dir)
+        artifact_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(staged_artifact_dir), str(artifact_dir))
+    return source_path

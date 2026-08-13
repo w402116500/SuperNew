@@ -28,8 +28,9 @@ JobStatus = Literal["pending", "running", "completed", "failed"]
 # 上传任务默认步骤。每项是 (内部 key, 前端显示标签)。
 DEFAULT_STEPS = [
     ("upload", "文档上传"),
-    ("cleanup", "清理旧版本"),
-    ("parse", "解析与分块"),
+    ("mineru", "MinerU 转 Markdown"),
+    ("chunk", "Markdown 三级分块"),
+    ("cleanup", "替换旧版本"),
     ("parent_store", "父级分块入库"),
     ("vector_store", "向量化入库"),
 ]

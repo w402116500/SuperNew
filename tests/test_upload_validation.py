@@ -9,11 +9,15 @@ class UploadValidationTests(unittest.TestCase):
     def test_markdown_and_text_extensions_are_supported(self):
         self.assertTrue(is_supported_document("商品参数.MD"))
         self.assertTrue(is_supported_document("店铺规则.txt"))
+        self.assertTrue(is_supported_document("产品介绍.pptx"))
+        self.assertTrue(is_supported_document("扫描件.png"))
         self.assertEqual(normalize_upload_filename(" vivo-y200.md "), "vivo-y200.md")
 
     def test_unsupported_extension_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Markdown"):
             normalize_upload_filename("evaluation.jsonl")
+        with self.assertRaisesRegex(ValueError, "Markdown"):
+            normalize_upload_filename("legacy.doc")
 
 
 if __name__ == "__main__":

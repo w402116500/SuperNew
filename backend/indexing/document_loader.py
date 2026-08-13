@@ -15,10 +15,10 @@ from types import SimpleNamespace
 # Dict、List 用于标注返回的文档块字典和列表类型。
 from typing import Dict, List
 
-# 这些 LangChain Loader 分别负责读取 Word、PDF、Excel 文件。
-from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader, UnstructuredExcelLoader
 # RecursiveCharacterTextSplitter 会尽量按自然分隔符切分长文本。
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from backend.indexing.document_types import NATIVE_TEXT_SUFFIXES, document_type_for_filename, is_rich_document
 
 # 编译需要移除的 C0 控制字符与 DEL（保留常规排版字：\t、\n、\r）。
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -317,13 +317,29 @@ class DocumentLoader:
         # 返回该页面或章节的所有层级块。
         return root_chunks
 
-    def _load_plain_text_document(self, file_path: str, filename: str, doc_type: str) -> list[dict]:
+    def _load_plain_text_document(
+        self,
+        file_path: str,
+        filename: str,
+        doc_type: str,
+        source_file_path: str | None = None,
+    ) -> list[dict]:
         """读取 Markdown/TXT 纯文本文件，并复用统一的三层分块流程。"""
         with open(file_path, "r", encoding="utf-8-sig") as file:
             text = file.read()
 
         raw_docs = [SimpleNamespace(page_content=text, metadata={"page": 0})]
-        return self._load_from_langchain_docs(raw_docs, file_path, filename, doc_type)
+        return self._load_from_langchain_docs(raw_docs, source_file_path or file_path, filename, doc_type)
+
+    def load_parsed_markdown(
+        self,
+        markdown_path: str,
+        filename: str,
+        source_file_path: str,
+        doc_type: str,
+    ) -> list[dict]:
+        """Load MinerU Markdown while retaining the original file as chunk metadata."""
+        return self._load_plain_text_document(markdown_path, filename, doc_type, source_file_path)
 
     # 不同 loader 的输出从这里进入同一套 metadata 和三级分块流程。
     def _load_from_langchain_docs(
@@ -381,7 +397,12 @@ class DocumentLoader:
             documents.extend(page_chunks)
         return documents
 
-    def load_document(self, file_path: str, filename: str) -> list[dict]:
+    def load_document(
+        self,
+        file_path: str,
+        filename: str,
+        source_file_path: str | None = None,
+    ) -> list[dict]:
         """根据文件扩展名选择解析器，加载一个文件并返回统一的三层块列表。
 
         Args:
@@ -392,52 +413,33 @@ class DocumentLoader:
             list[dict]: 该文件产生的所有 L1/L2/L3 文本块。
 
         Raises:
-            ValueError: 文件扩展名不属于当前支持的 PDF、Word、Excel、HTML、Markdown、TXT 类型。
+            ValueError: 文件扩展名不属于原生文本格式，或富文档绕过 MinerU。
             Exception: 底层 Loader 读取或解析文件失败。
         """
         # lower() 使扩展名判断不区分大小写，例如 .PDF 与 .pdf 都能识别。
         file_lower = filename.lower()
 
-        # 扩展名只负责选择解析器，解析完成后的数据结构保持一致。
-        if file_lower.endswith(".pdf"):
-            # PDF 文档使用 LangChain 的 PyPDFLoader。
-            doc_type = "PDF"
-            loader = PyPDFLoader(file_path)
-        elif file_lower.endswith((".docx", ".doc")):
-            # Word 文档使用基于 docx2txt 的加载器。
-            doc_type = "Word"
-            loader = Docx2txtLoader(file_path)
-        elif file_lower.endswith((".xlsx", ".xls")):
-            # Excel 工作簿使用 UnstructuredExcelLoader。
-            doc_type = "Excel"
-            loader = UnstructuredExcelLoader(file_path)
+        if is_rich_document(filename):
+            raise ValueError(f"富文档必须通过 MinerU 解析: {filename}")
+
+        if not file_lower.endswith(NATIVE_TEXT_SUFFIXES):
+            raise ValueError(f"不支持的文件类型: {filename}")
+
+        doc_type = document_type_for_filename(filename)
         # HTML 使用前面实现的语义清洗器，而不是通用文件 loader。
-        elif file_lower.endswith((".html", ".htm")):
-            doc_type = "HTML"
+        if file_lower.endswith((".html", ".htm")):
             # 延迟导入避免在非 HTML 场景加载 BeautifulSoup 相关模块，也避免潜在循环依赖。
             from backend.indexing.html_processor import load_html_for_document_loader
 
             # HTML 解析器已经返回 LangChain Document 列表，无需调用 loader.load()。
             raw_docs = load_html_for_document_loader(file_path, filename)
-            return self._load_from_langchain_docs(raw_docs, file_path, filename, doc_type)
-        elif file_lower.endswith(".md"):
-            doc_type = "Markdown"
-            return self._load_plain_text_document(file_path, filename, doc_type)
-        elif file_lower.endswith(".txt"):
-            doc_type = "Text"
-            return self._load_plain_text_document(file_path, filename, doc_type)
-        else:
-            # 目前没有相应解析器的扩展名直接提示调用方。
-            raise ValueError(f"不支持的文件类型: {filename}")
+            return self._load_from_langchain_docs(raw_docs, source_file_path or file_path, filename, doc_type)
+        if file_lower.endswith(".md"):
+            return self._load_plain_text_document(file_path, filename, doc_type, source_file_path)
+        if file_lower.endswith(".txt"):
+            return self._load_plain_text_document(file_path, filename, doc_type, source_file_path)
 
-        try:
-            # PDF、Word、Excel Loader 都通过 load() 返回 LangChain Document 列表。
-            raw_docs = loader.load()
-            return self._load_from_langchain_docs(raw_docs, file_path, filename, doc_type)
-        # 保留原异常作为 cause，并补充文件处理语境，排错时能同时看到两层信息。
-        except Exception as e:
-            # 使用 from e 保留底层异常链，便于定位是文件损坏还是 Loader 配置问题。
-            raise Exception(f"处理文档失败: {str(e)}") from e
+        raise ValueError(f"不支持的文件类型: {filename}")
 
     def load_documents_from_folder(self, folder_path: str) -> list[dict]:
         """遍历文件夹中支持的文件，逐个加载并合并全部文本块。
@@ -458,13 +460,7 @@ class DocumentLoader:
         for filename in os.listdir(folder_path):
             # 用小写副本判断扩展名，避免大小写差异导致文件漏处理。
             file_lower = filename.lower()
-            if not (
-                file_lower.endswith(".pdf")
-                or file_lower.endswith((".docx", ".doc"))
-                or file_lower.endswith((".xlsx", ".xls"))
-                or file_lower.endswith((".html", ".htm"))
-                or file_lower.endswith((".md", ".txt"))
-            ):
+            if not file_lower.endswith(NATIVE_TEXT_SUFFIXES):
                 # 扩展名不受支持时跳过该条目。
                 continue
 

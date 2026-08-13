@@ -3,19 +3,7 @@
 这里只验证客户端提交的“文件名”是否安全且受支持；不接受路径，也不负责读取文件内容。
 """
 
-# 元组保存允许上传的扩展名。元组不可修改，适合作为固定白名单常量。
-# 该白名单应与 DocumentLoader 实际支持的 PDF、Word、Excel、HTML、Markdown、TXT 格式保持一致。
-SUPPORTED_DOCUMENT_SUFFIXES = (
-    ".pdf",
-    ".docx",
-    ".doc",
-    ".xlsx",
-    ".xls",
-    ".html",
-    ".htm",
-    ".md",
-    ".txt",
-)
+from backend.indexing.document_types import SUPPORTED_DOCUMENT_SUFFIXES
 
 
 def is_supported_document(filename: str) -> bool:
@@ -65,6 +53,6 @@ def normalize_upload_filename(filename: str) -> str:
         raise ValueError("文件名包含非法控制字符")
     # 扩展名白名单与实际 loader 能力保持一致，避免上传后才发现无法解析。
     if not is_supported_document(candidate):
-        raise ValueError("仅支持 PDF、Word、Excel、HTML、Markdown 和 TXT 文档")
+        raise ValueError("仅支持 PDF、DOCX、PPTX、XLSX、图片、HTML、Markdown 和 TXT 文档")
     # 所有规则通过后，返回去除首尾空白后的安全文件名。
     return candidate

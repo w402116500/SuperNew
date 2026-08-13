@@ -8,7 +8,7 @@
 
 ## 项目能做什么
 
-- 支持上传 Markdown、PDF、Word、Excel、HTML、TXT 文档，异步完成解析和入库。
+- 支持上传 Markdown、TXT、HTML，以及 PDF、DOCX、PPTX、XLSX 和常见图片。富文档统一交给 MinerU 转为 Markdown 后再入库。
 - 使用三级分块保存长文档上下文：小块负责找得准，父块负责让回答看得全。
 - 同时使用语义检索和关键词检索，兼顾“意思相近”和“型号、容量、价格等词必须命中”的场景。
 - 对召回结果进行证据判断；资料不足时，最多执行一次查询改写后重新检索。
@@ -31,9 +31,10 @@ flowchart LR
     AGENT --> LLM["OpenAI 兼容模型服务"]
     API --> FE
 
-    ADMIN["管理员上传文档"] --> PARSE["解析和三级分块"]
-    PARSE --> PG
-    PARSE --> EMB["本地 Embedding 模型"]
+    ADMIN["管理员上传文档"] --> PARSE["MinerU / 原生解析 -> Markdown"]
+    PARSE --> CHUNK["三级分块"]
+    CHUNK --> PG
+    CHUNK --> EMB["本地 Embedding 模型"]
     EMB --> MV
 ```
 
@@ -44,6 +45,7 @@ flowchart LR
 | PostgreSQL | 用户、会话消息、L1/L2 父级分块。 |
 | Redis | 父级分块和会话相关缓存。 |
 | Milvus 2.5+ | L3 叶子块的稠密向量、原文和服务端 BM25 稀疏特征。 |
+| MinerU | 将 PDF、Office 文档和图片解析为 Markdown，并保留结构化清单与导出资源。 |
 | Hugging Face Embedding | 将 L3 叶子块和用户问题转为稠密向量；默认模型为 `BAAI/bge-m3`。 |
 | OpenAI 兼容模型服务 | 负责工具调用、复杂度判断、证据判断、查询改写和最终回答。 |
 
@@ -51,12 +53,14 @@ Docker Compose 会启动 PostgreSQL、Redis、etcd、MinIO、Milvus 和 Attu。A
 
 ## 文档如何入库
 
-上传一个文档后，后台会依次执行以下步骤：
+上传一个文档后，后台会先在临时目录完成解析和分块校验，再替换同名旧文档：
 
-1. 清理同名旧文档的索引，避免同一文件的新旧版本同时参与回答。
-2. 按文件类型提取正文，并切成三级关联文本块。
-3. 将 L1、L2 父级分块写入 PostgreSQL，同时尝试写入 Redis 缓存。
-4. 只为 L3 叶子分块生成稠密向量，并写入 Milvus；Milvus 根据原文自动生成 BM25 稀疏特征。
+1. 保存上传原文件到临时目录。PDF、DOCX、PPTX、XLSX、PNG、JPG、WEBP、BMP、TIFF 仅通过 MinerU 解析；Markdown、TXT、HTML 使用原生解析。
+2. 对富文档，MinerU 生成 `document.md`、`content_list.json`、解析配置和导出图片等资源；系统只把其中的 Markdown 作为三级分块输入。
+3. 解析和分块成功后，清理同名旧文档的 Milvus 向量、PostgreSQL 父块、原文件和旧解析产物，再将新的原文件与产物包提升到正式目录。
+4. 将 L1、L2 父级分块写入 PostgreSQL，同时尝试写入 Redis 缓存；只为 L3 叶子分块生成稠密向量，并写入 Milvus，Milvus 根据原文自动生成 BM25 稀疏特征。
+
+若 MinerU 转换或 Markdown 分块失败，上传任务会明确失败，旧文档不会被删除，也不会悄悄改用其他解析器。旧版 `.doc`、`.xls` 不支持，请先转换为 DOCX 或 XLSX。
 
 ### 三级分块与存储
 
@@ -108,6 +112,7 @@ flowchart TD
 - Node.js 20+ 与 npm。
 - 可用的 OpenAI 兼容模型服务。默认启动脚本会尝试启动 Ollama；也可以配置远程模型服务并在启动时跳过 Ollama。
 - 本地可用的 Embedding 模型缓存，或允许首次下载 `BAAI/bge-m3`。
+- 已部署并可访问的 MinerU Gradio 服务。启动脚本不会自动启动 MinerU；默认地址为 `http://127.0.0.1:7860`。
 
 ### 首次准备
 
@@ -137,9 +142,14 @@ JWT_SECRET_KEY=
 EMBEDDING_MODEL=BAAI/bge-m3
 EMBEDDING_DEVICE=cpu
 EMBEDDING_LOCAL_FILES_ONLY=true
+
+# MinerU 富文档解析服务
+MINERU_URL=http://127.0.0.1:7860
+MINERU_BACKEND=hybrid-engine
+MINERU_ENGINE_URL=http://localhost:30000
 ```
 
-可选配置包括 `RERANK_MODEL`、`RERANK_BINDING_HOST`、`RERANK_API_KEY`、`RETRIEVAL_TOP_K`、`AUTO_MERGE_THRESHOLD` 等。完整含义以对应后端源码中的默认值为准；不要在 README、截图或提交记录中暴露真实 API Key。
+可选配置包括 `MINERU_END_PAGES`、`MINERU_FORCE_OCR`、`MINERU_FORMULA_ENABLE`、`MINERU_TABLE_ENABLE`、`MINERU_IMAGE_ANALYSIS`、`MINERU_EFFORT`、`MINERU_LANGUAGE`、`RERANK_MODEL`、`RERANK_BINDING_HOST`、`RERANK_API_KEY`、`RETRIEVAL_TOP_K`、`AUTO_MERGE_THRESHOLD` 等。完整含义以对应后端源码中的默认值为准；不要在 README、截图或提交记录中暴露真实 API Key。
 
 ### 一键启动和停止
 
@@ -184,7 +194,7 @@ pwsh -NoLogo -NoProfile -File .\scripts\supermew.ps1 -Action start -NoOllama
 ## 使用方式
 
 1. 注册账号并登录。管理员账号可上传、删除和查看知识库文档。
-2. 在文档管理页面上传店铺资料，等待后台任务显示解析、父块入库和向量化入库完成。
+2. 在文档管理页面上传店铺资料。富文档会依次显示 MinerU 转换、三级分块、旧数据清理、父块入库和向量化入库进度。
 3. 在聊天页提问，例如“X200 Pro 的卫星通信能力是什么？”或“Y200 和 S19 的前置相机分别是多少？”。
 4. 在回答下方查看引用来源和 RAG 过程：召回了哪些资料、候选数量、是否精排、证据判断结果，以及是否发生过改写检索。
 5. 生成过程中可以停止回答；对话记录会按用户隔离保存，较长历史会被压缩成会话笔记以控制上下文长度。
@@ -271,6 +281,7 @@ uv run python .\scripts\run_rag_baseline.py `
 │   └── tools/                       # 知识库检索和天气工具示例
 ├── frontend/                        # Vue 3 前端
 ├── data/rag-samples/vivo-store-v1/  # vivo 示例语料与固定评测题
+├── data/parsed/                     # MinerU 解析产物包（运行时生成，不提交）
 ├── docs/                            # 评测记录与项目文档
 ├── output/rag-evaluations/          # 评测原始结果和报告
 ├── scripts/                         # 启停与评测脚本

@@ -23,8 +23,9 @@ const createUploadJob = (overrides: Record<string, any> = {}) => ({
   message: '正在向量化入库：450 / 770',
   steps: [
     { key: 'upload', label: '文档上传', percent: 100, status: 'completed', message: '文档上传完成' },
-    { key: 'cleanup', label: '清理旧版本', percent: 100, status: 'completed', message: '清理完成' },
-    { key: 'parse', label: '解析与分块', percent: 100, status: 'completed', message: '解析完成' },
+    { key: 'mineru', label: 'MinerU 转 Markdown', percent: 100, status: 'completed', message: '转换完成' },
+    { key: 'chunk', label: 'Markdown 三级分块', percent: 100, status: 'completed', message: '分块完成' },
+    { key: 'cleanup', label: '替换旧版本', percent: 100, status: 'completed', message: '替换完成' },
     { key: 'parent_store', label: '父级分块入库', percent: 100, status: 'completed', message: '父级分块入库完成' },
     { key: 'vector_store', label: '向量化入库', percent: 58, status: 'running', message: '450 / 770' },
   ],
@@ -63,7 +64,7 @@ describe('document upload polling', () => {
       status: 'completed',
       message: '文档处理完成',
       steps: [
-        ...runningJob.steps.slice(0, 4),
+        ...runningJob.steps.slice(0, 5),
         { key: 'vector_store', label: '向量化入库', percent: 100, status: 'completed', message: '770 / 770' },
       ],
     });

@@ -8,6 +8,7 @@
 from backend.indexing.document_loader import DocumentLoader
 # EmbeddingService 是嵌入服务类；embedding_service 是全进程复用的默认模型实例。
 from backend.indexing.embedding import EmbeddingService, embedding_service
+from backend.indexing.ingestion import DocumentIngestionService, PreparedDocument
 # MilvusWriter：将文本块向量化后批量写入 Milvus。
 from backend.indexing.milvus_writer import MilvusWriter
 # ParentChunkStore：将 L1/L2 父块保存到 PostgreSQL，并使用 Redis 缓存读取结果。
@@ -17,7 +18,9 @@ from backend.indexing.parent_chunk_store import ParentChunkStore
 __all__ = [
     "DocumentLoader",
     "EmbeddingService",
+    "DocumentIngestionService",
     "MilvusWriter",
     "ParentChunkStore",
+    "PreparedDocument",
     "embedding_service",
 ]

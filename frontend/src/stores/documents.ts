@@ -22,8 +22,9 @@ export const useDocumentStore = defineStore('documents', {
     createUploadSteps(): UploadStep[] {
       return [
         { key: 'upload', label: '文档上传', percent: 0, status: 'pending', message: '' },
-        { key: 'cleanup', label: '清理旧版本', percent: 0, status: 'pending', message: '' },
-        { key: 'parse', label: '解析与分块', percent: 0, status: 'pending', message: '' },
+        { key: 'mineru', label: 'MinerU 转 Markdown', percent: 0, status: 'pending', message: '' },
+        { key: 'chunk', label: 'Markdown 三级分块', percent: 0, status: 'pending', message: '' },
+        { key: 'cleanup', label: '替换旧版本', percent: 0, status: 'pending', message: '' },
         { key: 'parent_store', label: '父级分块入库', percent: 0, status: 'pending', message: '' },
         { key: 'vector_store', label: '向量化入库', percent: 0, status: 'pending', message: '' },
       ];
