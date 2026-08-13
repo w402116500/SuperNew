@@ -55,6 +55,7 @@ def _process_upload_job(job_id: str, staging_dir: str, filename: str) -> None:
             lambda step, percent, message: _prepare_progress(job_id, step, percent, message),
         )
 
+        # 先验证新版本再删除旧索引，确保 MinerU 或 Markdown 处理失败不会影响线上文档。
         failed_step = "cleanup"
         upload_job_manager.update_step(job_id, "cleanup", 10, "running", "新版本已验证，正在清理旧版本")
         delete_document_transactionally(filename)
@@ -62,6 +63,7 @@ def _process_upload_job(job_id: str, staging_dir: str, filename: str) -> None:
         promote_staged_document(staging_dir, filename, prepared.artifact_bundle is not None)
         upload_job_manager.complete_step(job_id, "cleanup", "旧版本已替换，新版本已启用")
 
+        # 父块先落 PostgreSQL，叶子向量随后写入 Milvus，保持 Auto-merging 所需的父子链路。
         failed_step = "parent_store"
         upload_job_manager.update_step(job_id, "parent_store", 20, "running", "正在写入父级分块")
         parent_chunk_store.upsert_documents(prepared.parent_chunks)
@@ -222,6 +224,7 @@ async def upload_document(file: UploadFile = File(...), _: User = Depends(requir
         staged_source_path = staging_dir / filename
         await save_upload_file(file, staged_source_path)
         prepared = ingestion_service.prepare(staged_source_path, filename, source_path_for(filename), staging_dir)
+        # 同步接口与异步任务遵循相同顺序，不能为了快捷跳过新版本的预校验。
         delete_document_transactionally(filename)
         promote_staged_document(staging_dir, filename, prepared.artifact_bundle is not None)
         parent_chunk_store.upsert_documents(prepared.parent_chunks)

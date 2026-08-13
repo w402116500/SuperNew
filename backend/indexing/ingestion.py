@@ -40,6 +40,7 @@ class DocumentIngestionService:
     ) -> PreparedDocument:
         """Convert and chunk a staged upload before old data is removed."""
         source = Path(staged_source_path)
+        # 分块元数据必须指向最终存储位置，不能泄露会在任务结束后清理的暂存路径。
         canonical_source = str(Path(final_source_path))
         artifact_bundle: MineruArtifactBundle | None = None
 
@@ -48,6 +49,7 @@ class DocumentIngestionService:
             artifact_bundle = self._mineru_client.convert_to_bundle(source, Path(staging_dir) / "parsed")
             self._report(progress, "mineru", 100, "MinerU Markdown 与解析产物已生成")
             self._report(progress, "chunk", 10, "正在对 MinerU Markdown 执行三级分块")
+            # MinerU 产物中的图片和结构化清单用于追溯，RAG 仅以 Markdown 作为统一文本输入。
             documents = self._loader.load_parsed_markdown(
                 str(artifact_bundle.markdown_path),
                 filename,
@@ -62,6 +64,7 @@ class DocumentIngestionService:
         if not documents:
             raise ValueError("文档处理失败，未能提取内容")
 
+        # L1/L2 用于命中后的上下文回溯，L3 才是写入 Milvus 的最小检索单元。
         parent_chunks = [chunk for chunk in documents if int(chunk.get("chunk_level", 0) or 0) in (1, 2)]
         leaf_chunks = [chunk for chunk in documents if int(chunk.get("chunk_level", 0) or 0) == 3]
         if not leaf_chunks:

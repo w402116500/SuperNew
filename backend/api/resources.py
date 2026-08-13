@@ -114,6 +114,7 @@ def artifact_dir_for(filename: str) -> Path:
 
 def create_staging_dir(job_id: str) -> Path:
     ensure_upload_dir()
+    # 每个任务独占暂存目录，避免同名文件的并发上传互相覆盖解析结果。
     staging_dir = STAGING_DIR / job_id
     staging_dir.mkdir(parents=True, exist_ok=False)
     return staging_dir
@@ -144,6 +145,7 @@ def promote_staged_document(staging_dir: str | Path, filename: str, has_artifact
     source_path.parent.mkdir(parents=True, exist_ok=True)
     if source_path.exists():
         source_path.unlink()
+    # 调用方只有在解析和分块通过后才可提升，失败任务始终只清理暂存目录。
     shutil.move(str(staged_source), str(source_path))
 
     if has_artifact_bundle:

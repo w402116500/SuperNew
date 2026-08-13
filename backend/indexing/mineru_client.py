@@ -124,6 +124,7 @@ class MineruClient:
 
         markdown, content_list_json, export_path = self._validate_result(result)
         target.mkdir(parents=True, exist_ok=True)
+        # 固定产物命名让后续排障、重建索引和同名文件替换不依赖 MinerU 的临时返回路径。
         markdown_path = target / "document.md"
         content_list_path = target / "content_list.json"
         profile_path = target / "profile.json"
@@ -171,6 +172,7 @@ class MineruClient:
             destination.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(export_path) as archive:
                 destination_root = destination.resolve()
+                # 必须在 extractall 前检查每个成员，防止 "../" 路径写出当前文档产物目录。
                 for member in archive.infolist():
                     member_path = (destination / member.filename).resolve()
                     if member_path != destination_root and destination_root not in member_path.parents:
