@@ -11,3 +11,4 @@ volumes/
 frontend/node_modules/
 frontend/dist/
 tmp/
+output/rag-evaluations/

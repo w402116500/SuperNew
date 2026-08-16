@@ -1,7 +1,7 @@
 [project]
 name = "ai-customer-service"
 version = "0.1.0"
-description = "基于知识库的 AI 客服"
+description = "面向企业资料的智能知识库问答系统"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -29,6 +29,7 @@ dependencies = [
   "rich>=14.2.0",
   "field>=0.2.0",
   "gradio-client>=2.6.0",
+  "pyarrow>=25.0.1",
 ]
 
 [tool.setuptools.packages.find]

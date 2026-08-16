@@ -21,11 +21,14 @@ from pydantic import BaseModel, Field
 
 # Context 提供本请求的 SSE 步骤事件和 trace 暂存，不使用跨请求全局状态。
 from backend.chat.request_context import ChatRequestContext
+# 规划和评分也使用同一硬超时，避免外部服务阻塞编排图。
+from backend.model_settings import model_timeout_seconds
 # 恢复状态和子 Agent trace 都先经过 Schema 校验与白名单规范化。
 from backend.schemas.chat import HitlResumeState, normalize_rag_sub_trace
 # utils 提供底层检索、一次改写、去重和 API trace 字段过滤能力。
 from backend.rag.utils import (
     RETRIEVAL_TOP_K,
+    RetrievalRuntime,
     retrieve_documents,
     rewrite_query_once,
     dedupe_documents,
@@ -38,6 +41,7 @@ API_KEY = os.getenv("ARK_API_KEY")  # 调用模型服务时使用的认证密钥
 BASE_URL = os.getenv("BASE_URL")  # OpenAI 兼容模型服务的基础地址。
 FAST_MODEL = os.getenv("FAST_MODEL")  # 用于快速分类复杂度和拆分子问题的模型名。
 GRADE_MODEL = os.getenv("GRADE_MODEL")  # 用于判断检索证据是否充分的模型名。
+MODEL_TIMEOUT_SECONDS = model_timeout_seconds()  # 单次规划、评分模型请求的硬超时。
 
 _grader_model = None  # 证据评分模型客户端缓存；首次创建后复用。
 _complexity_model = None  # 复杂度规划模型客户端缓存；首次创建后复用。
@@ -71,6 +75,8 @@ def _get_grader_model():
             temperature=0,
             # 收集流式用量统计，便于统一模型调用指标。
             stream_usage=True,
+            # 超时后证据评分节点会进入既有的 fail-closed 分支。
+            timeout=MODEL_TIMEOUT_SECONDS,
         )
     # 返回缓存的评分模型供评分节点调用。
     return _grader_model
@@ -100,6 +106,8 @@ def _get_complexity_model():
             temperature=0,
             # 让客户端收集流式调用的用量信息；本函数本身并不会开启文本流式输出。
             stream_usage=True,
+            # 规划请求超时后由调用方显式处理，而不是无限等待。
+            timeout=MODEL_TIMEOUT_SECONDS,
         )
     # 返回新建或此前缓存的同一个模型客户端，供 classify_complexity() 调用。
     return _complexity_model
@@ -207,6 +215,7 @@ class RAGState(TypedDict):
     knowledge_filenames: List[str]  # 本请求可检索的文件名白名单；空列表表示不限制。
     rag_step_group: Optional[str]  # 前端显示并行步骤时使用的分组 ID。
     rag_step_group_label: Optional[str]  # 前端显示给用户的分组标题。
+    retrieval_runtime: Optional[RetrievalRuntime]  # 评测可注入独立集合；线上默认为 None。
 
 
 def _format_docs(docs: List[dict]) -> str:
@@ -311,6 +320,7 @@ def _initial_state(
     is_sub_agent: bool = False,
     rag_step_group: Optional[str] = None,
     rag_step_group_label: Optional[str] = None,
+    retrieval_runtime: RetrievalRuntime | None = None,
 ) -> dict:
     """创建首次运行或子 Agent 运行所需的完整初始图状态。
 
@@ -347,6 +357,7 @@ def _initial_state(
         "knowledge_filenames": list(ctx.knowledge_filenames),  # 子 Agent 与主流程共享同一检索范围。
         "rag_step_group": rag_step_group,  # 子分支可指定前端步骤分组 ID。
         "rag_step_group_label": rag_step_group_label,  # 子分支可指定分组显示名称。
+        "retrieval_runtime": retrieval_runtime,  # 评测注入的依赖沿整张图显式传递。
     }
 
 # 第一轮只用原问题检索，并同时保存初始文档快照供 trace 对比。
@@ -357,6 +368,7 @@ def retrieve_initial(state: RAGState) -> RAGState:
         query,
         top_k=RETRIEVAL_TOP_K,
         knowledge_filenames=state.get("knowledge_filenames"),
+        runtime=state.get("retrieval_runtime"),
     )  # 调用底层召回、合并和精排流水线。
     results = retrieved.get("docs", [])  # 读取最终可用的证据块列表。
     retrieve_meta = retrieved.get("meta", {})  # 读取候选数、精排和合并等诊断数据。
@@ -455,49 +467,8 @@ def _grade_for_no_docs() -> EvidenceGrade:
     )
 
 
-def _normalize_product_identifier(value: str) -> str:
-    """将问题中的机型名称和文件名归一化，用于严格的降级匹配。"""
-    return re.sub(r"[^a-z0-9]", "", value.lower()).removeprefix("vivo")
-
-
-def _question_product_identifiers(question: str) -> set[str]:
-    """Extract the explicitly named vivo models from a customer question."""
-    return {
-        _normalize_product_identifier(match)
-        for match in re.findall(
-            r"(?:vivo\s*)?(?:[ys]\s*\d+(?:\s*pro)?|x\s*(?:fold\s*\d+\s*pro?|\d+(?:\s*pro)?))",
-            question,
-            flags=re.IGNORECASE,
-        )
-    }
-
-
-def _has_complete_product_match(question: str, docs: list[dict]) -> bool:
-    """只在问题中的每个明确机型都已被召回时，允许评分故障后的受限回答。"""
-    question_models = _question_product_identifiers(question)
-    if not question_models:
-        return False
-
-    retrieved_models = {
-        _normalize_product_identifier(str(doc.get("filename", "")).removesuffix(".md"))
-        for doc in docs
-        if doc.get("filename")
-    }
-    return question_models.issubset(retrieved_models)
-
-
-def _grade_for_unavailable_grader(question: str, docs: list[dict]) -> EvidenceGrade:
-    """评分模型故障时，仅对机型与召回资料完整对应的问题保留受限回答路径。"""
-    if _has_complete_product_match(question, docs):
-        return EvidenceGrade(
-            relevance="strong",
-            answerability="sufficient",
-            ambiguity="none",
-            route="answer",
-            confidence=0.0,
-            reason="evidence_grading_unavailable_product_match",
-        )
-
+def _grade_for_unavailable_grader() -> EvidenceGrade:
+    """评分模型故障时保守停止，避免用未验证片段生成事实性回答。"""
     return EvidenceGrade(
         relevance="weak",
         answerability="none",
@@ -601,13 +572,10 @@ def grade_documents_node(state: RAGState) -> RAGState:
                 [{"role": "user", "content": prompt}],
             )
         except Exception:
-            # 兼容模型偶发忽略 function calling 时，不能让一次格式错误变成客服接口 500。
+            # 兼容模型偶发忽略 function calling 时，不能让一次格式错误变成问答接口 500。
             # 无法可靠评分时必须 fail closed，禁止把候选片段直接交给回答模型。
-            grade = _grade_for_unavailable_grader(question, docs)
-            if grade.route == "answer":
-                _emit(state, "⚠️", "证据评分暂不可用，已按机型精确匹配继续回答")
-            else:
-                _emit(state, "⚠️", "证据评分暂不可用，已保守停止回答")
+            grade = _grade_for_unavailable_grader()
+            _emit(state, "⚠️", "证据评分暂不可用，已保守停止回答")
 
     route = _resolve_route(grade, state)  # 对模型建议执行证据门槛和预算约束。
     grade_update = _grade_update(grade, route)  # 转换成状态/trace 可直接使用的字段。
@@ -726,6 +694,7 @@ def retrieve_rewritten(state: RAGState) -> RAGState:
         rewritten_query,
         top_k=RETRIEVAL_TOP_K,
         knowledge_filenames=state.get("knowledge_filenames"),
+        runtime=state.get("retrieval_runtime"),
     )  # 用改写查询重新执行完整检索流水线。
     results = retrieved.get("docs", [])  # 提取改写后的最终候选证据。
     retrieve_meta = retrieved.get("meta", {})  # 提取本轮召回、合并、精排元数据。
@@ -963,6 +932,7 @@ def _fanout_sub_questions(state: RAGState):
                 is_sub_agent=True,
                 rag_step_group=f"子问题 {i}",
                 rag_step_group_label=sq,
+                retrieval_runtime=state.get("retrieval_runtime"),
             ),
         )
         for i, sq in enumerate(sub_qs, 1)
@@ -1204,6 +1174,7 @@ def _retrieve_resume_query(state: dict) -> dict:
         query,
         top_k=RETRIEVAL_TOP_K,
         knowledge_filenames=state.get("knowledge_filenames"),
+        runtime=state.get("retrieval_runtime"),
     )  # 直接检索，跳过复杂度和扇出。
     results = retrieved.get("docs", [])  # 提取最终证据块。
     retrieve_meta = retrieved.get("meta", {})  # 提取检索诊断数据。
@@ -1271,9 +1242,16 @@ def resume_rag_from_hitl(
 
 
 # 公开首次运行入口只接收问题和请求 Context，并把编译图的最终状态返回调用方。
-def run_rag_graph(question: str, ctx: ChatRequestContext) -> dict:
+def run_rag_graph(
+    question: str,
+    ctx: ChatRequestContext,
+    *,
+    retrieval_runtime: RetrievalRuntime | None = None,
+) -> dict:
     """运行一次首次 RAG 图，并在命中 HITL 路由时附加可持久化恢复快照。"""
-    result = rag_graph.invoke(_initial_state(question, ctx))  # 用完整初始状态同步运行已编译主图。
+    result = rag_graph.invoke(
+        _initial_state(question, ctx, retrieval_runtime=retrieval_runtime)
+    )  # 用完整初始状态同步运行已编译主图。
     if _is_hitl_result(result):  # 首轮若暂停，也必须提供可持久化恢复状态。
         result["hitl_resume_state"] = _build_hitl_resume_state(result)
     return result

@@ -7,6 +7,8 @@
 
 # os 用于读取环境变量中的密集向量维度。
 import os
+from itertools import chain, islice
+from typing import Iterable
 
 # EmbeddingService 用于生成密集向量；默认单例避免重复加载模型权重。
 from backend.indexing.embedding import EmbeddingService, embedding_service as _default_embedding_service
@@ -33,11 +35,11 @@ class MilvusWriter:
         # 使用调用方注入的 Store，或通过工厂取得全局配置 Store。
         self.milvus_manager = milvus_manager or get_milvus_store()
 
-    def write_documents(self, documents: list[dict], batch_size: int = 50, progress_callback=None):
+    def write_documents(self, documents: Iterable[dict], batch_size: int = 50, progress_callback=None):
         """分批生成文档块的密集向量，并写入 Milvus。
 
         Args:
-            documents: 待写入的块字典列表。每项至少应含 ``text``、``filename``、
+            documents: 待写入的块字典迭代器。每项至少应含 ``text``、``filename``、
                 ``file_type``，并可包含页码、块 ID 与父子关系字段。
             batch_size: 每次送入嵌入模型和 Milvus 的块数量，默认 50。
             progress_callback: 可选进度回调函数，调用形式为 ``callback(processed, total)``。
@@ -45,22 +47,24 @@ class MilvusWriter:
         Returns:
             None: 写入成功后不返回数据；错误会由嵌入模型或 Milvus Store 向上传播。
         """
-        # 没有待写入块时直接返回，避免创建空集合或发送空插入请求。
-        if not documents:
+        # 允许评测传入流式迭代器，避免大语料同时保留原始文本、Markdown 和分块列表。
+        iterator = iter(documents)
+        first_document = next(iterator, None)
+        if first_document is None:
             return
+        iterator = chain((first_document,), iterator)
+        total = len(documents) if hasattr(documents, "__len__") else None
 
         # Milvus dense_embedding 字段的维度必须与嵌入模型输出长度一致。
         dense_dim = int(os.getenv("DENSE_EMBEDDING_DIM", "1024"))
 
         # total 用于切片边界和进度回调。
-        total = len(documents)
         # 写入前确保集合、schema 和索引存在；已存在时该操作不会重复创建。
         self.milvus_manager.init_collection(dense_dim)
 
-        # 按批向量化和插入，防止大文档一次占满内存或超过 RPC 限制。
-        for i in range(0, total, batch_size):
-            # 切出当前批次，例如 i=50、batch_size=50 时取第 51 到第 100 项。
-            batch = documents[i : i + batch_size]
+        # 按批向量化和插入，支持生成器以控制大语料的峰值内存。
+        processed = 0
+        while batch := list(islice(iterator, batch_size)):
             # 提取当前批次每个字典中的正文，保持与 batch 完全相同的顺序。
             texts = [doc["text"] for doc in batch]
             # 当前批次先一次性生成 Dense 向量，再与原文按位置配对。
@@ -94,9 +98,8 @@ class MilvusWriter:
             # 只有向量和 metadata 都组装完成后才提交这一批。
             # insert 会通过 MilvusStore 创建短连接、执行写入、再关闭连接。
             self.milvus_manager.insert(insert_data)
+            processed += len(batch)
 
-            if progress_callback:
-                # min 处理最后一批不足 batch_size 的情况，确保 processed 不超过 total。
-                processed = min(i + batch_size, total)
-                # 通知调用方当前完成数量和总数量，例如 callback(50, 120)。
+            if progress_callback and total is not None:
+                # 只有输入总数可知时才报告百分比进度。
                 progress_callback(processed, total)

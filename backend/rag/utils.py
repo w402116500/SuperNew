@@ -17,6 +17,8 @@ Environment variables:
 
 # defaultdict 用于按 parent_chunk_id 自动创建子块列表。
 from collections import defaultdict
+# dataclass 把评测需要替换的运行时依赖收敛成一个不可变配置对象。
+from dataclasses import dataclass
 # 类型标注帮助说明检索结果、元数据和可选配置的结构。
 from typing import Any, Dict, List, Literal, Optional, Tuple
 # os 读取检索和精排相关环境变量；json 用于处理精排服务 JSON 异常。
@@ -33,6 +35,7 @@ from pydantic import BaseModel, Field
 from backend.indexing.milvus_client import get_milvus_store
 from backend.indexing.embedding import embedding_service as _embedding_service
 from backend.indexing.parent_chunk_store import ParentChunkStore
+from backend.model_settings import model_timeout_seconds
 
 
 # 示例占位符按未配置处理，避免程序向 your-rerank-host 之类的假地址发请求。
@@ -153,6 +156,22 @@ RETRIEVAL_TRACE_FIELDS = (
 _milvus_manager = get_milvus_store()
 _parent_chunk_store = ParentChunkStore()
 
+
+@dataclass(frozen=True)
+class RetrievalRuntime:
+    """一次检索运行可替换的基础设施和开关。
+
+    不传时 ``retrieve_documents`` 继续使用业务默认依赖。离线评测通过该对象注入独立
+    Milvus 集合与临时父块存储，保证评测数据不会污染默认知识库。
+    """
+
+    milvus_store: Any | None = None
+    embedding_service: Any | None = None
+    parent_chunk_store: Any | None = None
+    retrieval_mode: Literal["hybrid", "dense", "bm25"] = "hybrid"
+    enable_auto_merge: bool | None = None
+    enable_rerank: bool | None = None
+
 # 候选池必须不少于最终 top_k，给合并、精排和阈值过滤留出余量。
 def resolve_candidate_k(top_k: int) -> Tuple[int, Dict[str, Any]]:
     """解析 Milvus 候选池大小，并返回用于 trace 的配置来源。
@@ -260,7 +279,11 @@ def _merge_rank_score_into(target: dict, source: dict) -> None:
         target["score"] = max(float(existing), incoming)
 
 # 同一层只处理一次子块到直接父块的上卷，不跨层跳跃。
-def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[dict], int]:
+def _merge_to_parent_level(
+    docs: List[dict],
+    parent_chunk_store: Any,
+    threshold: int = 2,
+) -> Tuple[List[dict], int]:
     """在同一层级中，将命中足够多兄弟块的结果上卷为其直接父块。
 
     Args:
@@ -282,7 +305,7 @@ def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[d
         return docs, 0
 
     # Milvus 只保存 L3，父块正文要按 ID 从 PostgreSQL/Redis 恢复。
-    parent_docs = _parent_chunk_store.get_documents_by_ids(merge_parent_ids)
+    parent_docs = parent_chunk_store.get_documents_by_ids(merge_parent_ids)
     # 以 chunk_id 建索引，方便 O(1) 取回某个父块正文。
     parent_map = {item.get("chunk_id", ""): item for item in parent_docs if item.get("chunk_id")}
 
@@ -316,10 +339,10 @@ def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[d
     return merged_docs, merged_count
 
 
-def _empty_merge_meta() -> Dict[str, Any]:
+def _empty_merge_meta(*, auto_merge_enabled: bool = AUTO_MERGE_ENABLED) -> Dict[str, Any]:
     """创建 Auto-merge 未执行时使用的默认诊断元数据。"""
     return {
-        "auto_merge_enabled": AUTO_MERGE_ENABLED,
+        "auto_merge_enabled": auto_merge_enabled,
         "auto_merge_applied": False,
         "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
         "auto_merge_replaced_chunks": 0,
@@ -329,7 +352,12 @@ def _empty_merge_meta() -> Dict[str, Any]:
 
 
 # Auto-merging 在完整候选池上执行，不能等截断到 top_k 后再恢复上下文。
-def _auto_merge_candidates(docs: List[dict]) -> Tuple[List[dict], Dict[str, Any]]:
+def _auto_merge_candidates(
+    docs: List[dict],
+    *,
+    parent_chunk_store: Any = _parent_chunk_store,
+    enabled: bool = AUTO_MERGE_ENABLED,
+) -> Tuple[List[dict], Dict[str, Any]]:
     """在完整候选池执行两次直接父级上卷：L3→L2，再 L2→L1。
 
     Args:
@@ -338,16 +366,24 @@ def _auto_merge_candidates(docs: List[dict]) -> Tuple[List[dict], Dict[str, Any]
     Returns:
         Tuple[List[dict], Dict[str, Any]]: 合并后的候选和 Auto-merge 诊断元数据。
     """
-    meta = _empty_merge_meta()
+    meta = _empty_merge_meta(auto_merge_enabled=enabled)
     meta["post_merge_candidate_count"] = len(docs)
-    if not AUTO_MERGE_ENABLED or not docs:
+    if not enabled or not docs:
         # 配置关闭或没有召回结果时，不修改候选。
         return docs, meta
 
     # 第一步把满足阈值的 L3 叶子块替换为 L2。
-    merged_docs, merged_count_l3_l2 = _merge_to_parent_level(docs, threshold=AUTO_MERGE_THRESHOLD)
+    merged_docs, merged_count_l3_l2 = _merge_to_parent_level(
+        docs,
+        parent_chunk_store=parent_chunk_store,
+        threshold=AUTO_MERGE_THRESHOLD,
+    )
     # 第二步再检查 L2 是否足以继续上卷到 L1。
-    merged_docs, merged_count_l2_l1 = _merge_to_parent_level(merged_docs, threshold=AUTO_MERGE_THRESHOLD)
+    merged_docs, merged_count_l2_l1 = _merge_to_parent_level(
+        merged_docs,
+        parent_chunk_store=parent_chunk_store,
+        threshold=AUTO_MERGE_THRESHOLD,
+    )
 
     replaced_count = merged_count_l3_l2 + merged_count_l2_l1
     # update 将本次两步合并的统计覆盖到默认 meta 上。
@@ -389,7 +425,13 @@ def dedupe_documents(docs: List[dict]) -> List[dict]:
     return [by_key[key] for key in order]
 
 # 精排只接收合并后的候选，并始终返回诊断 metadata。
-def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[dict], Dict[str, Any]]:
+def _rerank_documents(
+    query: str,
+    docs: List[dict],
+    top_k: int,
+    *,
+    enabled: bool = RERANK_ENABLED,
+) -> Tuple[List[dict], Dict[str, Any]]:
     """调用可选外部 Rerank 服务对合并后的候选重排；失败时保留原排序。
 
     Args:
@@ -403,7 +445,7 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
     # rrf_rank 记录精排前的位置，供精排服务 index 映射回原文档。
     docs_with_rank = [{**doc, "rrf_rank": i} for i, doc in enumerate(docs, 1)]
     meta: Dict[str, Any] = {
-        "rerank_enabled": RERANK_ENABLED,
+        "rerank_enabled": enabled,
         "rerank_applied": False,
         "rerank_model": RERANK_MODEL,
         "rerank_endpoint": _get_rerank_endpoint(),
@@ -475,6 +517,10 @@ def _finalize_retrieval(
     retrieval_mode: str,
     candidate_k: int,
     candidate_config: Dict[str, Any],
+    *,
+    parent_chunk_store: Any = _parent_chunk_store,
+    enable_auto_merge: bool = AUTO_MERGE_ENABLED,
+    enable_rerank: bool = RERANK_ENABLED,
 ) -> Dict[str, Any]:
     """执行召回后的固定流水线：合并、精排、阈值过滤和诊断元数据组装。
 
@@ -490,8 +536,17 @@ def _finalize_retrieval(
         Dict[str, Any]: 包含 ``docs`` 最终结果和 ``meta`` 全流程诊断数据的字典。
     """
     # 先在完整候选池恢复父上下文。
-    candidates, merge_meta = _auto_merge_candidates(retrieved)
-    reranked_docs, rerank_meta = _rerank_documents(query=query, docs=candidates, top_k=top_k)
+    candidates, merge_meta = _auto_merge_candidates(
+        retrieved,
+        parent_chunk_store=parent_chunk_store,
+        enabled=enable_auto_merge,
+    )
+    reranked_docs, rerank_meta = _rerank_documents(
+        query=query,
+        docs=candidates,
+        top_k=top_k,
+        enabled=enable_rerank,
+    )
     post_rerank_count = len(reranked_docs)
     # 精排后才执行最低分阈值，避免低相关结果进入回答上下文。
     final_docs = [d for d in reranked_docs if _meets_rerank_min_score(d)]
@@ -529,6 +584,7 @@ def retrieve_documents(
     query: str,
     top_k: int = RETRIEVAL_TOP_K,
     knowledge_filenames: List[str] | tuple[str, ...] | None = None,
+    runtime: RetrievalRuntime | None = None,
 ) -> Dict[str, Any]:
     """执行一次完整 RAG 检索，并在失败时返回可解释的空结果而非抛出异常。
 
@@ -536,30 +592,38 @@ def retrieve_documents(
         query: 用户的自然语言问题。
         top_k: 最终返回的最大文档数量，默认读取 RETRIEVAL_TOP_K。
         knowledge_filenames: 可选文件名白名单；为空时检索全部已入库文件。
+        runtime: 可选评测运行时依赖和检索策略；省略时完全沿用线上默认行为。
 
     Returns:
         Dict[str, Any]: ``docs`` 为最终检索块列表，``meta`` 为检索模式和各阶段统计。
     """
+    current_runtime = runtime or RetrievalRuntime()
+    milvus_store = current_runtime.milvus_store or _milvus_manager
+    embedding_service = current_runtime.embedding_service or _embedding_service
+    parent_chunk_store = current_runtime.parent_chunk_store or _parent_chunk_store
+    enable_auto_merge = (
+        AUTO_MERGE_ENABLED
+        if current_runtime.enable_auto_merge is None
+        else current_runtime.enable_auto_merge
+    )
+    enable_rerank = RERANK_ENABLED if current_runtime.enable_rerank is None else current_runtime.enable_rerank
+    requested_mode = current_runtime.retrieval_mode
+
     # 先解析候选池大小，通常大于 top_k，给合并和精排留出余量。
     candidate_k, candidate_config = resolve_candidate_k(top_k)
     filter_expr = f"chunk_level == {LEAF_RETRIEVE_LEVEL}"
     filename_filter = build_filename_filter_expression(knowledge_filenames)
     if filename_filter:
         filter_expr = f"{filter_expr} and {filename_filter}"
-    try:
-        # 查询向量只计算一次，Hybrid 失败转 Dense 时直接复用。
-        dense_embeddings = _embedding_service.get_embeddings([query])
-        dense_embedding = dense_embeddings[0]
-    except Exception:
-        # 嵌入模型不可用时，Milvus 无法进行密集/混合检索，返回标准空结果结构。
+    def failed_result(error: str) -> Dict[str, Any]:
         return {
             "docs": [],
             "meta": {
-                "rerank_enabled": RERANK_ENABLED,
+                "rerank_enabled": enable_rerank,
                 "rerank_applied": False,
                 "rerank_model": RERANK_MODEL,
                 "rerank_endpoint": _get_rerank_endpoint(),
-                "rerank_error": "embedding_failed",
+                "rerank_error": error,
                 "rerank_timeout_seconds": RERANK_TIMEOUT_SECONDS,
                 "retrieval_mode": "failed",
                 "retrieval_pipeline": "recall_merge_rerank",
@@ -568,7 +632,7 @@ def retrieve_documents(
                 "retrieval_top_k": top_k,
                 "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
                 "recall_count": 0,
-                **_empty_merge_meta(),
+                **_empty_merge_meta(auto_merge_enabled=enable_auto_merge),
                 "candidate_count": 0,
                 "rerank_min_score": RERANK_MIN_SCORE,
                 "post_rerank_count": 0,
@@ -577,9 +641,59 @@ def retrieve_documents(
             },
         }
 
+    if requested_mode == "bm25":
+        try:
+            retrieved = milvus_store.bm25_retrieve(
+                query=query,
+                top_k=candidate_k,
+                filter_expr=filter_expr,
+            )
+            return _finalize_retrieval(
+                query=query,
+                retrieved=retrieved,
+                top_k=top_k,
+                retrieval_mode="bm25",
+                candidate_k=candidate_k,
+                candidate_config=candidate_config,
+                parent_chunk_store=parent_chunk_store,
+                enable_auto_merge=enable_auto_merge,
+                enable_rerank=enable_rerank,
+            )
+        except Exception:
+            return failed_result("bm25_retrieve_failed")
+
+    try:
+        # 查询向量只计算一次，Hybrid 失败转 Dense 时直接复用。
+        dense_embeddings = embedding_service.get_embeddings([query])
+        dense_embedding = dense_embeddings[0]
+    except Exception:
+        # 嵌入模型不可用时，Milvus 无法进行密集/混合检索，返回标准空结果结构。
+        return failed_result("embedding_failed")
+
+    if requested_mode == "dense":
+        try:
+            retrieved = milvus_store.dense_retrieve(
+                dense_embedding=dense_embedding,
+                top_k=candidate_k,
+                filter_expr=filter_expr,
+            )
+            return _finalize_retrieval(
+                query=query,
+                retrieved=retrieved,
+                top_k=top_k,
+                retrieval_mode="dense",
+                candidate_k=candidate_k,
+                candidate_config=candidate_config,
+                parent_chunk_store=parent_chunk_store,
+                enable_auto_merge=enable_auto_merge,
+                enable_rerank=enable_rerank,
+            )
+        except Exception:
+            return failed_result("dense_retrieve_failed")
+
     try:
         # 优先使用 Dense + BM25 Hybrid，并把真实模式写入 metadata。
-        retrieved = _milvus_manager.hybrid_retrieve(
+        retrieved = milvus_store.hybrid_retrieve(
             dense_embedding=dense_embedding,
             query=query,
             top_k=candidate_k,
@@ -592,11 +706,14 @@ def retrieve_documents(
             retrieval_mode="hybrid",
             candidate_k=candidate_k,
             candidate_config=candidate_config,
+            parent_chunk_store=parent_chunk_store,
+            enable_auto_merge=enable_auto_merge,
+            enable_rerank=enable_rerank,
         )
     except Exception:
         try:
             # 只有 Hybrid 抛异常才降级 Dense；两路都失败时返回可解释的空结果。
-            retrieved = _milvus_manager.dense_retrieve(
+            retrieved = milvus_store.dense_retrieve(
                 dense_embedding=dense_embedding,
                 top_k=candidate_k,
                 filter_expr=filter_expr,
@@ -608,39 +725,20 @@ def retrieve_documents(
                 retrieval_mode="dense_fallback",
                 candidate_k=candidate_k,
                 candidate_config=candidate_config,
+                parent_chunk_store=parent_chunk_store,
+                enable_auto_merge=enable_auto_merge,
+                enable_rerank=enable_rerank,
             )
         except Exception:
             # Hybrid 与 Dense 都不可用时同样返回可追踪的标准空结果。
-            return {
-                "docs": [],
-                "meta": {
-                    "rerank_enabled": RERANK_ENABLED,
-                    "rerank_applied": False,
-                    "rerank_model": RERANK_MODEL,
-                    "rerank_endpoint": _get_rerank_endpoint(),
-                    "rerank_error": "retrieve_failed",
-                    "rerank_timeout_seconds": RERANK_TIMEOUT_SECONDS,
-                    "retrieval_mode": "failed",
-                    "retrieval_pipeline": "recall_merge_rerank",
-                    "candidate_k": candidate_k,
-                    **candidate_config,
-                    "retrieval_top_k": top_k,
-                    "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
-                    "recall_count": 0,
-                    **_empty_merge_meta(),
-                    "candidate_count": 0,
-                    "rerank_min_score": RERANK_MIN_SCORE,
-                    "post_rerank_count": 0,
-                    "post_threshold_count": 0,
-                    "retrieval_empty": True,
-                },
-            }
+            return failed_result("retrieve_failed")
 
 
 # 查询重写模型沿用环境中的地址和凭据，避免把敏感信息写入源码。
 ARK_API_KEY = os.getenv("ARK_API_KEY")
 FAST_MODEL = os.getenv("FAST_MODEL")
 BASE_URL = os.getenv("BASE_URL")
+MODEL_TIMEOUT_SECONDS = model_timeout_seconds()
 
 
 class RewritePlan(BaseModel):
@@ -775,6 +873,7 @@ def _get_rewrite_model() -> Any | None:
             base_url=BASE_URL,
             temperature=0,
             stream_usage=True,
+            timeout=MODEL_TIMEOUT_SECONDS,
         )
     return _rewrite_model
 

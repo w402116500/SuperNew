@@ -513,6 +513,60 @@ class MilvusStore:
                 })
         return formatted_results
 
+    def bm25_retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        filter_expr: str = "",
+    ) -> list[dict]:
+        """只使用 Milvus 原生 BM25 稀疏向量执行关键词检索。
+
+        ``sparse_embedding`` 由集合 schema 中的 BM25 Function 从 ``text`` 自动生成，
+        查询时直接传入原始文本即可，不在客户端重复维护分词或稀疏向量统计。
+        """
+        output_fields = [
+            "text",
+            "filename",
+            "file_type",
+            "page_number",
+            "chunk_id",
+            "parent_chunk_id",
+            "root_chunk_id",
+            "chunk_level",
+            "chunk_idx",
+        ]
+
+        def _search(client: MilvusClient):
+            return client.search(
+                collection_name=self.collection_name,
+                data=[query],
+                anns_field="sparse_embedding",
+                search_params={"metric_type": "BM25", "params": {"drop_ratio_search": 0.2}},
+                limit=top_k,
+                output_fields=output_fields,
+                filter=filter_expr,
+            )
+
+        results = self._run(_search)
+        formatted_results = []
+        for hits in results:
+            for hit in hits:
+                entity = hit.get("entity", {}) or {}
+                formatted_results.append({
+                    "id": hit.get("id"),
+                    "text": hit.get("text", entity.get("text", "")),
+                    "filename": hit.get("filename", entity.get("filename", "")),
+                    "file_type": hit.get("file_type", entity.get("file_type", "")),
+                    "page_number": hit.get("page_number", entity.get("page_number", 0)),
+                    "chunk_id": hit.get("chunk_id", entity.get("chunk_id", "")),
+                    "parent_chunk_id": hit.get("parent_chunk_id", entity.get("parent_chunk_id", "")),
+                    "root_chunk_id": hit.get("root_chunk_id", entity.get("root_chunk_id", "")),
+                    "chunk_level": hit.get("chunk_level", entity.get("chunk_level", 0)),
+                    "chunk_idx": hit.get("chunk_idx", entity.get("chunk_idx", 0)),
+                    "score": hit.get("distance", 0.0),
+                })
+        return formatted_results
+
     def delete(self, filter_expr: str):
         """删除默认集合中匹配过滤条件的记录。
 
