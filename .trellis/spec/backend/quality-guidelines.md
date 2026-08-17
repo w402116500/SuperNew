@@ -345,3 +345,82 @@ summary = {"evaluation_status": "interrupted", **attempt_summary}
 ```python
 summary = {**attempt_summary, "evaluation_status": "interrupted"}
 ```
+
+## Scenario: Rewrite Candidate Fusion Attribution
+
+### 1. Scope / Trigger
+
+This contract applies to the opt-in T9 rewrite-candidate fusion path in
+`backend/rag/pipeline.py`, `backend/rag/utils.py`, and
+`backend/evaluation/runner.py`. It prevents a targeted rerun from treating
+ordinary model or routing variance as a retrieval optimization gain.
+
+### 2. Signatures
+
+```python
+RetrievalRuntime(enable_rewrite_candidate_fusion: bool = False)
+fuse_rewrite_candidate_results(
+    *, original_query, initial_retrieval, rewritten_retrieval,
+    top_k, runtime, fallback_reason=None
+) -> dict
+evaluate_run(
+    *, target_manifest_path=None, changed_variable="rewrite_candidate_fusion"
+) -> Path
+```
+
+### 3. Contracts
+
+- Fusion is disabled by default and is only evaluated when the existing
+  rewrite branch actually runs.
+- Raw candidates are merged by stable `chunk_id` (Milvus `id` is the fallback);
+  Auto-merging, Rerank, and final top-k are applied once to the union.
+- Final Rerank uses the original user question, not HyDE text.
+- Trace fields record whether fusion was applied, candidate counts, source
+  labels, and fallback reason.
+- A targeted result may claim fusion evidence gain only for cases whose trace
+  contains `rewrite_candidate_fusion_applied=true`.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required behavior |
+| --- | --- |
+| Target manifest includes validation or duplicate IDs | Reject before evaluation |
+| Target manifest hash or source result hash differs | Reject before evaluation |
+| Target manifest used without `changed_variable=rewrite_candidate_fusion` | Reject |
+| Rerun does not enter the rewrite branch | Mark the case not attributable to fusion |
+| Rewrite/fusion retrieval fails | Keep first finalized evidence and record fallback |
+
+### 5. Good/Base/Bad Cases
+
+- Good: a case triggers fusion, evidence coverage changes, and the report
+  attributes the change only to that case.
+- Base: a targeted rerun takes a different route and improves coverage; record
+  the change but exclude it from the fusion gain count.
+- Bad: compare aggregate targeted metrics without checking the per-case fusion
+  trace and start a 300-case experiment based on unrelated rerun variance.
+
+### 6. Tests Required
+
+- Assert the default runtime flag is false.
+- Assert candidate deduplication, original-query Rerank, stable top-k, and
+  fallback preservation.
+- Assert target manifests reject validation IDs, duplicate IDs, bad hashes, and
+  the wrong changed variable.
+- Assert reports distinguish actual fusion cases from reruns where fusion did
+  not execute.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```python
+if t9_coverage > baseline_coverage:
+    fusion_gain += 1
+```
+
+#### Correct
+
+```python
+if trace.get("rewrite_candidate_fusion_applied") and t9_coverage > baseline_coverage:
+    fusion_gain += 1
+```

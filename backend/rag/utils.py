@@ -150,6 +150,15 @@ RETRIEVAL_TRACE_FIELDS = (
     "post_rerank_count",
     "post_threshold_count",
     "retrieval_empty",
+    "retrieval_error",
+    "rewrite_candidate_fusion_enabled",
+    "rewrite_candidate_fusion_applied",
+    "rewrite_candidate_fusion_initial_candidate_count",
+    "rewrite_candidate_fusion_rewritten_candidate_count",
+    "rewrite_candidate_fusion_deduplicated_candidate_count",
+    "rewrite_candidate_fusion_fused_candidate_count",
+    "rewrite_candidate_fusion_final_document_sources",
+    "rewrite_candidate_fusion_fallback_reason",
 )
 
 # 全局初始化检索依赖（与 api 共用 embedding_service，保证 BM25 状态一致）
@@ -171,6 +180,9 @@ class RetrievalRuntime:
     retrieval_mode: Literal["hybrid", "dense", "bm25"] = "hybrid"
     enable_auto_merge: bool | None = None
     enable_rerank: bool | None = None
+    # T9 is evaluation-only. Online calls keep the existing overwrite behavior
+    # unless an isolated evaluation runtime explicitly turns this on.
+    enable_rewrite_candidate_fusion: bool = False
 
 # 候选池必须不少于最终 top_k，给合并、精排和阈值过滤留出余量。
 def resolve_candidate_k(top_k: int) -> Tuple[int, Dict[str, Any]]:
@@ -278,6 +290,16 @@ def _merge_rank_score_into(target: dict, source: dict) -> None:
     else:
         target["score"] = max(float(existing), incoming)
 
+
+def _merge_rewrite_candidate_sources(target: dict, source: dict) -> None:
+    """Keep T9-only source labels while Auto-merging replaces child chunks."""
+    source_labels = list(target.get("_rewrite_candidate_sources") or [])
+    for label in source.get("_rewrite_candidate_sources") or []:
+        if label not in source_labels:
+            source_labels.append(label)
+    if source_labels:
+        target["_rewrite_candidate_sources"] = source_labels
+
 # 同一层只处理一次子块到直接父块的上卷，不跨层跳跃。
 def _merge_to_parent_level(
     docs: List[dict],
@@ -323,12 +345,14 @@ def _merge_to_parent_level(
         if parent_id in parent_slot:
             existing = merged_docs[parent_slot[parent_id]]
             _merge_rank_score_into(existing, doc)
+            _merge_rewrite_candidate_sources(existing, doc)
             merged_count += 1
             continue
 
         parent_doc = dict(parent_map[parent_id])
         # 复制父块字典，避免直接修改缓存/数据库读取结果。
         _merge_rank_score_into(parent_doc, doc)
+        _merge_rewrite_candidate_sources(parent_doc, doc)
         # 诊断字段标记该结果由子块合并而来，便于 trace 解释召回变化。
         parent_doc["merged_from_children"] = True
         parent_doc["merged_child_count"] = len(groups[parent_id])
@@ -423,6 +447,59 @@ def dedupe_documents(docs: List[dict]) -> List[dict]:
             continue
         _merge_rank_score_into(by_key[key], item)
     return [by_key[key] for key in order]
+
+
+def _rewrite_candidate_key(doc: dict, source: str, index: int) -> str:
+    """Return T9's conservative, stable deduplication key for a leaf candidate."""
+    chunk_id = str(doc.get("chunk_id") or "").strip()
+    if chunk_id:
+        return f"chunk_id:{chunk_id}"
+    milvus_id = doc.get("id")
+    if milvus_id is not None and str(milvus_id).strip():
+        return f"milvus_id:{milvus_id}"
+    # A candidate without both stable identifiers must not be deduplicated by
+    # text. Keeping it avoids silently merging distinct evidence.
+    return f"missing_identifier:{source}:{index}"
+
+
+def _merge_rewrite_candidates(
+    initial_candidates: List[dict],
+    rewritten_candidates: List[dict],
+) -> tuple[List[dict], int]:
+    """Merge raw leaf candidates and preserve whether each came from either query."""
+    merged: Dict[str, dict] = {}
+    order: List[str] = []
+    for source, candidates in (("initial", initial_candidates), ("rewritten", rewritten_candidates)):
+        for index, candidate in enumerate(candidates):
+            item = dict(candidate)
+            key = _rewrite_candidate_key(item, source, index)
+            if key not in merged:
+                item["_rewrite_candidate_sources"] = [source]
+                merged[key] = item
+                order.append(key)
+                continue
+            _merge_rank_score_into(merged[key], item)
+            _merge_rewrite_candidate_sources(merged[key], {"_rewrite_candidate_sources": [source]})
+    return [merged[key] for key in order], len(initial_candidates) + len(rewritten_candidates) - len(order)
+
+
+def _rewrite_candidate_source_label(doc: dict) -> str:
+    labels = set(doc.get("_rewrite_candidate_sources") or [])
+    if labels == {"initial", "rewritten"}:
+        return "both"
+    if labels == {"initial"}:
+        return "initial"
+    if labels == {"rewritten"}:
+        return "rewritten"
+    return "unknown"
+
+
+def _strip_rewrite_candidate_sources(docs: List[dict]) -> List[dict]:
+    """Keep temporary fusion bookkeeping out of final API and JSONL documents."""
+    return [
+        {key: value for key, value in doc.items() if key != "_rewrite_candidate_sources"}
+        for doc in docs
+    ]
 
 # 精排只接收合并后的候选，并始终返回诊断 metadata。
 def _rerank_documents(
@@ -521,6 +598,7 @@ def _finalize_retrieval(
     parent_chunk_store: Any = _parent_chunk_store,
     enable_auto_merge: bool = AUTO_MERGE_ENABLED,
     enable_rerank: bool = RERANK_ENABLED,
+    extra_meta: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """执行召回后的固定流水线：合并、精排、阈值过滤和诊断元数据组装。
 
@@ -565,7 +643,127 @@ def _finalize_retrieval(
         "post_threshold_count": len(final_docs),
         "retrieval_empty": len(final_docs) == 0,
     }
+    if extra_meta:
+        meta.update(extra_meta)
     return {"docs": final_docs, "meta": meta}
+
+
+def _fusion_fallback_result(
+    initial_retrieval: Dict[str, Any],
+    *,
+    initial_candidate_count: int,
+    rewritten_candidate_count: int,
+    reason: str,
+    fallback_meta: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Return the first finalized result when T9's optional fusion cannot run."""
+    initial_docs = list(initial_retrieval.get("docs") or [])
+    meta = dict(initial_retrieval.get("meta") or {})
+    meta.update({
+        "rewrite_candidate_fusion_enabled": True,
+        "rewrite_candidate_fusion_applied": False,
+        "rewrite_candidate_fusion_initial_candidate_count": initial_candidate_count,
+        "rewrite_candidate_fusion_rewritten_candidate_count": rewritten_candidate_count,
+        "rewrite_candidate_fusion_deduplicated_candidate_count": 0,
+        "rewrite_candidate_fusion_fused_candidate_count": initial_candidate_count,
+        "rewrite_candidate_fusion_final_document_sources": ["initial"] * len(initial_docs),
+        "rewrite_candidate_fusion_fallback_reason": reason,
+    })
+    # Preserve an infrastructure error from the failed second recall.  The
+    # caller can then classify the case as system_error without discarding the
+    # first successful evidence set.
+    retrieval_error = str((fallback_meta or {}).get("retrieval_error") or "").strip()
+    if retrieval_error:
+        meta["retrieval_error"] = retrieval_error
+    return {"docs": initial_docs, "meta": meta}
+
+
+def fuse_rewrite_candidate_results(
+    *,
+    original_query: str,
+    initial_retrieval: Dict[str, Any],
+    rewritten_retrieval: Dict[str, Any] | None,
+    top_k: int,
+    runtime: RetrievalRuntime | None = None,
+    fallback_reason: str | None = None,
+) -> Dict[str, Any]:
+    """Fuse two raw recall sets, then run the existing merge/rerank pipeline once.
+
+    This function is deliberately independent from query execution: the existing
+    initial and rewritten searches still each use their frozen candidate pool.
+    Only their raw leaf candidates are combined before the final filtering step.
+    """
+    initial_candidates = list(initial_retrieval.get("raw_candidates") or [])
+    initial_raw_meta = initial_retrieval.get("raw_retrieval_meta") or {}
+    rewritten_candidates = list((rewritten_retrieval or {}).get("raw_candidates") or [])
+    rewritten_raw_meta = (rewritten_retrieval or {}).get("raw_retrieval_meta") or {}
+    if fallback_reason:
+        return _fusion_fallback_result(
+            initial_retrieval,
+            initial_candidate_count=len(initial_candidates),
+            rewritten_candidate_count=len(rewritten_candidates),
+            reason=fallback_reason,
+        )
+    if not rewritten_retrieval or rewritten_raw_meta.get("retrieval_mode") == "failed":
+        return _fusion_fallback_result(
+            initial_retrieval,
+            initial_candidate_count=len(initial_candidates),
+            rewritten_candidate_count=len(rewritten_candidates),
+            reason="rewritten_retrieval_failed",
+            fallback_meta=(rewritten_retrieval or {}).get("meta") or {},
+        )
+    if "raw_candidates" not in initial_retrieval:
+        return _fusion_fallback_result(
+            initial_retrieval,
+            initial_candidate_count=0,
+            rewritten_candidate_count=len(rewritten_candidates),
+            reason="initial_candidates_unavailable",
+        )
+
+    current_runtime = runtime or RetrievalRuntime()
+    parent_chunk_store = current_runtime.parent_chunk_store or _parent_chunk_store
+    enable_auto_merge = (
+        AUTO_MERGE_ENABLED
+        if current_runtime.enable_auto_merge is None
+        else current_runtime.enable_auto_merge
+    )
+    enable_rerank = RERANK_ENABLED if current_runtime.enable_rerank is None else current_runtime.enable_rerank
+    candidates, deduplicated_count = _merge_rewrite_candidates(initial_candidates, rewritten_candidates)
+    try:
+        finalized = _finalize_retrieval(
+            query=original_query,
+            retrieved=candidates,
+            top_k=top_k,
+            retrieval_mode="rewrite_candidate_fusion",
+            candidate_k=int(initial_raw_meta.get("candidate_k") or len(initial_candidates)),
+            candidate_config=dict(initial_raw_meta.get("candidate_config") or {}),
+            parent_chunk_store=parent_chunk_store,
+            enable_auto_merge=enable_auto_merge,
+            enable_rerank=enable_rerank,
+        )
+    except Exception as exc:
+        return _fusion_fallback_result(
+            initial_retrieval,
+            initial_candidate_count=len(initial_candidates),
+            rewritten_candidate_count=len(rewritten_candidates),
+            reason=f"fusion_finalize_failed:{type(exc).__name__}",
+        )
+
+    final_docs = list(finalized.get("docs") or [])
+    finalized["docs"] = _strip_rewrite_candidate_sources(final_docs)
+    finalized["meta"].update({
+        "rewrite_candidate_fusion_enabled": True,
+        "rewrite_candidate_fusion_applied": True,
+        "rewrite_candidate_fusion_initial_candidate_count": len(initial_candidates),
+        "rewrite_candidate_fusion_rewritten_candidate_count": len(rewritten_candidates),
+        "rewrite_candidate_fusion_deduplicated_candidate_count": deduplicated_count,
+        "rewrite_candidate_fusion_fused_candidate_count": len(candidates),
+        "rewrite_candidate_fusion_final_document_sources": [
+            _rewrite_candidate_source_label(doc) for doc in final_docs
+        ],
+        "rewrite_candidate_fusion_fallback_reason": None,
+    })
+    return finalized
 
 def build_filename_filter_expression(filenames: List[str] | tuple[str, ...] | None) -> str:
     """Build a Milvus-safe filename allowlist expression for a request-scoped retrieval."""
@@ -615,6 +813,14 @@ def retrieve_documents(
     filename_filter = build_filename_filter_expression(knowledge_filenames)
     if filename_filter:
         filter_expr = f"{filter_expr} and {filename_filter}"
+
+    def raw_retrieval_meta(retrieval_mode: str) -> Dict[str, Any]:
+        return {
+            "retrieval_mode": retrieval_mode,
+            "candidate_k": candidate_k,
+            "candidate_config": dict(candidate_config),
+        }
+
     def failed_result(error: str) -> Dict[str, Any]:
         return {
             "docs": [],
@@ -638,8 +844,29 @@ def retrieve_documents(
                 "post_rerank_count": 0,
                 "post_threshold_count": 0,
                 "retrieval_empty": True,
+                "retrieval_error": error,
             },
+            # Graph-internal only: T9 must distinguish a failed query from an
+            # empty but successful second recall set.
+            "raw_candidates": [],
+            "raw_retrieval_meta": raw_retrieval_meta("failed"),
         }
+
+    def successful_result(retrieved: List[dict], retrieval_mode: str) -> Dict[str, Any]:
+        result = _finalize_retrieval(
+            query=query,
+            retrieved=retrieved,
+            top_k=top_k,
+            retrieval_mode=retrieval_mode,
+            candidate_k=candidate_k,
+            candidate_config=candidate_config,
+            parent_chunk_store=parent_chunk_store,
+            enable_auto_merge=enable_auto_merge,
+            enable_rerank=enable_rerank,
+        )
+        result["raw_candidates"] = [dict(candidate) for candidate in retrieved]
+        result["raw_retrieval_meta"] = raw_retrieval_meta(retrieval_mode)
+        return result
 
     if requested_mode == "bm25":
         try:
@@ -648,19 +875,9 @@ def retrieve_documents(
                 top_k=candidate_k,
                 filter_expr=filter_expr,
             )
-            return _finalize_retrieval(
-                query=query,
-                retrieved=retrieved,
-                top_k=top_k,
-                retrieval_mode="bm25",
-                candidate_k=candidate_k,
-                candidate_config=candidate_config,
-                parent_chunk_store=parent_chunk_store,
-                enable_auto_merge=enable_auto_merge,
-                enable_rerank=enable_rerank,
-            )
-        except Exception:
-            return failed_result("bm25_retrieve_failed")
+            return successful_result(retrieved, "bm25")
+        except Exception as exc:
+            return failed_result(f"bm25_retrieve_failed:{type(exc).__name__}")
 
     try:
         # 查询向量只计算一次，Hybrid 失败转 Dense 时直接复用。
@@ -677,19 +894,9 @@ def retrieve_documents(
                 top_k=candidate_k,
                 filter_expr=filter_expr,
             )
-            return _finalize_retrieval(
-                query=query,
-                retrieved=retrieved,
-                top_k=top_k,
-                retrieval_mode="dense",
-                candidate_k=candidate_k,
-                candidate_config=candidate_config,
-                parent_chunk_store=parent_chunk_store,
-                enable_auto_merge=enable_auto_merge,
-                enable_rerank=enable_rerank,
-            )
-        except Exception:
-            return failed_result("dense_retrieve_failed")
+            return successful_result(retrieved, "dense")
+        except Exception as exc:
+            return failed_result(f"dense_retrieve_failed:{type(exc).__name__}")
 
     try:
         # 优先使用 Dense + BM25 Hybrid，并把真实模式写入 metadata。
@@ -699,18 +906,8 @@ def retrieve_documents(
             top_k=candidate_k,
             filter_expr=filter_expr,
         )
-        return _finalize_retrieval(
-            query=query,
-            retrieved=retrieved,
-            top_k=top_k,
-            retrieval_mode="hybrid",
-            candidate_k=candidate_k,
-            candidate_config=candidate_config,
-            parent_chunk_store=parent_chunk_store,
-            enable_auto_merge=enable_auto_merge,
-            enable_rerank=enable_rerank,
-        )
-    except Exception:
+        return successful_result(retrieved, "hybrid")
+    except Exception as hybrid_exc:
         try:
             # 只有 Hybrid 抛异常才降级 Dense；两路都失败时返回可解释的空结果。
             retrieved = milvus_store.dense_retrieve(
@@ -718,20 +915,12 @@ def retrieve_documents(
                 top_k=candidate_k,
                 filter_expr=filter_expr,
             )
-            return _finalize_retrieval(
-                query=query,
-                retrieved=retrieved,
-                top_k=top_k,
-                retrieval_mode="dense_fallback",
-                candidate_k=candidate_k,
-                candidate_config=candidate_config,
-                parent_chunk_store=parent_chunk_store,
-                enable_auto_merge=enable_auto_merge,
-                enable_rerank=enable_rerank,
-            )
-        except Exception:
+            return successful_result(retrieved, "dense_fallback")
+        except Exception as dense_exc:
             # Hybrid 与 Dense 都不可用时同样返回可追踪的标准空结果。
-            return failed_result("retrieve_failed")
+            return failed_result(
+                f"retrieve_failed:hybrid={type(hybrid_exc).__name__},dense={type(dense_exc).__name__}"
+            )
 
 
 # 查询重写模型沿用环境中的地址和凭据，避免把敏感信息写入源码。

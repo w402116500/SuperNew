@@ -771,6 +771,130 @@ def _select_experiment_cases(
     return selected, split_hash
 
 
+def _manifest_payload_hash(payload: dict[str, Any]) -> str:
+    """Hash a target manifest without allowing the hash field to self-reference."""
+    unsigned = {key: value for key, value in payload.items() if key != "manifest_sha256"}
+    encoded = json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def create_rewrite_candidate_fusion_manifest(
+    *,
+    source_results_path: Path,
+    case_split_path: Path,
+    output_path: Path,
+    source_evaluation_id: str,
+    expected_count: int = 15,
+) -> Path:
+    """Freeze analysis cases that actually entered the existing rewrite branch.
+
+    The manifest intentionally stores case IDs and baseline coverage only. It does
+    not copy questions, answers, or retrieved evidence, and it rejects validation
+    records before writing any output.
+    """
+    if not source_results_path.is_file():
+        raise FileNotFoundError(f"缺少源评测逐题结果：{source_results_path}")
+    if not case_split_path.is_file():
+        raise FileNotFoundError(f"缺少冻结 case split：{case_split_path}")
+    split = _read_json(case_split_path)
+    analysis_ids = {str(case_id) for case_id in split.get("analysis_case_ids") or []}
+    validation_ids = {str(case_id) for case_id in split.get("validation_case_ids") or []}
+    # This manifest is an immutable source contract.  Unlike resume loading,
+    # it must reject duplicate case IDs instead of silently keeping the last
+    # checkpoint from a repeated JSONL stream.
+    records: list[dict[str, Any]] = []
+    seen_case_ids: set[str] = set()
+    for line_number, line in enumerate(source_results_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        case_id = str(record.get("case_id") or "")
+        if not case_id:
+            continue
+        if case_id in seen_case_ids:
+            raise ValueError(f"源评测包含重复 case ID：{case_id}（第 {line_number} 行）")
+        seen_case_ids.add(case_id)
+        records.append(record)
+    by_id: dict[str, dict[str, Any]] = {}
+    for record in records:
+        case_id = str(record.get("case_id") or "")
+        if not case_id:
+            continue
+        if case_id in by_id:
+            raise ValueError(f"源评测包含重复 case ID：{case_id}")
+        by_id[case_id] = record
+    selected: list[dict[str, Any]] = []
+    for case_id, record in by_id.items():
+        if case_id in validation_ids or record.get("case_set") == "validation":
+            continue
+        if case_id not in analysis_ids or record.get("case_set") != "analysis":
+            continue
+        trace = record.get("rag_trace") or {}
+        if trace.get("rewrite_method") not in {"step_back", "hyde"}:
+            continue
+        if _has_evaluation_error(record):
+            continue
+        selected.append(record)
+    selected.sort(key=lambda record: str(record["case_id"]))
+    if len(selected) != expected_count:
+        raise ValueError(
+            f"源评测实际触发改写的 analysis 题数为 {len(selected)}，预期 {expected_count}；拒绝冻结清单"
+        )
+    manifest: dict[str, Any] = {
+        "manifest_version": 1,
+        "source_evaluation_id": source_evaluation_id,
+        "source_results_path": str(source_results_path),
+        "source_results_sha256": _sha256_file(source_results_path),
+        "source_case_split_path": str(case_split_path),
+        "source_case_split_sha256": _sha256_file(case_split_path),
+        "case_set": "analysis",
+        "case_count": len(selected),
+        "case_ids": [str(record["case_id"]) for record in selected],
+        "baseline_evidence_coverage": {
+            str(record["case_id"]): record.get("evidence_coverage")
+            for record in selected
+        },
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    manifest["manifest_sha256"] = _manifest_payload_hash(manifest)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(output_path, manifest)
+    return output_path
+
+
+def _select_target_manifest_cases(
+    *,
+    corpus_dir: Path,
+    all_cases: list[dict[str, Any]],
+    case_set: Literal["all", "analysis", "validation"],
+    target_manifest_path: Path,
+) -> tuple[list[dict[str, Any]], str]:
+    """Validate a frozen T9 target manifest against the current corpus split."""
+    if case_set != "analysis":
+        raise ValueError("改写候选融合 target manifest 只能用于 analysis case set")
+    payload = _read_json(target_manifest_path)
+    if payload.get("case_set") != "analysis":
+        raise ValueError("target manifest 的 case_set 必须是 analysis")
+    if payload.get("manifest_sha256") != _manifest_payload_hash(payload):
+        raise ValueError("target manifest 自身哈希校验失败，拒绝使用")
+    case_ids = [str(case_id) for case_id in payload.get("case_ids") or []]
+    if len(case_ids) != int(payload.get("case_count") or 0) or len(set(case_ids)) != len(case_ids):
+        raise ValueError("target manifest 的 case_count 与唯一 case_ids 不一致")
+    if len(case_ids) != 15:
+        raise ValueError("target manifest 必须固定包含 15 道 analysis 题")
+    selected_analysis, split_hash = _select_experiment_cases(corpus_dir, all_cases, "analysis")
+    analysis_ids = {str(case["id"]) for case in selected_analysis}
+    if not set(case_ids).issubset(analysis_ids):
+        raise ValueError("target manifest 包含非 analysis 题目或不属于当前冻结 split 的题目")
+    if payload.get("source_case_split_sha256") != split_hash:
+        raise ValueError("target manifest 的 case-split 哈希与当前 corpus 不匹配")
+    source_results = Path(str(payload.get("source_results_path") or ""))
+    if not source_results.is_file() or _sha256_file(source_results) != payload.get("source_results_sha256"):
+        raise ValueError("target manifest 的源 results.jsonl 哈希不匹配")
+    by_id = {str(case["id"]): dict(case) for case in selected_analysis}
+    return [by_id[case_id] for case_id in case_ids], split_hash
+
+
 def _add_case_set_to_records(records: list[dict[str, Any]], cases: list[dict[str, Any]]) -> None:
     case_sets = {str(case["id"]): str(case.get("case_set") or "all") for case in cases}
     for record in records:
@@ -1482,13 +1606,27 @@ def _evaluate_multihop_case(
         )
         state = run_rag_graph(case["question"], ctx, retrieval_runtime=runtime)
         rag_seconds = time.perf_counter() - rag_started
+        trace = state.get("rag_trace") or {}
+        retrieval_error = str(trace.get("retrieval_error") or "").strip()
+        if retrieval_error:
+            # A failed vector-store call is infrastructure failure, not a valid
+            # "no knowledge" answer. Preserve the trace and mark the record so
+            # retry and manual review keep it out of model-quality metrics.
+            record = _multihop_error_record(
+                case,
+                RuntimeError(retrieval_error),
+                elapsed_seconds=time.perf_counter() - started,
+                state=state,
+                dataset_label=config.get("dataset", "multihoprag"),
+            )
+            record["rag_seconds"] = rag_seconds
+            return record
         generation_started = time.perf_counter()
         answer, generation_error = _answer_from_evidence(case["question"], state)
         generation_seconds = time.perf_counter() - generation_started
         judge_started = time.perf_counter()
         answer_grade = judge_multihop_answer(case, answer, client=judge_client, config=judge_config)
         judge_seconds = time.perf_counter() - judge_started
-        trace = state.get("rag_trace") or {}
         docs = state.get("docs") or []
         expected = case["evidence_filenames"]
         evidence_hits = _ranks(expected, docs)
@@ -1534,6 +1672,7 @@ def _build_multihop_runtime(config: dict[str, Any]) -> tuple[RetrievalRuntime, J
         embedding_service=embedding_service,
         parent_chunk_store=ParentChunkStore(),
         retrieval_mode="hybrid",
+        enable_rewrite_candidate_fusion=bool(config.get("rewrite_candidate_fusion_enabled")),
     )
     judge_config = _judge_config()
     judge_client = requests.Session() if judge_config else None
@@ -1797,6 +1936,7 @@ def _new_experiment_config(
         "case_set": case_set,
         "case_count": case_count,
         "changed_variable": changed_variable,
+        "rewrite_candidate_fusion_enabled": changed_variable == "rewrite_candidate_fusion",
         "code_version": _code_version(),
         "created_at": datetime.now(UTC).isoformat(),
     })
@@ -1812,6 +1952,7 @@ def evaluate_run(
     evaluation_mode: Literal["retrieval", "rag"] | None = None,
     changed_variable: str | None = None,
     retry_from_evaluation_id: str | None = None,
+    target_manifest_path: Path | None = None,
 ) -> Path:
     """Evaluate a prepared corpus, optionally in a non-overlapping experiment run.
 
@@ -1830,12 +1971,22 @@ def evaluate_run(
         raise ValueError("只有 EnterpriseRAG 正式语料支持 analysis/validation case set")
 
     all_cases = read_cases(corpus_dir / "cases.jsonl")
-    cases, selected_split_hash = _select_experiment_cases(corpus_dir, all_cases, case_set)
+    if target_manifest_path is not None:
+        cases, selected_split_hash = _select_target_manifest_cases(
+            corpus_dir=corpus_dir,
+            all_cases=all_cases,
+            case_set=case_set,
+            target_manifest_path=target_manifest_path,
+        )
+    else:
+        cases, selected_split_hash = _select_experiment_cases(corpus_dir, all_cases, case_set)
     if not cases:
         raise RuntimeError("所选 case set 为空，拒绝生成没有题目的实验结果")
     mode = evaluation_mode or str(corpus_config.get("evaluation_mode") or "rag")
     if mode not in {"retrieval", "rag"}:
         raise ValueError(f"不支持的评测模式：{mode}")
+    if target_manifest_path is not None and changed_variable != "rewrite_candidate_fusion":
+        raise ValueError("target manifest 运行必须明确声明 changed_variable=rewrite_candidate_fusion")
     if retry_from_evaluation_id and (evaluation_id is None or mode != "rag" or dataset != "enterpriserag"):
         raise ValueError("retry 只支持 EnterpriseRAG 完整 RAG，且必须提供新的 evaluation_id")
 
@@ -1879,6 +2030,11 @@ def evaluate_run(
             changed_variable=changed_variable,
             case_count=len(cases),
         )
+        if target_manifest_path is not None:
+            requested_config.update({
+                "target_manifest_path": str(target_manifest_path),
+                "target_manifest_sha256": _sha256_file(target_manifest_path),
+            })
         if retry_from_evaluation_id:
             retry_compatibility_ignored = {
                 "run_id", "evaluation_id", "prepared_at", "created_at", "code_version",
@@ -1923,6 +2079,7 @@ def evaluate_run(
                 "model_timeout_seconds", "evaluation_case_timeout_seconds",
                 "retry_source_evaluation_id", "retry_source_results_sha256", "retry_case_count",
                 "preserved_case_count",
+                "rewrite_candidate_fusion_enabled", "target_manifest_path", "target_manifest_sha256",
             )
             changed = [key for key in immutable_keys if config.get(key) != requested_config.get(key)]
             if changed:

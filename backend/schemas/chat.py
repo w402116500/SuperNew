@@ -113,6 +113,7 @@ class RagTraceFields(StrictSchema):
     post_rerank_count: Optional[int] = None
     post_threshold_count: Optional[int] = None
     retrieval_empty: Optional[bool] = None
+    retrieval_error: Optional[str] = None
     # Milvus 召回模式和候选池配置/统计。
     retrieval_mode: Optional[str] = None
     retrieval_pipeline: Optional[str] = None
@@ -134,6 +135,15 @@ class RagTraceFields(StrictSchema):
     retrieved_chunks: Optional[List[RetrievedChunk]] = None
     initial_retrieved_chunks: Optional[List[RetrievedChunk]] = None
     rewrite_retrieved_chunks: Optional[List[RetrievedChunk]] = None
+    # T9 改写候选融合仅用于离线评测；这些字段说明两批叶子候选如何合并或回退。
+    rewrite_candidate_fusion_enabled: Optional[bool] = None
+    rewrite_candidate_fusion_applied: Optional[bool] = None
+    rewrite_candidate_fusion_initial_candidate_count: Optional[int] = None
+    rewrite_candidate_fusion_rewritten_candidate_count: Optional[int] = None
+    rewrite_candidate_fusion_deduplicated_candidate_count: Optional[int] = None
+    rewrite_candidate_fusion_fused_candidate_count: Optional[int] = None
+    rewrite_candidate_fusion_final_document_sources: Optional[List[str]] = None
+    rewrite_candidate_fusion_fallback_reason: Optional[str] = None
     # 复杂度路由：问题复杂度、拆分出的子问题、子 Agent 数量和最终合并数量。
     complexity: Optional[str] = None
     complexity_reason: Optional[str] = None

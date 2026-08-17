@@ -1255,4 +1255,31 @@ Rerank 共尝试 500 题，成功 498 题；`qst_0164`、`qst_0207` 的 SiliconF
 
 这批人工结论说明：当前失败不应简单归结为“没有召回”。至少 7 题是标准文档已被记录为召回、但关键细节没有进入最终上下文；37 题则是回答阶段遗漏、冲突或相邻资料污染。另一方面，21 条自动 `fail/review` 经人工核对后核心回答成立，应作为判卷校准样本，而不是直接驱动 RAG 调参。4 条“回答通过但证据不完整”不能反过来证明检索充分。
 
-T8 仍只描述 analysis 集，不能代表 200 题 validation 泛化结果。当前不修改 RAG 参数、不开始 T9；下一步等待用户确认唯一优化变量，再为新实验保存新的 `evaluation-config.json`、`evaluation_id`、`changed_variable`、逐题 JSONL、汇总报告和人工复核记录。
+T8 仍只描述 analysis 集，不能代表 200 题 validation 泛化结果。
+
+### T9 改写候选融合：15 题 targeted 试跑（未通过归因门槛）
+
+本轮唯一行为变量是 `rewrite_candidate_fusion`：仅当现有流程实际触发一次问题改写时，才把首次检索和改写检索的候选按 `chunk_id` 去重，再用原问题统一 Auto-merging、Rerank 和最终 8 段筛选。默认线上开关仍关闭；没有重新入库、没有清理 Milvus，也没有操作 `tutorial_verify_embeddings`。
+
+运行产物：
+
+- evaluation ID：`t9-rewrite-fusion-targeted-003`
+- 题集：固定的 15 道 analysis 题，来源为 `baseline-rag-010` 的 target manifest
+- 配置：`changed_variable=rewrite_candidate_fusion`，`rewrite_candidate_fusion_enabled=true`
+- 结果目录：`output/rag-evaluations/enterpriserag/enterpriserag-en-representative-sf-001/evaluations/t9-rewrite-fusion-targeted-003/`
+- 人工复核：同目录的 `manual-review.jsonl` 和 `manual-review.md`
+
+| 指标 | baseline-rag-010 同题 | T9 试跑 | 说明 |
+| --- | ---: | ---: | --- |
+| 题数 | 15 | 15 | 均为 analysis |
+| 证据全覆盖题数 | 2 / 15 | 7 / 15 | 全体重跑多出的覆盖不能直接归因；其中 6 道覆盖变好的题没有实际触发融合 |
+| 平均证据覆盖率 | 0.1333 | 0.5222 | 全体重跑差异，不能视为融合效果 |
+| 回答通过题数 | 1 / 15 | 1 / 15 | 总体不变 |
+| 实际触发融合 | 不适用 | 7 / 15 | 8 题在重跑时未进入改写分支 |
+| 触发融合且证据覆盖提升 | 不适用 | 0 / 7 | 未达到本任务的证据收益门槛 |
+| 触发融合且回答变通过 | 不适用 | 1 / 7 | `qst_0458`；基线证据已完整，仍需排除生成波动 |
+| 新增系统错误或超时 | 不适用 | 0 | 没有发现运行稳定性退化 |
+
+人工复核后的判断是：真正执行融合的 7 道题没有任何证据覆盖提升；全体指标中看起来变好的 6 道题是在未触发融合的重跑中出现的，不能算作该变量的收益。因此 T9.4 门槛未通过，本轮不启动 300 道 analysis，也不运行 validation。该结果只能说明当前 targeted 试验无法对融合收益作出可靠归因，不能说明融合一定无效。
+
+下一步必须先重新设计可归因的 targeted 试验（例如固定改写分支的输入/输出，并确保对照题在同一检索条件下实际执行融合），再由用户确认唯一变量后继续。确认前不修改 RAG 参数、不扩大题集、不接触 validation。
