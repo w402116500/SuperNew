@@ -1208,6 +1208,16 @@ def _has_evaluation_error(record: dict[str, Any]) -> bool:
     return bool(str(record.get("evaluation_error") or "").strip())
 
 
+def _has_retryable_error(record: dict[str, Any]) -> bool:
+    """Return whether a result lacks a stable answer-and-grade outcome."""
+    grade = record.get("answer_grade") or {}
+    return bool(
+        _has_evaluation_error(record)
+        or str(record.get("answer_generation_error") or "").strip()
+        or str(grade.get("grader_error") or "").strip()
+    )
+
+
 def _is_provider_quota_error(record: dict[str, Any]) -> bool:
     """Stop a run immediately when the provider rejects every further call for quota."""
     error = str(record.get("evaluation_error") or "")
@@ -1228,13 +1238,13 @@ def _retry_case_selection(
         str(case["id"])
         for case in cases
         if str(case["id"]) not in source_by_id
-        or _has_evaluation_error(source_by_id[str(case["id"])])
+        or _has_retryable_error(source_by_id[str(case["id"])])
     }
     preserved_ids = {
         str(case["id"])
         for case in cases
         if str(case["id"]) in source_by_id
-        and not _has_evaluation_error(source_by_id[str(case["id"])])
+        and not _has_retryable_error(source_by_id[str(case["id"])])
     }
     return [case for case in cases if str(case["id"]) in retry_ids], preserved_ids, retry_ids
 
@@ -1316,6 +1326,7 @@ _TARGET_MANIFEST_CONTRACTS: dict[str, tuple[int, str]] = {
     "evidence_candidate_audit": (97, "rewrite_candidate_fusion"),
     "adjacent_l3_expansion": (11, "adjacent_l3_expansion"),
     "structured_chunking_offline_audit": (30, "document_chunking_strategy"),
+    "model_comparison": (30, "model"),
 }
 
 
@@ -3340,6 +3351,7 @@ def evaluate_run(
             "rewrite_candidate_fusion",
             "adjacent_l3_expansion",
             "document_chunking_strategy",
+            "model",
         }
     ):
         raise ValueError("candidate trace 只能在受控的单变量 target manifest 评测中开启")
@@ -3535,7 +3547,7 @@ def evaluate_run(
                 case_id = str(case["id"])
                 source_record = source_by_id.get(case_id)
                 record = attempt_by_id.get(case_id) if case_id in retry_case_ids else source_record
-                if record is None or _has_evaluation_error(record):
+                if record is None or _has_retryable_error(record):
                     if record is not None:
                         merged_by_id[case_id] = record
                     unresolved_ids.append(case_id)
