@@ -12,13 +12,40 @@ from backend.rag.utils import (
     RetrievalRuntime,
     fuse_rewrite_candidate_results,
     retrieve_documents,
+    _finalize_retrieval,
 )
-from backend.evaluation.runner import _evaluate_multihop_case, create_rewrite_candidate_fusion_manifest
+from backend.evaluation.runner import (
+    _evaluate_multihop_case,
+    create_evidence_candidate_audit_manifest,
+    create_rewrite_candidate_fusion_manifest,
+)
 
 
 class RewriteCandidateFusionTests(unittest.TestCase):
     def test_runtime_flag_is_off_by_default(self):
         self.assertFalse(RetrievalRuntime().enable_rewrite_candidate_fusion)
+
+    def test_candidate_trace_is_opt_in_and_keeps_all_stage_snapshots(self):
+        result = _finalize_retrieval(
+            query="question",
+            retrieved=[{
+                "chunk_id": "c1", "parent_chunk_id": "p1", "filename": "a.md",
+                "text": "evidence", "score": 0.8,
+            }],
+            top_k=8,
+            retrieval_mode="hybrid",
+            candidate_k=30,
+            candidate_config={},
+            enable_auto_merge=False,
+            enable_rerank=False,
+            capture_candidate_trace=True,
+        )
+        audit = result["candidate_audit"]
+        self.assertEqual(audit["raw_leaf_candidates"][0]["chunk_id"], "c1")
+        self.assertEqual(audit["rerank_input_candidates"][0]["raw_rank"], 1)
+        self.assertEqual(audit["rerank_input_candidates"][0]["rerank_input_rank"], 1)
+        self.assertEqual(audit["rerank_returned_candidates"][0]["rerank_output_rank"], 1)
+        self.assertEqual(audit["final_context_candidates"][0]["text"], "evidence")
 
     def test_fusion_deduplicates_candidates_and_reranks_with_original_question(self):
         initial = {
@@ -225,6 +252,104 @@ class RewriteCandidateFusionTests(unittest.TestCase):
                     output_path=output_path,
                     source_evaluation_id="baseline-rag-test",
                     expected_count=1,
+                )
+
+    def test_evidence_candidate_audit_manifest_freezes_exact_97_analysis_cases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            results_path = root / "results.jsonl"
+            classification_path = root / "classification.json"
+            split_path = root / "case-split.json"
+            output_path = root / "target.json"
+
+            miss = [f"a{index:03d}" for index in range(63)]
+            late = [f"a{index:03d}" for index in range(59, 78)]
+            incomplete = [f"a{index:03d}" for index in range(78, 97)]
+            case_ids = sorted(set(miss) | set(late) | set(incomplete))
+            records = [
+                {
+                    "case_id": case_id,
+                    "case_set": "analysis",
+                    "answer_grade": {"verdict": "fail"},
+                    "evidence_coverage": 0.5,
+                    "retrieved_filenames": ["source.md"],
+                    "expected_evidence_filenames": ["source.md"],
+                }
+                for case_id in case_ids
+            ]
+            results_path.write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+            classification_path.write_text(json.dumps({
+                "categories": {
+                    "retrieval_miss": {"case_ids": miss},
+                    "retrieval_late": {"case_ids": late},
+                    "evidence_incomplete": {"case_ids": incomplete},
+                },
+            }), encoding="utf-8")
+            split_path.write_text(json.dumps({
+                "analysis_case_ids": case_ids,
+                "validation_case_ids": ["v001"],
+            }), encoding="utf-8")
+
+            create_evidence_candidate_audit_manifest(
+                source_results_path=results_path,
+                failure_classification_path=classification_path,
+                case_split_path=split_path,
+                output_path=output_path,
+                source_evaluation_id="baseline-rag-test",
+            )
+
+            manifest = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["manifest_type"], "evidence_candidate_audit")
+            self.assertEqual(manifest["case_count"], 97)
+            self.assertEqual(manifest["category_case_counts"], {
+                "retrieval_miss": 63,
+                "retrieval_late": 19,
+                "evidence_incomplete": 19,
+            })
+            self.assertEqual(manifest["case_categories"]["a059"], ["retrieval_miss", "retrieval_late"])
+            self.assertNotIn("v001", manifest["case_ids"])
+
+    def test_evidence_candidate_audit_manifest_rejects_validation_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            results_path = root / "results.jsonl"
+            classification_path = root / "classification.json"
+            split_path = root / "case-split.json"
+            output_path = root / "target.json"
+            miss = [f"a{index:03d}" for index in range(63)]
+            late = [f"a{index:03d}" for index in range(59, 78)]
+            incomplete = [f"a{index:03d}" for index in range(78, 96)] + ["v001"]
+            case_ids = sorted(set(miss) | set(late) | set(incomplete))
+            records = [
+                {"case_id": case_id, "case_set": "analysis"}
+                for case_id in case_ids
+            ]
+            results_path.write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+            classification_path.write_text(json.dumps({
+                "categories": {
+                    "retrieval_miss": {"case_ids": miss},
+                    "retrieval_late": {"case_ids": late},
+                    "evidence_incomplete": {"case_ids": incomplete},
+                },
+            }), encoding="utf-8")
+            split_path.write_text(json.dumps({
+                "analysis_case_ids": [case_id for case_id in case_ids if case_id != "v001"],
+                "validation_case_ids": ["v001"],
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "validation"):
+                create_evidence_candidate_audit_manifest(
+                    source_results_path=results_path,
+                    failure_classification_path=classification_path,
+                    case_split_path=split_path,
+                    output_path=output_path,
+                    source_evaluation_id="baseline-rag-test",
                 )
 
 

@@ -16,7 +16,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import requests
 
@@ -76,6 +76,9 @@ class _MultiHopWorker:
     process: Any
     request_queue: Any
     result_queue: Any
+
+
+MAX_EVALUATION_WORKERS = 32
 
 
 def _json_default(value: Any) -> str:
@@ -778,6 +781,16 @@ def _manifest_payload_hash(payload: dict[str, Any]) -> str:
     return sha256(encoded).hexdigest()
 
 
+# Target manifests are analysis-only experiments.  The expected count and the
+# one permitted behavior variable stay in one table so creation and execution
+# cannot silently drift apart.
+_TARGET_MANIFEST_CONTRACTS: dict[str, tuple[int, str]] = {
+    "rewrite_candidate_fusion": (15, "rewrite_candidate_fusion"),
+    "evidence_candidate_audit": (97, "rewrite_candidate_fusion"),
+    "adjacent_l3_expansion": (11, "adjacent_l3_expansion"),
+}
+
+
 def create_rewrite_candidate_fusion_manifest(
     *,
     source_results_path: Path,
@@ -862,6 +875,281 @@ def create_rewrite_candidate_fusion_manifest(
     return output_path
 
 
+def create_evidence_candidate_audit_manifest(
+    *,
+    source_results_path: Path,
+    failure_classification_path: Path,
+    case_split_path: Path,
+    output_path: Path,
+    source_evaluation_id: str,
+) -> Path:
+    """Freeze the 97-case union of retrieval-miss/late/incomplete analysis cases."""
+    for path in (source_results_path, failure_classification_path, case_split_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"缺少 manifest 源文件：{path}")
+    classification = _read_json(failure_classification_path)
+    categories = classification.get("categories") or {}
+    selected_categories = ("retrieval_miss", "retrieval_late", "evidence_incomplete")
+    category_ids = {
+        category: {str(case_id) for case_id in (categories.get(category, {}).get("case_ids") or [])}
+        for category in selected_categories
+    }
+    expected_category_counts = {"retrieval_miss": 63, "retrieval_late": 19, "evidence_incomplete": 19}
+    actual_category_counts = {key: len(value) for key, value in category_ids.items()}
+    if actual_category_counts != expected_category_counts:
+        raise ValueError(f"T8 证据链分类数量变化，预期 {expected_category_counts}，实际 {actual_category_counts}")
+    case_ids = sorted(set().union(*category_ids.values()))
+    if len(case_ids) != 97:
+        raise ValueError(f"证据链审计清单应为 97 题，实际为 {len(case_ids)}")
+    split = _read_json(case_split_path)
+    analysis_ids = {str(case_id) for case_id in split.get("analysis_case_ids") or []}
+    validation_ids = {str(case_id) for case_id in split.get("validation_case_ids") or []}
+    if set(case_ids) - analysis_ids or set(case_ids) & validation_ids:
+        raise ValueError("证据链审计清单包含非 analysis 或 validation 题目")
+    records = {}
+    for line in source_results_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        case_id = str(record.get("case_id") or "")
+        if case_id in records:
+            raise ValueError(f"源评测包含重复 case ID：{case_id}")
+        records[case_id] = record
+    missing = [case_id for case_id in case_ids if case_id not in records]
+    if missing:
+        raise ValueError(f"源评测缺少目标题：{missing[:5]}")
+    non_analysis_records = [
+        case_id for case_id in case_ids
+        if records[case_id].get("case_set") != "analysis"
+    ]
+    if non_analysis_records:
+        raise ValueError(f"源结果中的目标题不是 analysis：{non_analysis_records[:5]}")
+    manifest: dict[str, Any] = {
+        "manifest_version": 1,
+        "manifest_type": "evidence_candidate_audit",
+        "source_evaluation_id": source_evaluation_id,
+        "source_results_path": str(source_results_path),
+        "source_results_sha256": _sha256_file(source_results_path),
+        "source_failure_classification_path": str(failure_classification_path),
+        "source_failure_classification_sha256": _sha256_file(failure_classification_path),
+        "source_case_split_path": str(case_split_path),
+        "source_case_split_sha256": _sha256_file(case_split_path),
+        "case_set": "analysis",
+        "case_count": len(case_ids),
+        "category_case_counts": {key: len(value) for key, value in category_ids.items()},
+        "case_ids": case_ids,
+        "case_categories": {case_id: [key for key, ids in category_ids.items() if case_id in ids] for case_id in case_ids},
+        "baseline_comparison": {
+            case_id: {
+                "verdict": records[case_id].get("answer_grade", {}).get("verdict"),
+                "evidence_coverage": records[case_id].get("evidence_coverage"),
+                "retrieved_filenames": records[case_id].get("retrieved_filenames", []),
+                "expected_evidence_filenames": records[case_id].get("expected_evidence_filenames", records[case_id].get("evidence_filenames", [])),
+            }
+            for case_id in case_ids
+        },
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    manifest["manifest_sha256"] = _manifest_payload_hash(manifest)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(output_path, manifest)
+    return output_path
+
+
+def create_adjacent_l3_expansion_manifest(
+    *,
+    source_results_path: Path,
+    raw_candidate_fact_review_path: Path,
+    case_split_path: Path,
+    output_path: Path,
+    source_evaluation_id: str,
+    expected_count: int = 11,
+) -> Path:
+    """Freeze the manually confirmed analysis cases with an adjacent-L3 gap.
+
+    The manual fact review is the experiment-selection source.  The baseline
+    JSONL and frozen split are still hashed and checked so a later rerun cannot
+    quietly point the same case IDs at a changed corpus or evaluation result.
+    """
+    for path in (source_results_path, raw_candidate_fact_review_path, case_split_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"缺少相邻 L3 清单源文件：{path}")
+    split = _read_json(case_split_path)
+    analysis_ids = {str(case_id) for case_id in split.get("analysis_case_ids") or []}
+    validation_ids = {str(case_id) for case_id in split.get("validation_case_ids") or []}
+
+    source_records: dict[str, dict[str, Any]] = {}
+    for line_number, line in enumerate(source_results_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        case_id = str(record.get("case_id") or "")
+        if not case_id:
+            continue
+        if case_id in source_records:
+            raise ValueError(f"源评测包含重复 case ID：{case_id}（第 {line_number} 行）")
+        source_records[case_id] = record
+
+    review_records: dict[str, dict[str, Any]] = {}
+    for line_number, line in enumerate(raw_candidate_fact_review_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        case_id = str(record.get("case_id") or "")
+        if not case_id:
+            raise ValueError(f"人工复核缺少 case ID（第 {line_number} 行）")
+        if case_id in review_records:
+            raise ValueError(f"人工复核包含重复 case ID：{case_id}（第 {line_number} 行）")
+        review_records[case_id] = record
+
+    selected_ids = sorted(
+        case_id
+        for case_id, record in review_records.items()
+        if record.get("classification") == "adjacent_leaf_gap"
+    )
+    if len(selected_ids) != expected_count:
+        raise ValueError(f"相邻 L3 人工复核题数应为 {expected_count}，实际为 {len(selected_ids)}")
+    if set(selected_ids) - analysis_ids or set(selected_ids) & validation_ids:
+        raise ValueError("相邻 L3 清单包含非 analysis 或 validation 题目")
+    missing_records = [case_id for case_id in selected_ids if case_id not in source_records]
+    if missing_records:
+        raise ValueError(f"源评测缺少相邻 L3 目标题：{missing_records[:5]}")
+    non_analysis_records = [
+        case_id for case_id in selected_ids
+        if source_records[case_id].get("case_set") != "analysis"
+    ]
+    if non_analysis_records:
+        raise ValueError(f"源结果中的相邻 L3 目标题不是 analysis：{non_analysis_records[:5]}")
+
+    manifest: dict[str, Any] = {
+        "manifest_version": 1,
+        "manifest_type": "adjacent_l3_expansion",
+        "changed_variable": "adjacent_l3_expansion",
+        "source_evaluation_id": source_evaluation_id,
+        "source_results_path": str(source_results_path),
+        "source_results_sha256": _sha256_file(source_results_path),
+        "source_raw_candidate_fact_review_path": str(raw_candidate_fact_review_path),
+        "source_raw_candidate_fact_review_sha256": _sha256_file(raw_candidate_fact_review_path),
+        "source_case_split_path": str(case_split_path),
+        "source_case_split_sha256": _sha256_file(case_split_path),
+        "case_set": "analysis",
+        "case_count": len(selected_ids),
+        "case_ids": selected_ids,
+        "manual_selection": {
+            case_id: {
+                "classification": review_records[case_id].get("classification"),
+                "source_ref": review_records[case_id].get("source_ref"),
+                "retrieved_l3_indices": review_records[case_id].get("retrieved_l3_indices", []),
+                "evidence_l3_indices": review_records[case_id].get("evidence_l3_indices", []),
+                "confidence": review_records[case_id].get("confidence"),
+            }
+            for case_id in selected_ids
+        },
+        "baseline_comparison": {
+            case_id: {
+                "verdict": source_records[case_id].get("answer_grade", {}).get("verdict"),
+                "evidence_coverage": source_records[case_id].get("evidence_coverage"),
+                "retrieved_filenames": source_records[case_id].get("retrieved_filenames", []),
+                "expected_evidence_filenames": source_records[case_id].get(
+                    "expected_evidence_filenames", source_records[case_id].get("evidence_filenames", [])
+                ),
+            }
+            for case_id in selected_ids
+        },
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    manifest["manifest_sha256"] = _manifest_payload_hash(manifest)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(output_path, manifest)
+    return output_path
+
+
+def create_adjacent_l3_non_pass_manifest(
+    *,
+    source_results_path: Path,
+    case_split_path: Path,
+    output_path: Path,
+    source_evaluation_id: str,
+    expected_count: int = 147,
+) -> Path:
+    """Freeze every non-pass analysis result for an adjacent-L3 rerun.
+
+    This is deliberately separate from the manually selected 11-case T10
+    manifest.  The source results remain the selection authority, so a pass
+    case or validation case cannot be added by editing a target list.
+    """
+    for path in (source_results_path, case_split_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"缺少相邻 L3 非通过题清单源文件：{path}")
+    split = _read_json(case_split_path)
+    analysis_ids = {str(case_id) for case_id in split.get("analysis_case_ids") or []}
+    validation_ids = {str(case_id) for case_id in split.get("validation_case_ids") or []}
+
+    source_records: dict[str, dict[str, Any]] = {}
+    for line_number, line in enumerate(source_results_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        case_id = str(record.get("case_id") or "")
+        if not case_id:
+            continue
+        if case_id in source_records:
+            raise ValueError(f"源评测包含重复 case ID：{case_id}（第 {line_number} 行）")
+        source_records[case_id] = record
+
+    baseline_verdict_counts: dict[str, int] = {}
+    non_pass_ids: list[str] = []
+    pass_ids: list[str] = []
+    for case_id, record in source_records.items():
+        if case_id in validation_ids or record.get("case_set") != "analysis":
+            continue
+        verdict = str((record.get("answer_grade") or {}).get("verdict") or "")
+        baseline_verdict_counts[verdict] = baseline_verdict_counts.get(verdict, 0) + 1
+        if verdict == "pass":
+            pass_ids.append(case_id)
+        else:
+            non_pass_ids.append(case_id)
+    selected_ids = sorted(non_pass_ids)
+    if len(selected_ids) != expected_count:
+        raise ValueError(f"analysis 非通过题数应为 {expected_count}，实际为 {len(selected_ids)}")
+    if set(selected_ids) - analysis_ids or set(selected_ids) & validation_ids:
+        raise ValueError("相邻 L3 非通过清单包含非 analysis 或 validation 题目")
+
+    manifest: dict[str, Any] = {
+        "manifest_version": 1,
+        "manifest_type": "adjacent_l3_expansion",
+        "selection_mode": "non_pass_analysis",
+        "source_selection_rule": "case_set=analysis and answer_grade.verdict != pass",
+        "changed_variable": "adjacent_l3_expansion",
+        "source_evaluation_id": source_evaluation_id,
+        "source_results_path": str(source_results_path),
+        "source_results_sha256": _sha256_file(source_results_path),
+        "source_case_split_path": str(case_split_path),
+        "source_case_split_sha256": _sha256_file(case_split_path),
+        "case_set": "analysis",
+        "case_count": len(selected_ids),
+        "case_ids": selected_ids,
+        "excluded_pass_count": len(pass_ids),
+        "baseline_verdict_counts": baseline_verdict_counts,
+        "baseline_comparison": {
+            case_id: {
+                "verdict": (source_records[case_id].get("answer_grade") or {}).get("verdict"),
+                "evidence_coverage": source_records[case_id].get("evidence_coverage"),
+                "retrieved_filenames": source_records[case_id].get("retrieved_filenames", []),
+                "expected_evidence_filenames": source_records[case_id].get(
+                    "expected_evidence_filenames", source_records[case_id].get("evidence_filenames", [])
+                ),
+            }
+            for case_id in selected_ids
+        },
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    manifest["manifest_sha256"] = _manifest_payload_hash(manifest)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(output_path, manifest)
+    return output_path
+
+
 def _select_target_manifest_cases(
     *,
     corpus_dir: Path,
@@ -869,7 +1157,7 @@ def _select_target_manifest_cases(
     case_set: Literal["all", "analysis", "validation"],
     target_manifest_path: Path,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Validate a frozen T9 target manifest against the current corpus split."""
+    """Validate a frozen analysis target manifest against the current corpus split."""
     if case_set != "analysis":
         raise ValueError("改写候选融合 target manifest 只能用于 analysis case set")
     payload = _read_json(target_manifest_path)
@@ -880,8 +1168,28 @@ def _select_target_manifest_cases(
     case_ids = [str(case_id) for case_id in payload.get("case_ids") or []]
     if len(case_ids) != int(payload.get("case_count") or 0) or len(set(case_ids)) != len(case_ids):
         raise ValueError("target manifest 的 case_count 与唯一 case_ids 不一致")
-    if len(case_ids) != 15:
-        raise ValueError("target manifest 必须固定包含 15 道 analysis 题")
+    manifest_type = str(payload.get("manifest_type") or "rewrite_candidate_fusion")
+    if manifest_type not in _TARGET_MANIFEST_CONTRACTS:
+        raise ValueError(f"不支持的 target manifest 类型：{manifest_type}")
+    expected_count, expected_variable = _TARGET_MANIFEST_CONTRACTS[manifest_type]
+    selection_mode = str(payload.get("selection_mode") or "")
+    if manifest_type == "adjacent_l3_expansion" and not selection_mode:
+        selection_mode = "adjacent_leaf_gap"
+    if manifest_type == "adjacent_l3_expansion" and selection_mode not in {
+        "adjacent_leaf_gap", "non_pass_analysis"
+    }:
+        raise ValueError("相邻 L3 target manifest 的 selection_mode 不受支持")
+    # T10 manifests created after this contract was introduced carry their
+    # variable explicitly.  Keep accepting older T9/T8 manifests that predate
+    # the field, but reject a declared value that could route the target to a
+    # different runtime behavior.
+    declared_variable = payload.get("changed_variable")
+    if declared_variable is not None and declared_variable != expected_variable:
+        raise ValueError(
+            f"target manifest 的 changed_variable 必须为 {expected_variable}"
+        )
+    if not (manifest_type == "adjacent_l3_expansion" and selection_mode == "non_pass_analysis") and len(case_ids) != expected_count:
+        raise ValueError(f"target manifest 必须固定包含 {expected_count} 道 analysis 题")
     selected_analysis, split_hash = _select_experiment_cases(corpus_dir, all_cases, "analysis")
     analysis_ids = {str(case["id"]) for case in selected_analysis}
     if not set(case_ids).issubset(analysis_ids):
@@ -891,7 +1199,131 @@ def _select_target_manifest_cases(
     source_results = Path(str(payload.get("source_results_path") or ""))
     if not source_results.is_file() or _sha256_file(source_results) != payload.get("source_results_sha256"):
         raise ValueError("target manifest 的源 results.jsonl 哈希不匹配")
+    source_result_records: dict[str, dict[str, Any]] = {}
+    for line_number, line in enumerate(source_results.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        result_id = str(record.get("case_id") or "")
+        if result_id in source_result_records:
+            raise ValueError(f"target manifest 的源 results.jsonl 包含重复 case ID：{result_id}（第 {line_number} 行）")
+        if result_id:
+            source_result_records[result_id] = record
+    if manifest_type == "evidence_candidate_audit":
+        classification_path = Path(str(payload.get("source_failure_classification_path") or ""))
+        if not classification_path.is_file() or _sha256_file(classification_path) != payload.get("source_failure_classification_sha256"):
+            raise ValueError("target manifest 的失败分类源文件哈希不匹配")
+        classification = _read_json(classification_path)
+        categories = classification.get("categories") or {}
+        selected_categories = ("retrieval_miss", "retrieval_late", "evidence_incomplete")
+        expected_ids = {
+            str(case_id)
+            for category in selected_categories
+            for case_id in (categories.get(category, {}).get("case_ids") or [])
+        }
+        if set(case_ids) != expected_ids:
+            raise ValueError("target manifest 与失败分类的三类证据链题目不一致")
+        expected_category_counts = {category: len({str(case_id) for case_id in (categories.get(category, {}).get("case_ids") or [])}) for category in selected_categories}
+        if payload.get("category_case_counts") != expected_category_counts:
+            raise ValueError("target manifest 的分类数量与失败分类源文件不一致")
+        manifest_categories = payload.get("case_categories") or {}
+        for case_id in case_ids:
+            expected_membership = [category for category in selected_categories if case_id in {str(value) for value in (categories.get(category, {}).get("case_ids") or [])}]
+            if manifest_categories.get(case_id) != expected_membership:
+                raise ValueError(f"target manifest 的分类成员关系不一致：{case_id}")
+    if manifest_type == "adjacent_l3_expansion" and selection_mode == "non_pass_analysis":
+        expected_ids = sorted(
+            case_id
+            for case_id, record in source_result_records.items()
+            if record.get("case_set") == "analysis"
+            and str((record.get("answer_grade") or {}).get("verdict") or "") != "pass"
+        )
+        if case_ids != expected_ids:
+            raise ValueError("target manifest 与源 results.jsonl 的 analysis 非通过题集合不一致")
+        if payload.get("source_selection_rule") != "case_set=analysis and answer_grade.verdict != pass":
+            raise ValueError("target manifest 的 source_selection_rule 不正确")
+        if payload.get("excluded_pass_count") != sum(
+            1
+            for record in source_result_records.values()
+            if record.get("case_set") == "analysis"
+            and str((record.get("answer_grade") or {}).get("verdict") or "") == "pass"
+        ):
+            raise ValueError("target manifest 的 excluded_pass_count 与源结果不一致")
+        expected_counts: dict[str, int] = {}
+        for source_record in source_result_records.values():
+            if source_record.get("case_set") != "analysis":
+                continue
+            verdict = str((source_record.get("answer_grade") or {}).get("verdict") or "")
+            expected_counts[verdict] = expected_counts.get(verdict, 0) + 1
+        if payload.get("baseline_verdict_counts") != expected_counts:
+            raise ValueError("target manifest 的 baseline_verdict_counts 与源结果不一致")
+        baseline_comparison = payload.get("baseline_comparison") or {}
+        for case_id in case_ids:
+            source_record = source_result_records[case_id]
+            expected_baseline = {
+                "verdict": (source_record.get("answer_grade") or {}).get("verdict"),
+                "evidence_coverage": source_record.get("evidence_coverage"),
+                "retrieved_filenames": source_record.get("retrieved_filenames", []),
+                "expected_evidence_filenames": source_record.get(
+                    "expected_evidence_filenames", source_record.get("evidence_filenames", [])
+                ),
+            }
+            if baseline_comparison.get(case_id) != expected_baseline:
+                raise ValueError(f"target manifest 的基线摘要与源结果不一致：{case_id}")
+    elif manifest_type == "adjacent_l3_expansion":
+        review_path = Path(str(payload.get("source_raw_candidate_fact_review_path") or ""))
+        if not review_path.is_file() or _sha256_file(review_path) != payload.get("source_raw_candidate_fact_review_sha256"):
+            raise ValueError("target manifest 的相邻 L3 人工复核源文件哈希不匹配")
+        review_ids: set[str] = set()
+        review_records: dict[str, dict[str, Any]] = {}
+        seen_review_ids: set[str] = set()
+        for line_number, line in enumerate(review_path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            review = json.loads(line)
+            review_id = str(review.get("case_id") or "")
+            if not review_id:
+                raise ValueError(f"相邻 L3 人工复核缺少 case ID（第 {line_number} 行）")
+            if review_id in seen_review_ids:
+                raise ValueError(f"相邻 L3 人工复核包含重复 case ID：{review_id}")
+            seen_review_ids.add(review_id)
+            review_records[review_id] = review
+            if review.get("classification") == "adjacent_leaf_gap":
+                review_ids.add(review_id)
+        if set(case_ids) != review_ids:
+            raise ValueError("target manifest 与相邻 L3 人工复核结论不一致")
+        manual_selection = payload.get("manual_selection") or {}
+        baseline_comparison = payload.get("baseline_comparison") or {}
+        for case_id in case_ids:
+            review = review_records[case_id]
+            expected_selection = {
+                "classification": review.get("classification"),
+                "source_ref": review.get("source_ref"),
+                "retrieved_l3_indices": review.get("retrieved_l3_indices", []),
+                "evidence_l3_indices": review.get("evidence_l3_indices", []),
+                "confidence": review.get("confidence"),
+            }
+            if manual_selection.get(case_id) != expected_selection:
+                raise ValueError(f"target manifest 的人工选择摘要与源复核不一致：{case_id}")
+            source_record = source_result_records.get(case_id)
+            if source_record is None:
+                raise ValueError(f"target manifest 的源 results.jsonl 缺少题目：{case_id}")
+            expected_baseline = {
+                "verdict": source_record.get("answer_grade", {}).get("verdict"),
+                "evidence_coverage": source_record.get("evidence_coverage"),
+                "retrieved_filenames": source_record.get("retrieved_filenames", []),
+                "expected_evidence_filenames": source_record.get(
+                    "expected_evidence_filenames",
+                    source_record.get("evidence_filenames", []),
+                ),
+            }
+            if baseline_comparison.get(case_id) != expected_baseline:
+                raise ValueError(f"target manifest 的基线摘要与源结果不一致：{case_id}")
     by_id = {str(case["id"]): dict(case) for case in selected_analysis}
+    baseline_comparison = payload.get("baseline_comparison") or {}
+    for case_id, case in by_id.items():
+        if case_id in baseline_comparison:
+            case["_baseline_comparison"] = baseline_comparison[case_id]
     return [by_id[case_id] for case_id in case_ids], split_hash
 
 
@@ -947,7 +1379,16 @@ def _manual_review_records(records: list[dict[str, Any]]) -> list[dict[str, Any]
             reasons.append("evidence_complete_answer_failed")
         if verdict == "pass" and coverage < 1.0:
             reasons.append("answer_passed_evidence_incomplete")
-        if record.get("evaluation_error") or record.get("answer_generation_error"):
+        evidence_grading_error = (
+            (record.get("rag_trace") or {}).get("evidence_reason")
+            == "evidence_grading_unavailable"
+        )
+        if (
+            record.get("evaluation_error")
+            or record.get("answer_generation_error")
+            or (grade.get("grader_error") or "")
+            or evidence_grading_error
+        ):
             reasons.append("system_error")
         if reasons:
             queue_records.append({"review_reasons": reasons, "record": record})
@@ -1576,6 +2017,13 @@ def _multihop_error_record(
         "evaluation_error": f"{type(exc).__name__}: {exc}",
         "null_refusal_correct": False,
         "rag_trace": trace,
+        "candidate_audits": current_state.get("candidate_audits") or [],
+        "expected_fact_audit": [{
+            "fact": fact, "first_seen_stage": None, "supporting_chunk_ids": [],
+            "used_in_answer": None, "root_cause": None,
+            "reason": "pending_manual_review", "confidence": None,
+        } for fact in (case.get("answer_facts") or [])],
+        "baseline_comparison": case.get("_baseline_comparison"),
         "route": current_state.get("route"),
         "retrieval_status": current_state.get("retrieval_status"),
         "rag_seconds": 0.0,
@@ -1647,6 +2095,13 @@ def _evaluate_multihop_case(
             "null_refusal_correct": case["question_type"] in {"null", "null_query", "info_not_found"}
             and answer_grade["verdict"] == "pass",
             "rag_trace": trace,
+            "candidate_audits": state.get("candidate_audits") or [],
+            "expected_fact_audit": [{
+                "fact": fact, "first_seen_stage": None, "supporting_chunk_ids": [],
+                "used_in_answer": None, "root_cause": None,
+                "reason": "pending_manual_review", "confidence": None,
+            } for fact in (case.get("answer_facts") or [])],
+            "baseline_comparison": case.get("_baseline_comparison"),
             "route": state.get("route"),
             "retrieval_status": state.get("retrieval_status"),
             "rag_seconds": rag_seconds,
@@ -1673,6 +2128,8 @@ def _build_multihop_runtime(config: dict[str, Any]) -> tuple[RetrievalRuntime, J
         parent_chunk_store=ParentChunkStore(),
         retrieval_mode="hybrid",
         enable_rewrite_candidate_fusion=bool(config.get("rewrite_candidate_fusion_enabled")),
+        enable_adjacent_l3_expansion=bool(config.get("adjacent_l3_expansion_enabled")),
+        capture_candidate_trace=bool(config.get("candidate_trace_capture_enabled")),
     )
     judge_config = _judge_config()
     judge_client = requests.Session() if judge_config else None
@@ -1760,6 +2217,184 @@ def _run_case_in_worker(
         return payload["record"]
 
 
+def _evaluation_worker_count(config: dict[str, Any]) -> int:
+    """Read and validate the execution-only worker count from a config snapshot."""
+    raw_value = config.get("evaluation_worker_count", 1)
+    if isinstance(raw_value, bool):
+        raise ValueError("evaluation_worker_count 必须是 1 到 32 的整数")
+    try:
+        worker_count = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("evaluation_worker_count 必须是 1 到 32 的整数") from exc
+    if not 1 <= worker_count <= MAX_EVALUATION_WORKERS:
+        raise ValueError(
+            f"evaluation_worker_count 必须在 1 到 {MAX_EVALUATION_WORKERS} 之间"
+        )
+    return worker_count
+
+
+def _finalize_multihop_evaluation(
+    output_dir: Path,
+    config: dict[str, Any],
+    cases: list[dict[str, Any]],
+    records: list[dict[str, Any]],
+    completed_case_ids: set[str],
+    interruption_error: str,
+) -> dict[str, Any]:
+    """Write the shared terminal progress and metrics for serial or pooled execution."""
+    summary = {
+        "dataset": config.get("dataset", "multihoprag"),
+        "run_id": config["run_id"],
+        "judge_request_type": "independent_grade_model",
+        "evaluation_worker_count": _evaluation_worker_count(config),
+        **multihop_metrics(records),
+    }
+    summary["by_question_type"] = _enterprise_question_type_summary(
+        records,
+        evaluation_mode="rag",
+    )
+    _write_evaluation_progress(
+        output_dir,
+        total_cases=len(cases),
+        completed_case_ids=completed_case_ids,
+        status="interrupted" if interruption_error else "completed",
+        error=interruption_error,
+    )
+    summary["evaluation_status"] = "interrupted" if interruption_error else "completed"
+    if interruption_error:
+        summary["interruption_error"] = interruption_error
+    return summary
+
+
+def _evaluate_multihop_concurrently(
+    output_dir: Path,
+    config: dict[str, Any],
+    cases: list[dict[str, Any]],
+    *,
+    checkpoint_filename: str,
+    worker_count: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run independent cases in separate workers while checkpointing in the parent.
+
+    A worker owns at most one in-flight case.  This keeps the existing per-case
+    timeout and worker-recovery guarantees intact while allowing independent
+    evaluation cases to overlap.
+    """
+    checkpoint_path = output_dir / checkpoint_filename
+    records = _read_multihop_checkpoints(checkpoint_path)
+    cases_by_id = {str(case["id"]): case for case in cases}
+    records = [
+        _normalize_checkpoint_record(record, cases_by_id[str(record["case_id"])])
+        if str(record.get("case_id")) in cases_by_id else record
+        for record in records
+    ]
+    completed_case_ids = {str(record["case_id"]) for record in records}
+    pending_cases = [case for case in cases if str(case["id"]) not in completed_case_ids]
+    _write_evaluation_progress(
+        output_dir,
+        total_cases=len(cases),
+        completed_case_ids=completed_case_ids,
+        status="running",
+    )
+
+    case_timeout = evaluation_case_timeout_seconds()
+    active_workers: list[_MultiHopWorker] = []
+    inflight: dict[Any, tuple[_MultiHopWorker, dict[str, Any], float]] = {}
+    interruption_error = ""
+    next_case_index = 0
+
+    def start_worker() -> _MultiHopWorker:
+        worker = _start_multihop_worker(config)
+        active_workers.append(worker)
+        return worker
+
+    def retire_worker(worker: _MultiHopWorker) -> None:
+        _stop_multihop_worker(worker)
+        active_workers[:] = [item for item in active_workers if item is not worker]
+
+    executor = ThreadPoolExecutor(
+        max_workers=min(worker_count, len(pending_cases) or 1),
+        thread_name_prefix="rag-evaluation-case",
+    )
+    try:
+        for _ in range(min(worker_count, len(pending_cases))):
+            worker = start_worker()
+            case = pending_cases[next_case_index]
+            next_case_index += 1
+            future = executor.submit(_run_case_in_worker, worker, case, case_timeout)
+            inflight[future] = (worker, case, time.perf_counter())
+
+        while inflight:
+            completed_futures, _ = wait(inflight, return_when=FIRST_COMPLETED)
+            reusable_workers: list[_MultiHopWorker | None] = []
+            for future in completed_futures:
+                worker, case, started = inflight.pop(future)
+                try:
+                    record = future.result()
+                except Exception as exc:
+                    record = _multihop_error_record(
+                        case,
+                        exc,
+                        elapsed_seconds=time.perf_counter() - started,
+                        dataset_label=config.get("dataset", "multihoprag"),
+                    )
+                    retire_worker(worker)
+                    worker = None
+                else:
+                    if record.get("evaluation_error"):
+                        # An API/model failure can leave this worker's clients in
+                        # an unhealthy state, so replace only this worker slot.
+                        retire_worker(worker)
+                        worker = None
+
+                _append_result_checkpoint(checkpoint_path, record)
+                records.append(record)
+                completed_case_ids.add(str(case["id"]))
+                _write_evaluation_progress(
+                    output_dir,
+                    total_cases=len(cases),
+                    completed_case_ids=completed_case_ids,
+                    status="running",
+                )
+                if _is_provider_quota_error(record):
+                    interruption_error = str(record.get("evaluation_error") or "provider quota error")
+                reusable_workers.append(worker)
+
+            if interruption_error:
+                # Stop concurrent work immediately.  Its uncheckpointed cases
+                # remain missing and are the only cases selected by a later retry.
+                break
+
+            for worker in reusable_workers:
+                if next_case_index >= len(pending_cases):
+                    continue
+                if worker is None:
+                    worker = start_worker()
+                case = pending_cases[next_case_index]
+                next_case_index += 1
+                future = executor.submit(_run_case_in_worker, worker, case, case_timeout)
+                inflight[future] = (worker, case, time.perf_counter())
+    finally:
+        for worker in list(active_workers):
+            _stop_multihop_worker(worker)
+        # Stopping the process workers above wakes any waiting coordinator
+        # threads.  Their aborted cases deliberately stay absent from JSONL.
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    records.sort(key=lambda record: next(
+        (index for index, case in enumerate(cases) if str(case["id"]) == str(record.get("case_id"))),
+        len(cases),
+    ))
+    return records, _finalize_multihop_evaluation(
+        output_dir,
+        config,
+        cases,
+        records,
+        completed_case_ids,
+        interruption_error,
+    )
+
+
 def evaluate_multihop(
     output_dir: Path,
     config: dict[str, Any],
@@ -1769,6 +2404,18 @@ def evaluate_multihop(
     checkpoint_filename: str = "results.jsonl",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """运行完整图评测，并以进程级单题总时限保证整轮可恢复。"""
+    worker_count = _evaluation_worker_count(config)
+    if worker_count > 1:
+        if case_runner:
+            raise ValueError("并发评测不支持注入 case_runner；请使用真实隔离 worker")
+        return _evaluate_multihop_concurrently(
+            output_dir,
+            config,
+            cases,
+            checkpoint_filename=checkpoint_filename,
+            worker_count=worker_count,
+        )
+
     runtime: RetrievalRuntime | None = None
     judge_config: JudgeConfig | None = None
     judge_client: requests.Session | None = None
@@ -1836,27 +2483,14 @@ def evaluate_multihop(
                 break
     finally:
         _stop_multihop_worker(worker)
-    summary = {
-        "dataset": config.get("dataset", "multihoprag"),
-        "run_id": config["run_id"],
-        "judge_request_type": "independent_grade_model",
-        **multihop_metrics(records),
-    }
-    summary["by_question_type"] = _enterprise_question_type_summary(
-        records,
-        evaluation_mode="rag",
-    )
-    _write_evaluation_progress(
+    return records, _finalize_multihop_evaluation(
         output_dir,
-        total_cases=len(cases),
-        completed_case_ids=completed_case_ids,
-        status="interrupted" if interruption_error else "completed",
-        error=interruption_error,
+        config,
+        cases,
+        records,
+        completed_case_ids,
+        interruption_error,
     )
-    summary["evaluation_status"] = "interrupted" if interruption_error else "completed"
-    if interruption_error:
-        summary["interruption_error"] = interruption_error
-    return records, summary
 
 
 def _multihop_report(
@@ -1903,6 +2537,89 @@ def _multihop_report(
     return "\n".join(lines)
 
 
+def _candidate_audit_report(results: list[dict[str, Any]]) -> str:
+    """Human-readable index for candidate snapshots; full text remains in JSONL."""
+    lines = [
+        "# Candidate Audit",
+        "",
+        "本报告只展示查询、阶段数量、候选标识和事实点索引；候选全文保存在同目录 `results.jsonl`。",
+        "",
+        "| Case | Trigger | 原始 L3 | 扩展后候选 | 合并后 | 最终 | Verdict |",
+        "| --- | --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+
+    def identifiers(items: list[dict[str, Any]], limit: int = 8) -> str:
+        values: list[str] = []
+        for item in items[:limit]:
+            value = item.get("chunk_id") or item.get("id") or item.get("filename") or "?"
+            values.append(f"`{value}`")
+        if len(items) > limit:
+            values.append(f"…（另 {len(items) - limit} 个，见 JSONL）")
+        return ", ".join(values) or "（无）"
+
+    def inline(value: Any, empty: str = "（无）") -> str:
+        text = str(value or empty).replace("`", "'").replace("\n", " ")
+        return f"`{text}`"
+
+    for record in results:
+        audits = record.get("candidate_audits") or []
+        fused = next((item for item in audits if item.get("stage") == "fused"), None)
+        primary = fused or (audits[0] if audits else {})
+        raw_count = len((primary or {}).get("original_raw_leaf_candidates") or [])
+        if not raw_count:
+            raw_count = len((primary or {}).get("raw_leaf_candidates") or [])
+        if not raw_count:
+            raw_count = sum(len(item.get("raw_leaf_candidates") or []) for item in audits)
+        expanded_count = len((primary or {}).get("post_adjacent_expansion_candidates") or [])
+        if not expanded_count:
+            expanded_count = len((primary or {}).get("raw_leaf_candidates") or [])
+        merged_count = len((primary or {}).get("post_merge_candidates") or [])
+        final_count = len((primary or {}).get("final_context_candidates") or [])
+        trace = record.get("rag_trace") or {}
+        trigger = trace.get("rewrite_method") or "未触发"
+        verdict = (record.get("answer_grade") or {}).get("verdict", "review")
+        lines.append(
+            f"| `{record.get('case_id')}` | `{trigger}` | {raw_count} | {expanded_count} | "
+            f"{merged_count} | {final_count} | `{verdict}` |"
+        )
+        baseline = record.get("baseline_comparison") or {}
+        primary_meta = (primary or {}).get("meta") or {}
+        lines.extend([
+            "",
+            f"### `{record.get('case_id')}`",
+            "",
+            f"- 问题：{str(record.get('question') or '（无）').replace(chr(10), ' ')}",
+            f"- 改写查询：{inline(trace.get('rewritten_query'), '未触发')}",
+            f"- 基线对照：verdict={inline(baseline.get('verdict'))}，证据覆盖率={inline(baseline.get('evidence_coverage'))}",
+            f"- 标准事实点：{len(record.get('expected_fact_audit') or [])} 个；人工审计：`待复核`",
+        ])
+        if trace.get("adjacent_l3_expansion_enabled"):
+            lines.extend([
+                f"- 相邻 L3 扩展是否执行：{inline(primary_meta.get('adjacent_l3_expansion_applied', False))}",
+                f"- 相邻 L3 新增候选：{inline(primary_meta.get('adjacent_l3_expansion_added_candidate_count', 0))}",
+                f"- 相邻 L3 回退原因：{inline(primary_meta.get('adjacent_l3_expansion_fallback_reason'))}",
+            ])
+        else:
+            lines.append(
+                f"- 融合是否实际执行：{inline(primary_meta.get('rewrite_candidate_fusion_applied', False))}"
+            )
+        for audit in audits:
+            lines.extend([
+                "",
+                f"#### 阶段：`{audit.get('stage') or 'unknown'}`",
+                f"- 查询来源：{inline(audit.get('query_origin'), 'unknown')}；查询：{inline(audit.get('query'))}",
+                f"- 原始 L3（{len(audit.get('original_raw_leaf_candidates') or audit.get('raw_leaf_candidates') or [])}）：{identifiers(audit.get('original_raw_leaf_candidates') or audit.get('raw_leaf_candidates') or [])}",
+                f"- 相邻扩展块（{len(audit.get('adjacent_l3_candidates') or [])}）：{identifiers(audit.get('adjacent_l3_candidates') or [])}",
+                f"- 原始候选（{len(audit.get('raw_leaf_candidates') or [])}）：{identifiers(audit.get('raw_leaf_candidates') or [])}",
+                f"- Auto-merging 后（{len(audit.get('post_merge_candidates') or [])}）：{identifiers(audit.get('post_merge_candidates') or [])}",
+                f"- Rerank 返回（{len(audit.get('rerank_returned_candidates') or [])}）：{identifiers(audit.get('rerank_returned_candidates') or [])}",
+                f"- 阈值拒绝（{len(audit.get('threshold_rejected_candidates') or [])}）：{identifiers(audit.get('threshold_rejected_candidates') or [])}",
+                f"- 最终上下文（{len(audit.get('final_context_candidates') or [])}）：{identifiers(audit.get('final_context_candidates') or [])}",
+            ])
+        lines.extend(["", "---"])
+    return "\n".join(lines) + "\n"
+
+
 def _new_experiment_config(
     *,
     dataset: str,
@@ -1915,6 +2632,7 @@ def _new_experiment_config(
     evaluation_mode: Literal["retrieval", "rag"],
     changed_variable: str | None,
     case_count: int,
+    evaluation_worker_count: int,
 ) -> dict[str, Any]:
     """Capture the complete, non-secret input snapshot for one experiment."""
     corpus_manifest = _read_json(corpus_manifest_path)
@@ -1936,7 +2654,12 @@ def _new_experiment_config(
         "case_set": case_set,
         "case_count": case_count,
         "changed_variable": changed_variable,
+        # Execution-only setting: it changes throughput, not the frozen RAG
+        # retrieval/generation inputs.  Keep it in every experiment snapshot.
+        "evaluation_worker_count": evaluation_worker_count,
         "rewrite_candidate_fusion_enabled": changed_variable == "rewrite_candidate_fusion",
+        "adjacent_l3_expansion_enabled": changed_variable == "adjacent_l3_expansion",
+        "candidate_trace_capture_enabled": False,
         "code_version": _code_version(),
         "created_at": datetime.now(UTC).isoformat(),
     })
@@ -1953,12 +2676,19 @@ def evaluate_run(
     changed_variable: str | None = None,
     retry_from_evaluation_id: str | None = None,
     target_manifest_path: Path | None = None,
+    capture_candidate_trace: bool = False,
+    evaluation_worker_count: int = 1,
 ) -> Path:
     """Evaluate a prepared corpus, optionally in a non-overlapping experiment run.
 
     ``evaluation_id`` is the formal path: its artifacts never overwrite corpus
     configuration or another experiment. The no-ID branch preserves old runs.
     """
+    if isinstance(evaluation_worker_count, bool) or not 1 <= evaluation_worker_count <= MAX_EVALUATION_WORKERS:
+        raise ValueError(
+            f"evaluation_worker_count 必须在 1 到 {MAX_EVALUATION_WORKERS} 之间"
+        )
+
     corpus_dir = run_directory(dataset, run_id)
     corpus_config = _read_json(corpus_dir / "config.json")
     manifest_path = corpus_dir / "manifest.json"
@@ -1971,13 +2701,23 @@ def evaluate_run(
         raise ValueError("只有 EnterpriseRAG 正式语料支持 analysis/validation case set")
 
     all_cases = read_cases(corpus_dir / "cases.jsonl")
+    target_manifest_type: str | None = None
+    if changed_variable == "adjacent_l3_expansion" and target_manifest_path is None:
+        raise ValueError(
+            "adjacent_l3_expansion 只能通过固定的 11 题 target manifest 评测"
+        )
     if target_manifest_path is not None:
+        if evaluation_id is None:
+            raise ValueError("target manifest 评测必须提供独立 evaluation_id，不能写入 corpus 根目录")
+        if dataset != "enterpriserag":
+            raise ValueError("target manifest 评测只支持 EnterpriseRAG 正式语料")
         cases, selected_split_hash = _select_target_manifest_cases(
             corpus_dir=corpus_dir,
             all_cases=all_cases,
             case_set=case_set,
             target_manifest_path=target_manifest_path,
         )
+        target_manifest_type = str(_read_json(target_manifest_path).get("manifest_type") or "rewrite_candidate_fusion")
     else:
         cases, selected_split_hash = _select_experiment_cases(corpus_dir, all_cases, case_set)
     if not cases:
@@ -1985,8 +2725,21 @@ def evaluate_run(
     mode = evaluation_mode or str(corpus_config.get("evaluation_mode") or "rag")
     if mode not in {"retrieval", "rag"}:
         raise ValueError(f"不支持的评测模式：{mode}")
-    if target_manifest_path is not None and changed_variable != "rewrite_candidate_fusion":
-        raise ValueError("target manifest 运行必须明确声明 changed_variable=rewrite_candidate_fusion")
+    if target_manifest_path is not None:
+        if mode != "rag":
+            raise ValueError("target manifest 评测必须使用完整 RAG 模式")
+        expected_variable = _TARGET_MANIFEST_CONTRACTS[target_manifest_type or "rewrite_candidate_fusion"][1]
+        if changed_variable != expected_variable:
+            raise ValueError(
+                f"{target_manifest_type} target manifest 必须明确声明 changed_variable={expected_variable}"
+            )
+    if target_manifest_type in {"evidence_candidate_audit", "adjacent_l3_expansion"} and not capture_candidate_trace:
+        raise ValueError(f"{target_manifest_type} target manifest 必须显式开启 candidate trace")
+    if capture_candidate_trace and (
+        target_manifest_path is None
+        or changed_variable not in {"rewrite_candidate_fusion", "adjacent_l3_expansion"}
+    ):
+        raise ValueError("candidate trace 只能在受控的单变量 target manifest 评测中开启")
     if retry_from_evaluation_id and (evaluation_id is None or mode != "rag" or dataset != "enterpriserag"):
         raise ValueError("retry 只支持 EnterpriseRAG 完整 RAG，且必须提供新的 evaluation_id")
 
@@ -2029,15 +2782,22 @@ def evaluate_run(
             evaluation_mode=mode,  # type: ignore[arg-type]
             changed_variable=changed_variable,
             case_count=len(cases),
+            evaluation_worker_count=evaluation_worker_count,
         )
         if target_manifest_path is not None:
             requested_config.update({
                 "target_manifest_path": str(target_manifest_path),
                 "target_manifest_sha256": _sha256_file(target_manifest_path),
             })
+        if capture_candidate_trace:
+            requested_config["candidate_trace_capture_enabled"] = True
         if retry_from_evaluation_id:
             retry_compatibility_ignored = {
                 "run_id", "evaluation_id", "prepared_at", "created_at", "code_version",
+                # Worker count is an execution budget, not a RAG input.  A
+                # retry may safely use more workers while preserving all model,
+                # retrieval, corpus, and target-manifest inputs.
+                "evaluation_worker_count",
             }
             # A retry may intentionally change only the outer evaluation budget;
             # all model, retrieval, corpus, and case-set inputs must still match.
@@ -2079,9 +2839,16 @@ def evaluate_run(
                 "model_timeout_seconds", "evaluation_case_timeout_seconds",
                 "retry_source_evaluation_id", "retry_source_results_sha256", "retry_case_count",
                 "preserved_case_count",
-                "rewrite_candidate_fusion_enabled", "target_manifest_path", "target_manifest_sha256",
+                "evaluation_worker_count",
+                "rewrite_candidate_fusion_enabled", "adjacent_l3_expansion_enabled",
+                "target_manifest_path", "target_manifest_sha256",
+                "candidate_trace_capture_enabled",
             )
-            changed = [key for key in immutable_keys if config.get(key) != requested_config.get(key)]
+            changed = [
+                key for key in immutable_keys
+                if config.get(key, False if key == "candidate_trace_capture_enabled" else None)
+                != requested_config.get(key)
+            ]
             if changed:
                 raise FileExistsError(
                     f"evaluation_id 已被不同配置使用，拒绝覆盖：{evaluation_id}（差异字段：{changed}）"
@@ -2257,6 +3024,10 @@ def evaluate_run(
         "source_case_split_sha256": selected_split_hash or manifest.get("case_split_sha256"),
     })
     _write_results(output_dir / "results.jsonl", results)
+    if config.get("candidate_trace_capture_enabled"):
+        (output_dir / "candidate-audit.md").write_text(
+            _candidate_audit_report(results), encoding="utf-8", newline="\n"
+        )
     _write_case_review_report(
         output_dir,
         results,

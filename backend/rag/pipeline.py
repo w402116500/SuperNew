@@ -30,6 +30,7 @@ from backend.rag.utils import (
     RETRIEVAL_TOP_K,
     RetrievalRuntime,
     retrieve_documents,
+    fuse_rewrite_candidate_results,
     rewrite_query_once,
     dedupe_documents,
     retrieval_trace_fields,
@@ -202,6 +203,9 @@ class RAGState(TypedDict):
     rewritten_query: Optional[str]  # 拼接改写信息后的第二次检索查询。
     step_back_question: Optional[str]  # Step-back 产生的更抽象问题。
     hyde_document: Optional[str]  # HyDE 产生的假设文档，仅用于检索。
+    initial_retrieval: Optional[dict]
+    rewrite_failed: bool
+    candidate_audits: Optional[List[dict]]
     # rag_trace 最终会被 Schema 过滤后随 AI 消息持久化。
     rag_trace: Optional[dict]  # 本轮检索的结构化诊断记录，最终会随消息保存。
     # 复杂度路由新增字段
@@ -347,6 +351,9 @@ def _initial_state(
         "rewritten_query": None,  # 尚未生成第二次检索查询。
         "step_back_question": None,  # 尚未产生抽象退步问题。
         "hyde_document": None,  # 尚未产生假设性检索文档。
+        "initial_retrieval": None,
+        "rewrite_failed": False,
+        "candidate_audits": [],
         "rag_trace": None,  # 检索节点会创建本轮诊断记录。
         "complexity": None,  # 复杂度节点会写入 simple 或 complex。
         "complexity_reason": None,  # 复杂度节点会写入判断理由。
@@ -359,6 +366,32 @@ def _initial_state(
         "rag_step_group_label": rag_step_group_label,  # 子分支可指定分组显示名称。
         "retrieval_runtime": retrieval_runtime,  # 评测注入的依赖沿整张图显式传递。
     }
+
+
+def _rewrite_candidate_fusion_enabled(state: RAGState) -> bool:
+    runtime = state.get("retrieval_runtime")
+    return bool(runtime and runtime.enable_rewrite_candidate_fusion)
+
+
+def _adjacent_l3_expansion_enabled(state: RAGState) -> bool:
+    """Return the evaluation-only T10 flag without changing online routing."""
+    runtime = state.get("retrieval_runtime")
+    return bool(runtime and runtime.enable_adjacent_l3_expansion)
+
+
+def _candidate_trace_capture_enabled(state: RAGState) -> bool:
+    runtime = state.get("retrieval_runtime")
+    return bool(runtime and runtime.capture_candidate_trace)
+
+
+def _rewrite_fusion_failure_update(state: RAGState, *, rewrite_count: int, exc: BaseException) -> RAGState:
+    rag_trace = state.get("rag_trace", {}) or {}
+    rag_trace.update({
+        "rewrite_candidate_fusion_enabled": True,
+        "rewrite_candidate_fusion_fallback_reason": f"rewrite_query_failed:{type(exc).__name__}",
+    })
+    _emit(state, "⚠️", "查询改写失败，保留首次检索证据")
+    return {"rewrite_count": rewrite_count + 1, "rewrite_failed": True, "rag_trace": rag_trace}
 
 # 第一轮只用原问题检索，并同时保存初始文档快照供 trace 对比。
 def retrieve_initial(state: RAGState) -> RAGState:
@@ -408,12 +441,20 @@ def retrieve_initial(state: RAGState) -> RAGState:
         **retrieval_trace_fields(retrieve_meta),  # 展开底层检索允许公开的白名单诊断字段。
     }
     # 节点只返回本节点更新的字段，LangGraph 会合并到已有 RAGState。
-    return {
+    update: RAGState = {
         "query": query,  # 把实际检索查询写回图状态。
         "docs": results,  # 把候选证据交给评分节点。
         "context": context,  # 把带引用编号的正文交给评分模型。
         "rag_trace": rag_trace,  # 把初次检索诊断交给后续节点继续追加。
     }
+    if _rewrite_candidate_fusion_enabled(state):
+        update["initial_retrieval"] = retrieved
+    if _candidate_trace_capture_enabled(state):
+        update["candidate_audits"] = list(retrieved.get("candidate_audits") or [])
+        for audit in update["candidate_audits"]:
+            for candidate in audit.get("raw_leaf_candidates") or []:
+                candidate.setdefault("candidate_sources", ["initial"])
+    return update
 
 
 def _route_after_initial(state: RAGState) -> Literal["grade_documents"]:
@@ -424,6 +465,12 @@ def _route_after_initial(state: RAGState) -> Literal["grade_documents"]:
 def _route_after_grade(state: RAGState) -> Literal["rewrite_question", "end"]:
     """只有评分结果允许改写时进入重写节点，其他路由均结束本次主图。"""
     if state.get("route") == "rewrite":  # 仅 rewrite 路由需要继续执行图。
+        # T10 intentionally keeps one original-query recall. Its only new
+        # behavior is direct adjacent-L3 expansion before the existing merge
+        # and rerank steps, so it must not add a rewritten query or a second
+        # embedding/vector-retrieval call.
+        if _adjacent_l3_expansion_enabled(state):
+            return "end"
         return "rewrite_question"
     return "end"
 
@@ -639,17 +686,31 @@ def rewrite_question_node(state: RAGState) -> RAGState:
         }
 
     _emit(state, "🧠", "选择 Step-back / HyDE 重写方式")
-    rewrite = rewrite_query_once(question)  # 调用 utils 中的结构化二选一重写能力。
+    try:
+        rewrite = rewrite_query_once(question)  # 调用 utils 中的结构化二选一重写能力。
+    except Exception as exc:
+        if not _rewrite_candidate_fusion_enabled(state):
+            raise
+        return _rewrite_fusion_failure_update(state, rewrite_count=rewrite_count, exc=exc)
     rewrite_method = (rewrite.get("rewrite_method") or "").strip()  # 读取并清洗策略名称。
     step_back_question = (rewrite.get("step_back_question") or "").strip()  # 读取 Step-back 输出。
     hyde_document = (rewrite.get("hyde_document") or "").strip()  # 读取 HyDE 输出。
     rewritten_query = (rewrite.get("rewritten_query") or "").strip()  # 读取真正用于检索的拼接查询。
     if rewrite_method not in ("step_back", "hyde") or not rewritten_query:
-        raise ValueError("Query rewriting returned an incomplete result")
+        exc = ValueError("Query rewriting returned an incomplete result")
+        if _rewrite_candidate_fusion_enabled(state):
+            return _rewrite_fusion_failure_update(state, rewrite_count=rewrite_count, exc=exc)
+        raise exc
     if rewrite_method == "step_back" and (not step_back_question or hyde_document):
-        raise ValueError("Step-back rewriting returned an invalid result")
+        exc = ValueError("Step-back rewriting returned an invalid result")
+        if _rewrite_candidate_fusion_enabled(state):
+            return _rewrite_fusion_failure_update(state, rewrite_count=rewrite_count, exc=exc)
+        raise exc
     if rewrite_method == "hyde" and (not hyde_document or step_back_question):
-        raise ValueError("HyDE rewriting returned an invalid result")
+        exc = ValueError("HyDE rewriting returned an invalid result")
+        if _rewrite_candidate_fusion_enabled(state):
+            return _rewrite_fusion_failure_update(state, rewrite_count=rewrite_count, exc=exc)
+        raise exc
 
     method_label = "Step-back" if rewrite_method == "step_back" else "HyDE"  # 将内部枚举转成前端可读名称。
     _emit(state, "✅", f"已选择 {method_label} 重写", "本轮只执行这一种重写检索")
@@ -682,6 +743,19 @@ def retrieve_rewritten(state: RAGState) -> RAGState:
     重写方法和查询均由上一节点写入状态；缺失时立即报错，避免错误地用空查询或原问题
     进行“重写后检索”。评分节点随后会看到 rewrite_count=1，因此不能再次循环改写。
     """
+    fusion_enabled = _rewrite_candidate_fusion_enabled(state)
+    initial_retrieval = state.get("initial_retrieval") or {"docs": state.get("docs") or [], "meta": {}}
+    if state.get("rewrite_failed"):
+        fallback_reason = (state.get("rag_trace") or {}).get("rewrite_candidate_fusion_fallback_reason")
+        fused = fuse_rewrite_candidate_results(
+            original_query=state["question"], initial_retrieval=initial_retrieval,
+            rewritten_retrieval=None, top_k=RETRIEVAL_TOP_K,
+            runtime=state.get("retrieval_runtime"), fallback_reason=str(fallback_reason or "rewrite_query_failed"),
+        )
+        results = fused.get("docs", [])
+        rag_trace = state.get("rag_trace", {}) or {}
+        rag_trace.update({"retrieved_chunks": results, "rewrite_retrieved_chunks": [], "retrieval_stage": "rewrite_fusion_fallback", **retrieval_trace_fields(fused.get("meta", {}))})
+        return {"docs": results, "context": _format_docs(results), "candidate_audits": fused.get("candidate_audits") or [], "rag_trace": rag_trace}
     rewrite_method = (state.get("rewrite_method") or "").strip()  # 读取上个节点已验证的改写方法。
     if rewrite_method not in ("step_back", "hyde"):
         raise ValueError("rewrite_method is required for rewritten retrieval")
@@ -696,8 +770,27 @@ def retrieve_rewritten(state: RAGState) -> RAGState:
         knowledge_filenames=state.get("knowledge_filenames"),
         runtime=state.get("retrieval_runtime"),
     )  # 用改写查询重新执行完整检索流水线。
-    results = retrieved.get("docs", [])  # 提取改写后的最终候选证据。
-    retrieve_meta = retrieved.get("meta", {})  # 提取本轮召回、合并、精排元数据。
+    for audit in retrieved.get("candidate_audits") or []:
+        audit["query_origin"] = rewrite_method
+        audit["query"] = rewritten_query
+        for candidate in audit.get("raw_leaf_candidates") or []:
+            candidate.setdefault("candidate_sources", [rewrite_method])
+    rewritten_results = retrieved.get("docs", [])  # 提取改写后的最终候选证据。
+    if fusion_enabled:
+        fused = fuse_rewrite_candidate_results(
+            original_query=state["question"], initial_retrieval=initial_retrieval,
+            rewritten_retrieval=retrieved, top_k=RETRIEVAL_TOP_K,
+            runtime=state.get("retrieval_runtime"),
+        )
+        results = fused.get("docs", [])
+        retrieve_meta = fused.get("meta", {})
+        candidate_audits = list(state.get("candidate_audits") or [])
+        if fused.get("candidate_audit"):
+            candidate_audits.append(fused["candidate_audit"])
+    else:
+        results = rewritten_results
+        retrieve_meta = retrieved.get("meta", {})
+        candidate_audits = []
     context = _format_docs(results)  # 重新生成供第二次评分使用的引用上下文。
     _emit(
         state,
@@ -715,8 +808,8 @@ def retrieve_rewritten(state: RAGState) -> RAGState:
         "rewrite_method": rewrite_method,
         "rewritten_query": rewritten_query,
         "retrieved_chunks": results,
-        "rewrite_retrieved_chunks": results,
-        "retrieval_stage": "rewritten",
+        "rewrite_retrieved_chunks": rewritten_results,
+        "retrieval_stage": "rewrite_fusion" if fusion_enabled and retrieve_meta.get("rewrite_candidate_fusion_applied") else "rewritten",
         **retrieval_trace_fields(retrieve_meta),
     })
     if state.get("step_back_question"):  # 将前一节点的 Step-back 细节带入最终 trace。
@@ -726,6 +819,7 @@ def retrieve_rewritten(state: RAGState) -> RAGState:
     return {
         "docs": results,  # 使用改写查询得到的新证据，覆盖首次候选。
         "context": context,  # 使用新证据生成的评分上下文。
+        "candidate_audits": candidate_audits,
         "rag_trace": rag_trace,  # 同时保留初次和改写检索的诊断。
     }
 
@@ -908,6 +1002,10 @@ def prepare_sub_questions(state: RAGState) -> RAGState:
 
 def _route_after_complexity(state: RAGState):
     """简单问题直接检索，复杂问题先准备子问题再通过 Send 并行分发。"""
+    # T10 keeps exactly one original-question Hybrid candidate pool. Complex
+    # decomposition would add embeddings/vector searches and break that bound.
+    if _adjacent_l3_expansion_enabled(state):
+        return "retrieve_initial"
     if state.get("complexity") == "complex":  # 复杂问题先准备子问题，再由 Send 扇出。
         return "prepare_sub_questions"
     return "retrieve_initial"
@@ -968,7 +1066,9 @@ def synthesis(state: RAGState) -> RAGState:
 
     # 每个子 trace 再走一次白名单规范化，主 trace 不直接信任并行分支的临时字段。
     sub_traces = []  # 存放规范化后的子 Agent 诊断记录。
+    candidate_audits: List[dict] = []
     for result in sub_results:  # 每个并行结果都可能携带自己的 trace。
+        candidate_audits.extend(result.get("candidate_audits") or [])
         trace = result.get("rag_trace")  # 读取原始子 trace。
         if trace:  # 只有非空 trace 才需要 Pydantic 规范化。
             normalized_trace = normalize_rag_sub_trace(trace)  # 删除未知字段并校验结构。
@@ -1037,6 +1137,7 @@ def synthesis(state: RAGState) -> RAGState:
         "hitl_prompt": hitl_prompt,  # 无法回答时给前端的追问。
         "hitl_options": hitl_options,  # 无法回答时给前端的可选范围。
         "rag_trace": rag_trace,  # 完整的复杂问题诊断记录。
+        "candidate_audits": candidate_audits,
     }
 
 
@@ -1060,6 +1161,7 @@ def rag_sub_agent(state: RAGState) -> RAGState:
             "retrieval_status": result.get("retrieval_status") or trace.get("retrieval_status"),
             "route": result.get("route") or trace.get("route"),
             "rag_trace": trace,
+            "candidate_audits": result.get("candidate_audits") or [],
         }],
     }
 

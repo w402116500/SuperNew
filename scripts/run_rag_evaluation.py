@@ -51,7 +51,18 @@ def build_parser() -> argparse.ArgumentParser:
             command_parser.add_argument(
                 "--target-manifest",
                 default=None,
-                help="仅运行已冻结的 analysis target manifest（T9 小范围评测）。",
+                help="仅运行已冻结的 analysis target manifest（例如 T9/T10 小范围评测）。",
+            )
+            command_parser.add_argument(
+                "--capture-candidate-trace",
+                action="store_true",
+                help="在受控 target 实验中保存原始候选和阶段快照。",
+            )
+            command_parser.add_argument(
+                "--workers",
+                type=int,
+                default=1,
+                help="并发评测 worker 数；仅改变执行吞吐，默认 1。",
             )
     return parser
 
@@ -80,6 +91,8 @@ def main() -> int:
             changed_variable=args.changed_variable,
             retry_from_evaluation_id=args.retry_failed_from,
             target_manifest_path=Path(args.target_manifest) if args.target_manifest else None,
+            capture_candidate_trace=bool(args.capture_candidate_trace),
+            evaluation_worker_count=args.workers,
         )
     else:
         result = cleanup_run(dataset=args.dataset, run_id=run_id)

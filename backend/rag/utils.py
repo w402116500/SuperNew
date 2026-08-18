@@ -24,6 +24,8 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 # os 读取检索和精排相关环境变量；json 用于处理精排服务 JSON 异常。
 import os
 import json
+import re
+import time
 # requests 用于调用可选的外部 Rerank HTTP 服务。
 import requests
 # init_chat_model 用于在需要查询改写时创建低延迟模型客户端。
@@ -145,6 +147,7 @@ RETRIEVAL_TRACE_FIELDS = (
     "rerank_model",
     "rerank_endpoint",
     "rerank_error",
+    "rerank_elapsed_seconds",
     "rerank_timeout_seconds",
     "rerank_min_score",
     "post_rerank_count",
@@ -159,6 +162,15 @@ RETRIEVAL_TRACE_FIELDS = (
     "rewrite_candidate_fusion_fused_candidate_count",
     "rewrite_candidate_fusion_final_document_sources",
     "rewrite_candidate_fusion_fallback_reason",
+    "adjacent_l3_expansion_enabled",
+    "adjacent_l3_expansion_applied",
+    "adjacent_l3_expansion_original_candidate_count",
+    "adjacent_l3_expansion_requested_neighbor_count",
+    "adjacent_l3_expansion_retrieved_neighbor_count",
+    "adjacent_l3_expansion_added_candidate_count",
+    "adjacent_l3_expansion_deduplicated_candidate_count",
+    "adjacent_l3_expansion_skipped_candidate_count",
+    "adjacent_l3_expansion_fallback_reason",
 )
 
 # 全局初始化检索依赖（与 api 共用 embedding_service，保证 BM25 状态一致）
@@ -183,6 +195,12 @@ class RetrievalRuntime:
     # T9 is evaluation-only. Online calls keep the existing overwrite behavior
     # unless an isolated evaluation runtime explicitly turns this on.
     enable_rewrite_candidate_fusion: bool = False
+    # T10 is evaluation-only. It adds directly adjacent persisted L3 chunks to
+    # the initial candidate pool without running another embedding or search.
+    enable_adjacent_l3_expansion: bool = False
+    # Offline-only observation switch. Candidate text is retained only by the
+    # evaluation worker; public RagTrace remains a whitelist projection.
+    capture_candidate_trace: bool = False
 
 # 候选池必须不少于最终 top_k，给合并、精排和阈值过滤留出余量。
 def resolve_candidate_k(top_k: int) -> Tuple[int, Dict[str, Any]]:
@@ -305,6 +323,7 @@ def _merge_to_parent_level(
     docs: List[dict],
     parent_chunk_store: Any,
     threshold: int = 2,
+    mappings: List[dict] | None = None,
 ) -> Tuple[List[dict], int]:
     """在同一层级中，将命中足够多兄弟块的结果上卷为其直接父块。
 
@@ -356,6 +375,13 @@ def _merge_to_parent_level(
         # 诊断字段标记该结果由子块合并而来，便于 trace 解释召回变化。
         parent_doc["merged_from_children"] = True
         parent_doc["merged_child_count"] = len(groups[parent_id])
+        if mappings is not None:
+            mappings.append({
+                "parent_chunk_id": parent_id,
+                "parent_text": parent_doc.get("text", ""),
+                "child_chunk_ids": [str(child.get("chunk_id") or "") for child in groups[parent_id]],
+                "child_count": len(groups[parent_id]),
+            })
         parent_slot[parent_id] = len(merged_docs)
         merged_docs.append(parent_doc)
         merged_count += 1
@@ -391,6 +417,8 @@ def _auto_merge_candidates(
         Tuple[List[dict], Dict[str, Any]]: 合并后的候选和 Auto-merge 诊断元数据。
     """
     meta = _empty_merge_meta(auto_merge_enabled=enabled)
+    mappings: List[dict] = []
+    meta["auto_merge_mappings"] = mappings
     meta["post_merge_candidate_count"] = len(docs)
     if not enabled or not docs:
         # 配置关闭或没有召回结果时，不修改候选。
@@ -401,12 +429,14 @@ def _auto_merge_candidates(
         docs,
         parent_chunk_store=parent_chunk_store,
         threshold=AUTO_MERGE_THRESHOLD,
+        mappings=mappings,
     )
     # 第二步再检查 L2 是否足以继续上卷到 L1。
     merged_docs, merged_count_l2_l1 = _merge_to_parent_level(
         merged_docs,
         parent_chunk_store=parent_chunk_store,
         threshold=AUTO_MERGE_THRESHOLD,
+        mappings=mappings,
     )
 
     replaced_count = merged_count_l3_l2 + merged_count_l2_l1
@@ -423,6 +453,29 @@ def _auto_merge_candidates(
 def _sort_by_rank_score(docs: List[dict]) -> List[dict]:
     """按有效排名分从高到低排序；无分数的结果按 0 处理。"""
     return sorted(docs, key=lambda item: _effective_score(item) or 0.0, reverse=True)
+
+
+def _candidate_snapshot(doc: dict, raw_rank: int | None = None) -> dict:
+    """Create the complete JSON-safe candidate record used by offline audits."""
+    fields = (
+        "id", "chunk_id", "parent_chunk_id", "root_chunk_id", "chunk_level", "chunk_idx",
+        "filename", "page_number", "text", "score", "rrf_rank", "rerank_score",
+        "merged_from_children", "merged_child_count", "_rewrite_candidate_sources",
+        "post_merge_rank", "rerank_input_rank", "rerank_output_rank",
+        "threshold_rejected", "final_context_rank",
+    )
+    snapshot = {key: doc.get(key) for key in fields if key in doc}
+    if raw_rank is not None:
+        snapshot["raw_rank"] = raw_rank
+    labels = doc.get("_rewrite_candidate_sources")
+    if labels:
+        snapshot["candidate_sources"] = list(labels)
+    adjacent_origins = doc.get("_adjacent_l3_origins")
+    if adjacent_origins:
+        snapshot["adjacent_l3_origins"] = [dict(origin) for origin in adjacent_origins]
+    if "_adjacent_l3_added" in doc:
+        snapshot["adjacent_l3_added"] = bool(doc["_adjacent_l3_added"])
+    return snapshot
 
 
 # 相同 chunk_id 只保留一个结果，并合并更高排名分，避免重复引用。
@@ -447,6 +500,124 @@ def dedupe_documents(docs: List[dict]) -> List[dict]:
             continue
         _merge_rank_score_into(by_key[key], item)
     return [by_key[key] for key in order]
+
+
+_L3_CHUNK_ID_PATTERN = re.compile(r"^(?P<prefix>.+::p\d+::l3::)(?P<index>\d+)$")
+
+
+def _adjacent_l3_candidate_key(doc: dict, index: int) -> str:
+    """Return a stable key without collapsing candidates that lack identifiers."""
+    chunk_id = str(doc.get("chunk_id") or "").strip()
+    if chunk_id:
+        return f"chunk_id:{chunk_id}"
+    milvus_id = doc.get("id")
+    if milvus_id is not None and str(milvus_id).strip():
+        return f"milvus_id:{milvus_id}"
+    return f"missing_identifier:{index}"
+
+
+def _expand_adjacent_l3_candidates(
+    candidates: List[dict],
+    *,
+    milvus_store: Any,
+) -> tuple[List[dict], Dict[str, Any], List[dict]]:
+    """Add directly adjacent persisted L3 chunks without issuing a vector search.
+
+    L3 leaf chunks are stored in Milvus rather than ``ParentChunkStore``.  The
+    stable DocumentLoader ID includes its own L3 index, so this helper can build
+    the immediate ``n - 1`` / ``n + 1`` identifiers and resolve them through the
+    existing scalar ``get_chunks_by_ids`` API.  Only the original recall set is
+    expanded; newly read neighbours never expand recursively.
+    """
+    original = [dict(candidate) for candidate in candidates]
+    meta: Dict[str, Any] = {
+        "adjacent_l3_expansion_enabled": True,
+        "adjacent_l3_expansion_applied": False,
+        "adjacent_l3_expansion_original_candidate_count": len(original),
+        "adjacent_l3_expansion_requested_neighbor_count": 0,
+        "adjacent_l3_expansion_retrieved_neighbor_count": 0,
+        "adjacent_l3_expansion_added_candidate_count": 0,
+        "adjacent_l3_expansion_deduplicated_candidate_count": 0,
+        "adjacent_l3_expansion_skipped_candidate_count": 0,
+        "adjacent_l3_expansion_skipped_candidate_reasons": [],
+        "adjacent_l3_expansion_fallback_reason": None,
+    }
+    requested_origins: Dict[str, List[dict]] = {}
+    request_order: List[str] = []
+    for index, candidate in enumerate(original, 1):
+        chunk_id = str(candidate.get("chunk_id") or "").strip()
+        match = _L3_CHUNK_ID_PATTERN.match(chunk_id)
+        if not match:
+            meta["adjacent_l3_expansion_skipped_candidate_count"] += 1
+            meta["adjacent_l3_expansion_skipped_candidate_reasons"].append(
+                {"candidate_index": index, "reason": "unparseable_l3_chunk_id"}
+            )
+            continue
+        level = candidate.get("chunk_level")
+        if level not in (None, "", 3, "3"):
+            meta["adjacent_l3_expansion_skipped_candidate_count"] += 1
+            meta["adjacent_l3_expansion_skipped_candidate_reasons"].append(
+                {"candidate_index": index, "reason": "candidate_not_l3"}
+            )
+            continue
+        leaf_index = int(match.group("index"))
+        for offset in (-1, 1):
+            adjacent_index = leaf_index + offset
+            if adjacent_index < 0:
+                continue
+            adjacent_id = f"{match.group('prefix')}{adjacent_index}"
+            origin = {
+                "adjacent_to_chunk_id": chunk_id,
+                "relative_position": "previous" if offset < 0 else "next",
+            }
+            if adjacent_id not in requested_origins:
+                requested_origins[adjacent_id] = [origin]
+                request_order.append(adjacent_id)
+            else:
+                requested_origins[adjacent_id].append(origin)
+
+    meta["adjacent_l3_expansion_requested_neighbor_count"] = len(request_order)
+    if meta["adjacent_l3_expansion_skipped_candidate_count"]:
+        meta["adjacent_l3_expansion_fallback_reason"] = "unparseable_l3_candidates_skipped"
+    if not request_order:
+        meta["adjacent_l3_expansion_fallback_reason"] = "no_parseable_l3_candidates"
+        return original, meta, []
+
+    try:
+        resolved_rows = milvus_store.get_chunks_by_ids(request_order)
+    except Exception as exc:
+        meta["adjacent_l3_expansion_fallback_reason"] = f"adjacent_lookup_failed:{type(exc).__name__}"
+        return original, meta, []
+
+    resolved_by_id = {
+        str(row.get("chunk_id") or ""): dict(row)
+        for row in resolved_rows
+        if str(row.get("chunk_id") or "") in requested_origins
+    }
+    meta["adjacent_l3_expansion_applied"] = True
+    meta["adjacent_l3_expansion_retrieved_neighbor_count"] = len(resolved_by_id)
+
+    expanded = list(original)
+    existing_keys = {
+        _adjacent_l3_candidate_key(candidate, index)
+        for index, candidate in enumerate(expanded)
+    }
+    audit_neighbors: List[dict] = []
+    for adjacent_id in request_order:
+        row = resolved_by_id.get(adjacent_id)
+        if row is None:
+            continue
+        row["_adjacent_l3_origins"] = [dict(origin) for origin in requested_origins[adjacent_id]]
+        key = _adjacent_l3_candidate_key(row, len(expanded))
+        row["_adjacent_l3_added"] = key not in existing_keys
+        audit_neighbors.append(dict(row))
+        if key in existing_keys:
+            meta["adjacent_l3_expansion_deduplicated_candidate_count"] += 1
+            continue
+        existing_keys.add(key)
+        expanded.append(row)
+        meta["adjacent_l3_expansion_added_candidate_count"] += 1
+    return expanded, meta, audit_neighbors
 
 
 def _rewrite_candidate_key(doc: dict, source: str, index: int) -> str:
@@ -519,6 +690,12 @@ def _rerank_documents(
     Returns:
         Tuple[List[dict], Dict[str, Any]]: 重排或降级排序后的文档与精排诊断元数据。
     """
+    started = time.perf_counter()
+
+    def finish(items: List[dict]) -> Tuple[List[dict], Dict[str, Any]]:
+        meta["rerank_elapsed_seconds"] = time.perf_counter() - started
+        return items, meta
+
     # rrf_rank 记录精排前的位置，供精排服务 index 映射回原文档。
     docs_with_rank = [{**doc, "rrf_rank": i} for i, doc in enumerate(docs, 1)]
     meta: Dict[str, Any] = {
@@ -532,7 +709,7 @@ def _rerank_documents(
     }
     # 未配置 Rerank 时按现有分数排序，不调用任何外部服务。
     if not docs_with_rank or not meta["rerank_enabled"]:
-        return _sort_by_rank_score(docs_with_rank)[:top_k], meta
+        return finish(_sort_by_rank_score(docs_with_rank)[:top_k])
 
     payload = {
         # Rerank 服务常见的 OpenAI/Cohere 风格请求体。
@@ -560,7 +737,7 @@ def _rerank_documents(
         # 上游返回错误时记录原因并保留原排名，检索主线仍可继续。
         if response.status_code >= 400:
             meta["rerank_error"] = f"HTTP {response.status_code}: {response.text}"
-            return _sort_by_rank_score(docs_with_rank)[:top_k], meta
+            return finish(_sort_by_rank_score(docs_with_rank)[:top_k])
 
         items = response.json().get("results", [])
         # 精排服务每项通常包含原 documents 数组的 index 与 relevance_score。
@@ -576,14 +753,14 @@ def _rerank_documents(
                 reranked.append(doc)
 
         if reranked:
-            return reranked[:top_k], meta
+            return finish(reranked[:top_k])
 
         meta["rerank_error"] = "empty_rerank_results"
-        return _sort_by_rank_score(docs_with_rank)[:top_k], meta
+        return finish(_sort_by_rank_score(docs_with_rank)[:top_k])
     # 网络、JSON 或字段异常都走同一降级路径，不把精排故障升级为检索失败。
     except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
         meta["rerank_error"] = str(e)
-        return _sort_by_rank_score(docs_with_rank)[:top_k], meta
+        return finish(_sort_by_rank_score(docs_with_rank)[:top_k])
 
 
 # 固定流水线顺序为召回、父块合并、精排、阈值过滤，顺序变化会改变结果含义。
@@ -599,6 +776,8 @@ def _finalize_retrieval(
     enable_auto_merge: bool = AUTO_MERGE_ENABLED,
     enable_rerank: bool = RERANK_ENABLED,
     extra_meta: Dict[str, Any] | None = None,
+    capture_candidate_trace: bool = False,
+    candidate_audit_extra: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """执行召回后的固定流水线：合并、精排、阈值过滤和诊断元数据组装。
 
@@ -645,7 +824,77 @@ def _finalize_retrieval(
     }
     if extra_meta:
         meta.update(extra_meta)
-    return {"docs": final_docs, "meta": meta}
+    result: Dict[str, Any] = {"docs": final_docs, "meta": meta}
+    if capture_candidate_trace:
+        rerank_input = [
+            {**dict(doc), "raw_rank": index, "rerank_input_rank": index}
+            for index, doc in enumerate(candidates, 1)
+        ]
+        rerank_returned = [
+            {
+                **dict(doc),
+                "rerank_input_rank": doc.get("rrf_rank"),
+                "rerank_output_rank": index,
+            }
+            for index, doc in enumerate(reranked_docs, 1)
+        ]
+        rejected = [
+            {
+                **dict(doc),
+                "rerank_input_rank": doc.get("rrf_rank"),
+                "rerank_output_rank": index,
+                "threshold_rejected": True,
+            }
+            for index, doc in enumerate(reranked_docs, 1)
+            if doc not in final_docs
+        ]
+        returned_keys = {
+            str(doc.get("chunk_id") or doc.get("id") or doc.get("rrf_rank"))
+            for doc in reranked_docs
+        }
+        rerank_not_returned = [
+            {**dict(doc), "rerank_input_rank": doc.get("rrf_rank") or doc.get("rerank_input_rank")}
+            for doc in rerank_input
+            if str(doc.get("chunk_id") or doc.get("id") or doc.get("rrf_rank")) not in returned_keys
+        ]
+        post_merge = [
+            {**dict(doc), "post_merge_rank": index}
+            for index, doc in enumerate(candidates, 1)
+        ]
+        final_context = [
+            {
+                **dict(doc),
+                "final_context_rank": index,
+                "rerank_output_rank": next(
+                    (
+                        item.get("rerank_output_rank")
+                        for item in rerank_returned
+                        if str(item.get("chunk_id") or item.get("id") or item.get("rrf_rank"))
+                        == str(doc.get("chunk_id") or doc.get("id") or doc.get("rrf_rank"))
+                    ),
+                    None,
+                ),
+            }
+            for index, doc in enumerate(final_docs, 1)
+        ]
+        audit = {
+            "stage": "retrieval",
+            "query": query,
+            "query_origin": "original",
+            "raw_leaf_candidates": [_candidate_snapshot(doc, index) for index, doc in enumerate(retrieved, 1)],
+            "post_merge_candidates": [_candidate_snapshot(doc, index) for index, doc in enumerate(post_merge, 1)],
+            "rerank_input_candidates": [_candidate_snapshot(doc, index) for index, doc in enumerate(rerank_input, 1)],
+            "rerank_returned_candidates": [_candidate_snapshot(doc, index) for index, doc in enumerate(rerank_returned, 1)],
+            "rerank_not_returned_candidates": [_candidate_snapshot(doc, index) for index, doc in enumerate(rerank_not_returned, 1)],
+            "threshold_rejected_candidates": [_candidate_snapshot(doc, index) for index, doc in enumerate(rejected, 1)],
+            "final_context_candidates": [_candidate_snapshot(doc, index) for index, doc in enumerate(final_context, 1)],
+            "auto_merge_mappings": list(meta.get("auto_merge_mappings") or []),
+            "meta": {key: value for key, value in meta.items() if key != "auto_merge_mappings"},
+        }
+        if candidate_audit_extra:
+            audit.update(candidate_audit_extra)
+        result["candidate_audit"] = audit
+    return result
 
 
 def _fusion_fallback_result(
@@ -655,6 +904,7 @@ def _fusion_fallback_result(
     rewritten_candidate_count: int,
     reason: str,
     fallback_meta: Dict[str, Any] | None = None,
+    candidate_audits: List[dict] | None = None,
 ) -> Dict[str, Any]:
     """Return the first finalized result when T9's optional fusion cannot run."""
     initial_docs = list(initial_retrieval.get("docs") or [])
@@ -675,7 +925,10 @@ def _fusion_fallback_result(
     retrieval_error = str((fallback_meta or {}).get("retrieval_error") or "").strip()
     if retrieval_error:
         meta["retrieval_error"] = retrieval_error
-    return {"docs": initial_docs, "meta": meta}
+    result: Dict[str, Any] = {"docs": initial_docs, "meta": meta}
+    if candidate_audits is not None:
+        result["candidate_audits"] = list(candidate_audits)
+    return result
 
 
 def fuse_rewrite_candidate_results(
@@ -703,6 +956,7 @@ def fuse_rewrite_candidate_results(
             initial_candidate_count=len(initial_candidates),
             rewritten_candidate_count=len(rewritten_candidates),
             reason=fallback_reason,
+            candidate_audits=[item for item in (initial_retrieval.get("candidate_audits") or [])],
         )
     if not rewritten_retrieval or rewritten_raw_meta.get("retrieval_mode") == "failed":
         return _fusion_fallback_result(
@@ -711,6 +965,8 @@ def fuse_rewrite_candidate_results(
             rewritten_candidate_count=len(rewritten_candidates),
             reason="rewritten_retrieval_failed",
             fallback_meta=(rewritten_retrieval or {}).get("meta") or {},
+            candidate_audits=[item for item in (initial_retrieval.get("candidate_audits") or [])]
+            + [item for item in ((rewritten_retrieval or {}).get("candidate_audits") or [])],
         )
     if "raw_candidates" not in initial_retrieval:
         return _fusion_fallback_result(
@@ -740,6 +996,7 @@ def fuse_rewrite_candidate_results(
             parent_chunk_store=parent_chunk_store,
             enable_auto_merge=enable_auto_merge,
             enable_rerank=enable_rerank,
+            capture_candidate_trace=bool(current_runtime.capture_candidate_trace),
         )
     except Exception as exc:
         return _fusion_fallback_result(
@@ -747,6 +1004,8 @@ def fuse_rewrite_candidate_results(
             initial_candidate_count=len(initial_candidates),
             rewritten_candidate_count=len(rewritten_candidates),
             reason=f"fusion_finalize_failed:{type(exc).__name__}",
+            candidate_audits=[item for item in (initial_retrieval.get("candidate_audits") or [])]
+            + [item for item in ((rewritten_retrieval or {}).get("candidate_audits") or [])],
         )
 
     final_docs = list(finalized.get("docs") or [])
@@ -763,6 +1022,42 @@ def fuse_rewrite_candidate_results(
         ],
         "rewrite_candidate_fusion_fallback_reason": None,
     })
+    if current_runtime.capture_candidate_trace:
+        fused_audit = dict(finalized.get("candidate_audit") or {})
+        initial_keys = {
+            _rewrite_candidate_key(item, "initial", index)
+            for index, item in enumerate(initial_candidates)
+        }
+        deduplicated_candidates = [
+            {
+                "deduplication_key": _rewrite_candidate_key(item, "rewritten", index),
+                "candidate_sources": ["initial", "rewritten"],
+                "chunk_id": item.get("chunk_id"),
+                "id": item.get("id"),
+            }
+            for index, item in enumerate(rewritten_candidates)
+            if _rewrite_candidate_key(item, "rewritten", index) in initial_keys
+        ]
+        fused_audit.update({
+            "stage": "fused",
+            "query": original_query,
+            "query_origin": "original",
+            "raw_leaf_candidates": [
+                {**_candidate_snapshot(item, index), "candidate_sources": ["initial"]}
+                for index, item in enumerate(initial_candidates, 1)
+            ] + [
+                {**_candidate_snapshot(item, index), "candidate_sources": ["rewritten"]}
+                for index, item in enumerate(rewritten_candidates, 1)
+            ],
+            "candidate_sources": {
+                str(item.get("chunk_id") or item.get("id") or index): list(item.get("_rewrite_candidate_sources") or [])
+                for index, item in enumerate(candidates, 1)
+            },
+            "deduplicated_candidates": deduplicated_candidates,
+            "initial_audit": initial_retrieval.get("candidate_audit"),
+            "rewritten_audit": (rewritten_retrieval or {}).get("candidate_audit"),
+        })
+        finalized["candidate_audit"] = fused_audit
     return finalized
 
 def build_filename_filter_expression(filenames: List[str] | tuple[str, ...] | None) -> str:
@@ -853,9 +1148,33 @@ def retrieve_documents(
         }
 
     def successful_result(retrieved: List[dict], retrieval_mode: str) -> Dict[str, Any]:
+        finalized_candidates = retrieved
+        extra_meta: Dict[str, Any] | None = None
+        candidate_audit_extra: Dict[str, Any] | None = None
+        if current_runtime.enable_adjacent_l3_expansion:
+            finalized_candidates, expansion_meta, audit_neighbors = _expand_adjacent_l3_candidates(
+                retrieved,
+                milvus_store=milvus_store,
+            )
+            extra_meta = expansion_meta
+            if current_runtime.capture_candidate_trace:
+                candidate_audit_extra = {
+                    "original_raw_leaf_candidates": [
+                        _candidate_snapshot(candidate, index)
+                        for index, candidate in enumerate(retrieved, 1)
+                    ],
+                    "adjacent_l3_candidates": [
+                        _candidate_snapshot(candidate, index)
+                        for index, candidate in enumerate(audit_neighbors, 1)
+                    ],
+                    "post_adjacent_expansion_candidates": [
+                        _candidate_snapshot(candidate, index)
+                        for index, candidate in enumerate(finalized_candidates, 1)
+                    ],
+                }
         result = _finalize_retrieval(
             query=query,
-            retrieved=retrieved,
+            retrieved=finalized_candidates,
             top_k=top_k,
             retrieval_mode=retrieval_mode,
             candidate_k=candidate_k,
@@ -863,9 +1182,14 @@ def retrieve_documents(
             parent_chunk_store=parent_chunk_store,
             enable_auto_merge=enable_auto_merge,
             enable_rerank=enable_rerank,
+            extra_meta=extra_meta,
+            capture_candidate_trace=current_runtime.capture_candidate_trace,
+            candidate_audit_extra=candidate_audit_extra,
         )
         result["raw_candidates"] = [dict(candidate) for candidate in retrieved]
         result["raw_retrieval_meta"] = raw_retrieval_meta(retrieval_mode)
+        if current_runtime.capture_candidate_trace and result.get("candidate_audit"):
+            result["candidate_audits"] = [result["candidate_audit"]]
         return result
 
     if requested_mode == "bm25":

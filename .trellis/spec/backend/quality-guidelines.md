@@ -14,6 +14,12 @@ grader error is `human_review`; `evaluation_error`, answer-generation errors,
 and grader request/parse errors are `system_error`. These labels are automatic
 triage only and require human confirmation before an optimization decision.
 
+Evidence grading can fail closed before the independent grader returns an error:
+the RAG trace records this as `rag_trace.evidence_reason ==
+"evidence_grading_unavailable"`. Classification must treat that trace reason as
+`system_error` and must not also add `answer_failure`, because the answer was
+never evaluated under usable evidence-grading conditions.
+
 ## Forbidden Patterns
 
 Do not overwrite a prepared corpus or an experiment configuration. A repeated
@@ -30,6 +36,31 @@ validation queue markers (no IDs, questions, answers, evidence, or failure
 reasons). The controlled `results.jsonl` remains the complete machine audit
 source.
 Rerank is a comparison strategy only when every case in that experiment succeeds.
+
+### Common Mistake: Double-counting evidence-grading failures
+
+**Symptom**: A case with `evidence_grading_unavailable` appears in both
+`system_error` and `answer_failure`, inflating the apparent answer-quality loss.
+
+**Cause**: The classifier checks only `evaluation_error`, answer-generation
+errors, and `grader_error`, while the fail-closed evidence route reports its
+failure through `rag_trace.evidence_reason`.
+
+**Correct handling**:
+
+```python
+evidence_grading_error = (
+    (record.get("rag_trace") or {}).get("evidence_reason")
+    == "evidence_grading_unavailable"
+)
+has_system_error = bool(evaluation_error or answer_error or grader_error or evidence_grading_error)
+if verdict == "fail" and not has_system_error:
+    categories.add("answer_failure")
+```
+
+Keep these categories mutually exclusive for classification purposes; human
+review may still record the case separately when the underlying answer is
+otherwise inspectable.
 
 ## Testing Requirements
 

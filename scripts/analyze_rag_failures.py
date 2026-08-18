@@ -46,8 +46,14 @@ def _classify(record: dict[str, Any]) -> set[str]:
     evaluation_error = str(record.get("evaluation_error") or "")
     answer_error = str(record.get("answer_generation_error") or "")
     grader_error = str(grade.get("grader_error") or "")
+    trace = record.get("rag_trace") or {}
+    # The RAG graph fail-closes when evidence grading raises, so the exception
+    # is represented by a stable trace reason instead of grader_error.  Treat
+    # it as an evaluation-chain error; otherwise the same case is mislabeled
+    # as an answer failure and can distort optimization decisions.
+    evidence_grading_error = trace.get("evidence_reason") == "evidence_grading_unavailable"
 
-    has_system_error = bool(evaluation_error or answer_error or grader_error)
+    has_system_error = bool(evaluation_error or answer_error or grader_error or evidence_grading_error)
     if has_system_error:
         categories.add("system_error")
     elif verdict == "review":
@@ -69,7 +75,7 @@ def _classify(record: dict[str, Any]) -> set[str]:
     if expected and coverage is not None and 0 < float(coverage) < 1:
         categories.add("evidence_incomplete")
 
-    if verdict == "fail" and not evaluation_error and not answer_error and not grader_error:
+    if verdict == "fail" and not has_system_error:
         categories.add("answer_failure")
 
     return categories

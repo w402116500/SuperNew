@@ -37,6 +37,7 @@ from backend.evaluation.runner import (
     _evaluate_multihop_case,
     _prepare_enterprise_documents,
     _multihop_error_record,
+    _manual_review_records,
     _public_config,
     _read_retry_source_records,
     _read_multihop_checkpoints,
@@ -227,6 +228,28 @@ class FailureClassificationTests(unittest.TestCase):
         })
         self.assertIn("system_error", categories)
         self.assertNotIn("human_review", categories)
+
+    def test_evidence_grading_fail_closed_is_system_error(self):
+        from scripts.analyze_rag_failures import _classify
+
+        categories = _classify({
+            "question_type": "basic",
+            "answer_grade": {"verdict": "fail"},
+            "rag_trace": {"evidence_reason": "evidence_grading_unavailable"},
+        })
+        self.assertIn("system_error", categories)
+        self.assertNotIn("answer_failure", categories)
+
+    def test_manual_review_queue_keeps_evidence_grading_failure_as_system_error(self):
+        queue = _manual_review_records([{
+            "case_id": "qst-system",
+            "case_set": "analysis",
+            "evidence_coverage": 0.0,
+            "answer_grade": {"verdict": "fail", "grader_error": ""},
+            "rag_trace": {"evidence_reason": "evidence_grading_unavailable"},
+        }])
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["review_reasons"], ["system_error"])
 
     def test_multihop_smoke_samples_each_type(self):
         cases = [
@@ -530,6 +553,51 @@ class CleanupAndJudgeTests(unittest.TestCase):
         run_case.assert_called_once()
         self.assertEqual(summary["evaluation_status"], "interrupted")
         self.assertEqual(progress["status"], "interrupted")
+
+    def test_multihop_concurrent_workers_checkpoint_all_cases(self):
+        cases = [
+            {
+                "id": f"case-{index}",
+                "question": f"question-{index}",
+                "reference_answer": "answer",
+                "question_type": "basic",
+                "evidence_filenames": [],
+            }
+            for index in range(4)
+        ]
+
+        def completed_record(worker, case, timeout_seconds):
+            return {
+                "case_id": case["id"],
+                "question_type": case["question_type"],
+                "answer_grade": {"verdict": "pass"},
+                "evidence_coverage": 1.0,
+                "end_to_end_seconds": 0.1,
+            }
+
+        with TemporaryDirectory() as directory, patch(
+            "backend.evaluation.runner._start_multihop_worker",
+            side_effect=[Mock(), Mock()],
+        ) as start_worker, patch(
+            "backend.evaluation.runner._run_case_in_worker",
+            side_effect=completed_record,
+        ) as run_case:
+            records, summary = evaluate_multihop(
+                Path(directory),
+                {"run_id": "unit", "evaluation_worker_count": 2},
+                cases,
+            )
+            progress = json.loads(
+                (Path(directory) / "evaluation-progress.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(start_worker.call_count, 2)
+        self.assertEqual(run_case.call_count, 4)
+        self.assertEqual([record["case_id"] for record in records], [case["id"] for case in cases])
+        self.assertEqual(summary["evaluation_worker_count"], 2)
+        self.assertEqual(summary["evaluation_status"], "completed")
+        self.assertEqual(progress["completed_cases"], 4)
+        self.assertEqual(progress["status"], "completed")
 
     def test_multihop_checkpoint_is_durable_and_deduplicated_by_case_id(self):
         with TemporaryDirectory() as directory:
@@ -994,6 +1062,32 @@ class EnterpriseFormalEvaluationTests(unittest.TestCase):
         self.assertTrue(config_written)
         self.assertFalse(corpus_results_written)
 
+    def test_adjacent_l3_experiment_requires_target_manifest_and_isolated_id(self):
+        with TemporaryDirectory() as directory:
+            corpus_dir = Path(directory) / "corpus"
+            self._corpus_files(corpus_dir)
+            target = corpus_dir / "target.json"
+            target.write_text("{}", encoding="utf-8")
+            with patch("backend.evaluation.runner.run_directory", return_value=corpus_dir):
+                with self.assertRaisesRegex(ValueError, "只能通过固定的 11 题 target manifest"):
+                    evaluate_run(
+                        dataset="enterpriserag",
+                        run_id="corpus",
+                        evaluation_id="adjacent-no-target",
+                        case_set="analysis",
+                        evaluation_mode="rag",
+                        changed_variable="adjacent_l3_expansion",
+                    )
+                with self.assertRaisesRegex(ValueError, "必须提供独立 evaluation_id"):
+                    evaluate_run(
+                        dataset="enterpriserag",
+                        run_id="corpus",
+                        case_set="analysis",
+                        evaluation_mode="rag",
+                        changed_variable="adjacent_l3_expansion",
+                        target_manifest_path=target,
+                    )
+
     def test_retry_failed_cases_preserves_source_and_merges_successes(self):
         with TemporaryDirectory() as directory:
             corpus_dir = Path(directory) / "corpus"
@@ -1042,6 +1136,60 @@ class EnterpriseFormalEvaluationTests(unittest.TestCase):
             self.assertEqual([record["case_id"] for record in attempt_records], ["validation-1"])
             retry_manifest = json.loads((repaired / "retry-manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(retry_manifest["retry_case_ids"], ["validation-1"])
+
+    def test_retry_records_execution_worker_count_without_changing_rag_inputs(self):
+        with TemporaryDirectory() as directory:
+            corpus_dir = Path(directory) / "corpus"
+            self._corpus_files(corpus_dir)
+
+            def fake_rag(output_dir, config, selected_cases, **kwargs):
+                records = []
+                for case in selected_cases:
+                    failed = (
+                        config.get("retry_source_evaluation_id") is None
+                        and case["id"] == "validation-1"
+                    )
+                    records.append({
+                        "case_id": case["id"],
+                        "question": case["question"],
+                        "question_type": case["question_type"],
+                        "reference_answer": "A",
+                        "answer": "A",
+                        "expected_evidence_filenames": case["evidence_filenames"],
+                        "retrieved_filenames": case["evidence_filenames"],
+                        "evidence_coverage": 1.0,
+                        "answer_grade": {"verdict": "review" if failed else "pass"},
+                        "evaluation_error": "TimeoutError: source timeout" if failed else "",
+                        "rag_trace": {},
+                        "end_to_end_seconds": 0.1,
+                    })
+                return records, {"dataset": "enterpriserag", "run_id": config["run_id"]}
+
+            with patch("backend.evaluation.runner.run_directory", return_value=corpus_dir), patch(
+                "backend.evaluation.runner.evaluate_multihop", side_effect=fake_rag
+            ):
+                source = evaluate_run(
+                    dataset="enterpriserag",
+                    run_id="corpus",
+                    evaluation_id="baseline-rag-003",
+                    evaluation_mode="rag",
+                )
+                retry = evaluate_run(
+                    dataset="enterpriserag",
+                    run_id="corpus",
+                    evaluation_id="baseline-rag-004",
+                    evaluation_mode="rag",
+                    retry_from_evaluation_id="baseline-rag-003",
+                    evaluation_worker_count=10,
+                )
+
+            source_config = json.loads((source / "evaluation-config.json").read_text(encoding="utf-8"))
+            retry_config = json.loads((retry / "evaluation-config.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(source_config["evaluation_worker_count"], 1)
+        self.assertEqual(retry_config["evaluation_worker_count"], 10)
+        self.assertEqual(retry_config["changed_variable"], source_config["changed_variable"])
+        self.assertEqual(retry_config["collection_name"], source_config["collection_name"])
 
     def test_retry_with_unresolved_errors_keeps_overall_status_interrupted(self):
         with TemporaryDirectory() as directory:
