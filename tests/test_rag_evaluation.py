@@ -8,6 +8,7 @@ import queue
 import re
 import sqlite3
 import unittest
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -517,7 +518,7 @@ class CleanupAndJudgeTests(unittest.TestCase):
             "backend.evaluation.runner._run_case_in_worker",
             side_effect=[failed, next_failed],
         ), patch("backend.evaluation.runner._stop_multihop_worker") as stop_worker:
-            records, _ = evaluate_multihop(
+            records, summary = evaluate_multihop(
                 Path(directory),
                 {"run_id": "unit"},
                 cases,
@@ -525,6 +526,8 @@ class CleanupAndJudgeTests(unittest.TestCase):
 
         self.assertEqual([record["case_id"] for record in records], ["failed", "next"])
         self.assertEqual(start_worker.call_count, 2)
+        self.assertEqual(summary["evaluation_status"], "interrupted")
+        self.assertEqual(summary["evaluation_error_count"], 2)
         self.assertEqual(
             sum(call.args[0] is not None for call in stop_worker.call_args_list),
             2,
@@ -1014,6 +1017,95 @@ class EnterpriseFormalEvaluationTests(unittest.TestCase):
             "".join(json.dumps(case) + "\n" for case in cases), encoding="utf-8"
         )
 
+    @staticmethod
+    def _structured_target_files(root: Path, *, chunking_strategy: str) -> Path:
+        """Create the smallest valid 30-case structured target for runner gates."""
+        case_ids = [f"qst_{index:04d}" for index in range(30)]
+        cases = [
+            {
+                "id": case_id,
+                "question": case_id,
+                "question_type": "basic",
+                "expected_evidence_filenames": [f"doc-{index}.md"],
+                "evidence_filenames": [f"doc-{index}.md"],
+                "case_set": "analysis",
+            }
+            for index, case_id in enumerate(case_ids)
+        ]
+        (root / "config.json").write_text(json.dumps({
+            "run_id": "corpus",
+            "profile": "full",
+            "collection_name": "rag_eval_enterpriserag_corpus",
+            "language": "en",
+            "corpus": "representative",
+            "evaluation_mode": "rag",
+            "document_chunking_strategy": chunking_strategy,
+        }), encoding="utf-8")
+        (root / "cases.jsonl").write_text(
+            "".join(json.dumps(case) + "\n" for case in cases), encoding="utf-8"
+        )
+        split_path = root / "case-split.json"
+        split_path.write_text(json.dumps({
+            "analysis_case_ids": case_ids,
+            "validation_case_ids": [],
+        }), encoding="utf-8")
+        split_hash = sha256(split_path.read_bytes()).hexdigest()
+        (root / "manifest.json").write_text(json.dumps({
+            "collection_name": "rag_eval_enterpriserag_corpus",
+            "prepare_completed": True,
+            "cleanup_completed": False,
+            "case_split_sha256": split_hash,
+        }), encoding="utf-8")
+        source_results = root / "source-results.jsonl"
+        source_results.write_text(
+            "".join(json.dumps({
+                "case_id": case_id,
+                "case_set": "analysis",
+                "answer_grade": {"verdict": "fail"},
+                "evidence_coverage": 0.0,
+                "retrieved_filenames": [],
+                "expected_evidence_filenames": [f"doc-{index}.md"],
+            }) + "\n" for index, case_id in enumerate(case_ids)),
+            encoding="utf-8",
+        )
+        review_path = root / "raw-review.jsonl"
+        review_path.write_text(
+            "".join(json.dumps({
+                "case_id": case_id,
+                "case_set": "analysis",
+                "classification": "same_source_far_leaf_gap",
+                "source_ref": f"doc-{index}",
+            }) + "\n" for index, case_id in enumerate(case_ids)),
+            encoding="utf-8",
+        )
+        target = root / "structured-target.json"
+        payload = {
+            "manifest_type": "structured_chunking_offline_audit",
+            "manifest_version": "structured-chunking-target-v1",
+            "case_set": "analysis",
+            "case_count": len(case_ids),
+            "case_ids": case_ids,
+            "changed_variable": "document_chunking_strategy",
+            "source_case_split_sha256": split_hash,
+            "source_results_path": str(source_results),
+            "source_results_sha256": sha256(source_results.read_bytes()).hexdigest(),
+            "source_raw_review": str(review_path),
+            "source_raw_review_sha256": sha256(review_path.read_bytes()).hexdigest(),
+            "targets": [
+                {
+                    "case_id": case_id,
+                    "case_set": "analysis",
+                    "source_ref": f"doc-{index}",
+                }
+                for index, case_id in enumerate(case_ids)
+            ],
+        }
+        payload["manifest_sha256"] = sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        return target
+
     def test_formal_case_split_is_stable_disjoint_and_matches_quotas(self):
         cases = self._formal_cases()
         first = split_enterprise_cases(cases)
@@ -1087,6 +1179,160 @@ class EnterpriseFormalEvaluationTests(unittest.TestCase):
                         changed_variable="adjacent_l3_expansion",
                         target_manifest_path=target,
                     )
+
+    def test_structured_target_manifest_is_analysis_only_and_has_runtime_gates(self):
+        with TemporaryDirectory() as directory:
+            corpus_dir = Path(directory) / "corpus"
+            corpus_dir.mkdir(parents=True)
+            target = self._structured_target_files(
+                corpus_dir,
+                chunking_strategy="markdown_header_recursive_v1",
+            )
+            with patch("backend.evaluation.runner.run_directory", return_value=corpus_dir):
+                validation_target = corpus_dir / "validation-target.json"
+                validation_target.write_text(json.dumps({"case_set": "validation"}), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "case_set.*analysis"):
+                    evaluate_run(
+                        dataset="enterpriserag",
+                        run_id="corpus",
+                        evaluation_id="structured-validation",
+                        case_set="analysis",
+                        evaluation_mode="rag",
+                        changed_variable="document_chunking_strategy",
+                        target_manifest_path=validation_target,
+                        capture_candidate_trace=True,
+                        evaluation_worker_count=10,
+                    )
+
+                with self.assertRaisesRegex(ValueError, "changed_variable=document_chunking_strategy"):
+                    evaluate_run(
+                        dataset="enterpriserag",
+                        run_id="corpus",
+                        evaluation_id="structured-wrong-variable",
+                        case_set="analysis",
+                        evaluation_mode="rag",
+                        changed_variable="top_k",
+                        target_manifest_path=target,
+                        capture_candidate_trace=True,
+                        evaluation_worker_count=10,
+                    )
+
+                with self.assertRaisesRegex(ValueError, "必须显式开启 candidate trace"):
+                    evaluate_run(
+                        dataset="enterpriserag",
+                        run_id="corpus",
+                        evaluation_id="structured-no-trace",
+                        case_set="analysis",
+                        evaluation_mode="rag",
+                        changed_variable="document_chunking_strategy",
+                        target_manifest_path=target,
+                        capture_candidate_trace=False,
+                        evaluation_worker_count=10,
+                    )
+
+                with self.assertRaisesRegex(ValueError, "必须使用 evaluation_worker_count=10"):
+                    evaluate_run(
+                        dataset="enterpriserag",
+                        run_id="corpus",
+                        evaluation_id="structured-low-concurrency",
+                        case_set="analysis",
+                        evaluation_mode="rag",
+                        changed_variable="document_chunking_strategy",
+                        target_manifest_path=target,
+                        capture_candidate_trace=True,
+                        evaluation_worker_count=1,
+                    )
+
+            old_strategy_root = Path(directory) / "old-corpus"
+            old_strategy_root.mkdir(parents=True)
+            old_target = self._structured_target_files(
+                old_strategy_root,
+                chunking_strategy="recursive_l1_l2_l3",
+            )
+            with patch("backend.evaluation.runner.run_directory", return_value=old_strategy_root):
+                with self.assertRaisesRegex(ValueError, "只能使用 document_chunking_strategy=markdown_header_recursive_v1"):
+                    evaluate_run(
+                        dataset="enterpriserag",
+                        run_id="old-corpus",
+                        evaluation_id="structured-old-corpus",
+                        case_set="analysis",
+                        evaluation_mode="rag",
+                        changed_variable="document_chunking_strategy",
+                        target_manifest_path=old_target,
+                        capture_candidate_trace=True,
+                        evaluation_worker_count=10,
+                    )
+
+    def test_structured_experiment_snapshot_preserves_targeted_scope(self):
+        with TemporaryDirectory() as directory:
+            corpus_dir = Path(directory) / "corpus"
+            corpus_dir.mkdir(parents=True)
+            target = self._structured_target_files(
+                corpus_dir,
+                chunking_strategy="markdown_header_recursive_v1",
+            )
+            corpus_config = json.loads((corpus_dir / "config.json").read_text(encoding="utf-8"))
+            corpus_config["rechunk_scope"] = "targeted"
+            corpus_config["document_parse_workers"] = 8
+            (corpus_dir / "config.json").write_text(
+                json.dumps(corpus_config), encoding="utf-8"
+            )
+
+            def fake_rag(output_dir, config, selected_cases, **kwargs):
+                records = [{
+                    "case_id": case["id"],
+                    "question": case["question"],
+                    "question_type": case["question_type"],
+                    "reference_answer": "A",
+                    "answer": "A",
+                    "expected_evidence_filenames": case["expected_evidence_filenames"],
+                    "retrieved_filenames": case["expected_evidence_filenames"],
+                    "evidence_coverage": 1.0,
+                    "answer_grade": {"verdict": "pass", "reason": "ok"},
+                    "evaluation_error": "",
+                    "rag_trace": {},
+                    "end_to_end_seconds": 0.1,
+                } for case in selected_cases]
+                return records, {"dataset": "enterpriserag", "run_id": config["run_id"]}
+
+            with patch("backend.evaluation.runner.run_directory", return_value=corpus_dir), patch(
+                "backend.evaluation.runner.evaluate_multihop", side_effect=fake_rag
+            ):
+                evaluation_dir = evaluate_run(
+                    dataset="enterpriserag",
+                    run_id="corpus",
+                    evaluation_id="structured-targeted-snapshot",
+                    case_set="analysis",
+                    evaluation_mode="rag",
+                    changed_variable="document_chunking_strategy",
+                    target_manifest_path=target,
+                    capture_candidate_trace=True,
+                    evaluation_worker_count=10,
+                )
+
+            config = json.loads((evaluation_dir / "evaluation-config.json").read_text(encoding="utf-8"))
+            self.assertEqual(config["document_chunking_strategy"], "markdown_header_recursive_v1")
+            self.assertEqual(config["rechunk_scope"], "targeted")
+            self.assertEqual(config["document_parse_workers"], 8)
+
+            config["rechunk_scope"] = "full"
+            (evaluation_dir / "evaluation-config.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            with patch("backend.evaluation.runner.run_directory", return_value=corpus_dir), patch(
+                "backend.evaluation.runner.evaluate_multihop", side_effect=fake_rag
+            ), self.assertRaisesRegex(FileExistsError, "rechunk_scope"):
+                evaluate_run(
+                    dataset="enterpriserag",
+                    run_id="corpus",
+                    evaluation_id="structured-targeted-snapshot",
+                    case_set="analysis",
+                    evaluation_mode="rag",
+                    changed_variable="document_chunking_strategy",
+                    target_manifest_path=target,
+                    capture_candidate_trace=True,
+                    evaluation_worker_count=10,
+                )
 
     def test_retry_failed_cases_preserves_source_and_merges_successes(self):
         with TemporaryDirectory() as directory:

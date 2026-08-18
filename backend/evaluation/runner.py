@@ -45,11 +45,18 @@ from backend.evaluation.datasets import (
 )
 from backend.evaluation.metrics import multihop_metrics, retrieval_metrics
 from backend.evaluation.translation import TranslationClient, TranslationConfig
-from backend.indexing.document_loader import DocumentLoader
+from backend.indexing.document_loader import (
+    DEFAULT_CHUNKING_STRATEGY,
+    STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+    SUPPORTED_CHUNKING_STRATEGIES,
+    DocumentLoader,
+)
 from backend.indexing.embedding import embedding_public_config, embedding_service
+from backend.indexing.chunk_metadata import structured_chunk_metadata
 from backend.indexing.milvus_client import MilvusSettings, MilvusStore
 from backend.indexing.milvus_writer import MilvusWriter
 from backend.indexing.parent_chunk_store import ParentChunkStore
+from backend.evaluation.storage import EvaluationParentChunkStore, EvaluationStorageConfig
 from backend.model_settings import evaluation_case_timeout_seconds, model_timeout_seconds
 from backend.rag.utils import RETRIEVAL_TOP_K, RERANK_ENABLED, RetrievalRuntime, retrieve_documents
 
@@ -152,6 +159,157 @@ def _evaluation_store(collection_name: str) -> MilvusStore:
     return MilvusStore(replace(base, collection_name=collection_name))
 
 
+_VECTOR_COPY_FIELDS = [
+    "dense_embedding",
+    "text",
+    "filename",
+    "file_type",
+    "file_path",
+    "page_number",
+    "chunk_idx",
+    "chunk_id",
+    "parent_chunk_id",
+    "root_chunk_id",
+    "chunk_level",
+]
+
+
+def _copy_non_target_vectors(
+    *,
+    source_store: MilvusStore,
+    target_store: MilvusStore,
+    source_collection_name: str,
+    source_corpus_run_id: str,
+    target_corpus_run_id: str,
+    target_document_ids: set[str],
+    checkpoint_path: Path,
+    batch_size: int,
+    page_size: int = 1000,
+) -> dict[str, Any]:
+    """Copy only legacy non-target L3 vectors into a new collection.
+
+    This path never calls EmbeddingService and never writes to ``source_store``.
+    It is resumable by chunk ID: after an interrupted page, existing target IDs
+    are queried before insertion so a committed page is not submitted again.
+    Missing vector/text/ID fields fail closed; callers must not silently fall
+    back to re-embedding the 7,179 legacy documents.
+    """
+    if not source_collection_name or source_collection_name == target_store.collection_name:
+        raise RuntimeError("旧向量复制源集合与目标集合不能相同")
+    if not source_store.has_collection():
+        raise RuntimeError(f"旧 Representative Milvus 集合不存在，拒绝回退到全量重嵌入：{source_collection_name}")
+    if batch_size <= 0 or page_size <= 0:
+        raise ValueError("vector copy batch/page size 必须是正整数")
+
+    excluded_filenames = {
+        f"__rag_eval__{source_corpus_run_id}__{enterprise_document_filename(doc_id)}"
+        for doc_id in target_document_ids
+    }
+    immutable = {
+        "source_collection_name": source_collection_name,
+        "source_corpus_run_id": source_corpus_run_id,
+        "target_corpus_run_id": target_corpus_run_id,
+        "excluded_document_ids": sorted(target_document_ids),
+        "excluded_filenames": sorted(excluded_filenames),
+        "batch_size": batch_size,
+        "page_size": page_size,
+    }
+    checkpoint: dict[str, Any] = {}
+    copied_ids: set[str] = set()
+    offset = 0
+    if checkpoint_path.is_file():
+        checkpoint = _read_json(checkpoint_path)
+        for key, value in immutable.items():
+            if checkpoint.get(key) != value:
+                raise RuntimeError(f"vector copy checkpoint 配置不匹配：{key}")
+        copied_ids = {str(value) for value in checkpoint.get("copied_chunk_ids") or []}
+        offset = int(checkpoint.get("source_page_offset") or 0)
+
+    copied_count = int(checkpoint.get("vector_copy_count") or len(copied_ids))
+    page_count = int(checkpoint.get("source_page_count") or 0)
+
+    def flush_insert_rows(rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        existing = target_store.get_chunks_by_ids(
+            [str(item["chunk_id"]) for item in rows]
+        )
+        existing_ids = {str(item.get("chunk_id") or "") for item in (existing or [])}
+        recovered_ids = existing_ids - copied_ids
+        copied_ids.update(recovered_ids)
+        remaining = [item for item in rows if str(item["chunk_id"]) not in existing_ids]
+        if not remaining:
+            return len(recovered_ids)
+        target_store.insert(remaining)
+        copied_ids.update(str(item["chunk_id"]) for item in remaining)
+        return len(recovered_ids) + len(remaining)
+
+    # ``query`` offset pagination stops at Milvus' 16,384-row window.  Use the
+    # native server-side cursor so the complete legacy collection can be copied.
+    for rows in source_store.query_iterator(
+        filter_expr="chunk_level == 3",
+        output_fields=_VECTOR_COPY_FIELDS,
+        batch_size=page_size,
+    ):
+        page_count += 1
+        insert_rows: list[dict[str, Any]] = []
+        for row in rows:
+            filename = str(row.get("filename") or "")
+            if filename in excluded_filenames:
+                continue
+            chunk_id = str(row.get("chunk_id") or "")
+            vector = row.get("dense_embedding")
+            if not chunk_id or not filename or not isinstance(vector, (list, tuple)) or not vector:
+                raise RuntimeError(
+                    f"旧向量记录缺少可安全复制的 chunk_id/filename/dense_embedding：{row!r}"
+                )
+            if chunk_id in copied_ids:
+                continue
+            insert_rows.append({
+                "dense_embedding": list(vector),
+                "text": str(row.get("text") or ""),
+                "filename": filename,
+                "file_type": str(row.get("file_type") or ""),
+                "file_path": str(row.get("file_path") or ""),
+                "page_number": int(row.get("page_number", 0) or 0),
+                "chunk_idx": int(row.get("chunk_idx", 0) or 0),
+                "chunk_id": chunk_id,
+                "parent_chunk_id": str(row.get("parent_chunk_id") or ""),
+                "root_chunk_id": str(row.get("root_chunk_id") or ""),
+                "chunk_level": int(row.get("chunk_level", 3) or 3),
+                **structured_chunk_metadata(row),
+            })
+            if len(insert_rows) >= batch_size:
+                copied_count += flush_insert_rows(insert_rows)
+                insert_rows = []
+        if insert_rows:
+            # The same read-back guard handles a partial page after a crash.
+            copied_count += flush_insert_rows(insert_rows)
+
+        offset += len(rows)
+        checkpoint = {
+            **immutable,
+            "status": "running",
+            "source_page_offset": offset,
+            "source_page_count": page_count,
+            "vector_copy_count": copied_count,
+            # IDs make recovery safe if a process dies after Milvus accepts an
+            # insert but before this checkpoint is flushed.
+            "copied_chunk_ids": sorted(copied_ids),
+        }
+        _write_json(checkpoint_path, checkpoint)
+    checkpoint = {
+        **immutable,
+        "status": "completed",
+        "source_page_offset": offset,
+        "source_page_count": page_count,
+        "vector_copy_count": copied_count,
+        "copied_chunk_ids": sorted(copied_ids),
+    }
+    _write_json(checkpoint_path, checkpoint)
+    return checkpoint
+
+
 def _public_config(
     dataset: str,
     run_id: str,
@@ -161,6 +319,9 @@ def _public_config(
     language: str = "en",
     corpus: str = "representative",
     evaluation_mode: str = "rag",
+    chunking_strategy: str = DEFAULT_CHUNKING_STRATEGY,
+    rechunk_scope: str = "full",
+    document_parse_workers: int | None = None,
 ) -> dict[str, Any]:
     """保存可复现实验配置，明确排除所有密钥类环境变量。"""
     return {
@@ -194,6 +355,15 @@ def _public_config(
         "language": language,
         "corpus": corpus,
         "evaluation_mode": evaluation_mode,
+        "document_chunking_strategy": chunking_strategy,
+        "rechunk_scope": rechunk_scope,
+        "document_parse_workers": _normalize_enterprise_document_parse_workers(document_parse_workers),
+        "embedding_rate_limit_rpm": os.getenv("EMBEDDING_MAX_RPM", "2000"),
+        "embedding_rate_limit_tpm": os.getenv("EMBEDDING_MAX_TPM", "500000"),
+        "embedding_workers": _embedding_worker_count(),
+        "embedding_batch_retry_count": os.getenv("EMBEDDING_BATCH_RETRIES", "3"),
+        "milvus_batch_size": os.getenv("MILVUS_WRITE_BATCH_SIZE", os.getenv("EMBEDDING_BATCH_SIZE", "50")),
+        "milvus_batch_retry_count": os.getenv("MILVUS_WRITE_RETRIES", "3"),
         "secrets_recorded": False,
     }
 
@@ -273,6 +443,69 @@ def _translation_segment_worker_count() -> int:
     return min(max(configured, 1), 4)
 
 
+def _enterprise_document_parse_worker_count() -> int:
+    """Return the bounded local Markdown parse pool size.
+
+    Parsing is CPU/memory work and is intentionally separate from the RAG
+    evaluation worker count.  A bad environment value fails closed to the
+    conservative default instead of creating an unbounded executor.
+    """
+    try:
+        configured = int(os.getenv("ENTERPRISE_DOCUMENT_PARSE_WORKERS", "8"))
+    except ValueError:
+        configured = 8
+    return min(max(configured, 1), 32)
+
+
+def _normalize_enterprise_document_parse_workers(value: int | None) -> int:
+    if value is None:
+        return _enterprise_document_parse_worker_count()
+    return min(max(int(value), 1), 32)
+
+
+def _embedding_worker_count() -> int:
+    try:
+        configured = int(os.getenv("EMBEDDING_MAX_WORKERS", "10"))
+    except ValueError:
+        configured = 10
+    return min(max(configured, 1), 10)
+
+
+def _enterprise_document_parse_retries() -> int:
+    try:
+        configured = int(os.getenv("ENTERPRISE_DOCUMENT_PARSE_RETRIES", "2"))
+    except ValueError:
+        configured = 2
+    return min(max(configured, 0), 5)
+
+
+def _validate_structured_target_manifest_header(path: Path) -> dict[str, Any]:
+    """Validate the immutable, analysis-only target before any output is written."""
+    if not path.is_file():
+        raise FileNotFoundError(f"缺少结构化分块 target manifest：{path}")
+    payload = _read_json(path)
+    if payload.get("manifest_type") != "structured_chunking_offline_audit":
+        raise ValueError("target manifest 不是结构化分块离线审计清单")
+    if payload.get("case_set") != "analysis":
+        raise ValueError("结构化分块 targeted scope 只能使用 analysis target")
+    if payload.get("changed_variable") != "document_chunking_strategy":
+        raise ValueError("结构化分块 targeted scope 的 changed_variable 必须是 document_chunking_strategy")
+    if payload.get("new_chunking_strategy") != STRUCTURED_MARKDOWN_CHUNKING_STRATEGY:
+        raise ValueError("target manifest 的新分块策略不是 markdown_header_recursive_v1")
+    case_ids = [str(value) for value in payload.get("case_ids") or []]
+    if len(case_ids) != 30 or len(set(case_ids)) != len(case_ids):
+        raise ValueError("结构化分块 targeted scope 必须冻结 30 道唯一 analysis 题")
+    if payload.get("manifest_sha256") != _manifest_payload_hash(payload):
+        raise ValueError("结构化分块 target manifest 自身哈希校验失败")
+    target_document_ids = {
+        str(value) for value in payload.get("target_document_ids") or [] if str(value).strip()
+    }
+    declared_count = payload.get("target_document_count")
+    if target_document_ids and declared_count is not None and int(declared_count) != len(target_document_ids):
+        raise ValueError("target_document_count 与 target_document_ids 不一致")
+    return payload
+
+
 def _translate_markdown_documents(
     documents: list[str],
     config: TranslationConfig,
@@ -298,6 +531,11 @@ def _prepare_enterprise_documents(
     profile: Literal["smoke", "full"],
     language: Literal["en", "zh"],
     corpus: Literal["representative", "challenge"],
+    chunking_strategy: str = DEFAULT_CHUNKING_STRATEGY,
+    target_document_ids: set[str] | None = None,
+    target_case_ids: set[str] | None = None,
+    checkpoint_dir: Path | None = None,
+    parse_workers: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """选择 EnterpriseRAG 语料、生成 Markdown，并返回三级分块与审计元数据。"""
     all_cases = load_enterprise_cases(ENTERPRISE_ROOT)
@@ -368,11 +606,23 @@ def _prepare_enterprise_documents(
         translated_documents = [canonical_by_id[str(record["doc_id"])] for record in records]
         translation_config = TranslationConfig.from_env()
 
-    loader = DocumentLoader()
     run_prefix = f"__rag_eval__{run_id}__"
     all_chunks: list[dict[str, Any]] = []
     document_map: dict[str, str] = {}
     document_manifest: list[dict[str, Any]] = []
+    document_specs: list[dict[str, Any]] = []
+    target_document_ids = set(target_document_ids or set())
+    target_case_ids = set(target_case_ids or set())
+    if target_case_ids:
+        # Older frozen manifests predate target_document_ids.  Derive the full
+        # answer-document union from the immutable case set for compatibility.
+        target_document_ids.update(
+            str(doc_id)
+            for case in selected_cases
+            if str(case.get("id") or "") in target_case_ids
+            for doc_id in case.get("expected_doc_ids") or []
+        )
+    targeted_mode = bool(target_case_ids or target_document_ids)
     for index, record in enumerate(records):
         doc_id = str(record["doc_id"])
         stable_name = enterprise_document_filename(doc_id)
@@ -383,8 +633,19 @@ def _prepare_enterprise_documents(
         if not stable_path.exists() or stable_path.read_text(encoding="utf-8") != markdown:
             stable_path.write_text(markdown, encoding="utf-8", newline="\n")
         runtime_filename = f"{run_prefix}{stable_name}"
-        chunks = loader.load_document(str(stable_path), runtime_filename, str(stable_path))
-        all_chunks.extend(chunks)
+        document_specs.append({
+            "index": index,
+            "doc_id": doc_id,
+            "stable_path": stable_path,
+            "runtime_filename": runtime_filename,
+            "source_hash": sha256(markdown.encode("utf-8")).hexdigest(),
+            "chunking_strategy": (
+                STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+                if chunking_strategy == STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+                and (not targeted_mode or doc_id in target_document_ids)
+                else DEFAULT_CHUNKING_STRATEGY
+            ),
+        })
         document_map[doc_id] = runtime_filename
         roles = []
         if doc_id in required_ids:
@@ -405,7 +666,79 @@ def _prepare_enterprise_documents(
             "translation_source": (
                 "canonical_manual_retranslation" if language == "zh" else "source_parquet"
             ),
+            "chunking_strategy": document_specs[-1]["chunking_strategy"],
+            "targeted_rechunk": targeted_mode and doc_id in target_document_ids,
         })
+
+    # Each worker owns its loader because LangChain splitters are not shared
+    # mutable state.  Results are reassembled in source order and only the
+    # main thread writes checkpoint files, keeping persistence single-writer.
+    parse_workers = _normalize_enterprise_document_parse_workers(parse_workers)
+    parse_retries = _enterprise_document_parse_retries()
+    checkpoint_root = checkpoint_dir / "documents" if checkpoint_dir else None
+    if checkpoint_root:
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+
+    def parse_one(spec: dict[str, Any]) -> tuple[int, list[dict[str, Any]], int]:
+        last_error: Exception | None = None
+        for attempt in range(parse_retries + 1):
+            try:
+                loader = DocumentLoader(chunking_strategy=spec["chunking_strategy"])
+                chunks = loader.load_document(
+                    str(spec["stable_path"]),
+                    spec["runtime_filename"],
+                    str(spec["stable_path"]),
+                )
+                return spec["index"], chunks, attempt
+            except Exception as exc:  # retry only this document
+                last_error = exc
+                if attempt < parse_retries:
+                    time.sleep(min(2 ** attempt, 4))
+        raise RuntimeError(
+            f"EnterpriseRAG 文档解析失败：{spec['doc_id']}，已重试 {parse_retries} 次"
+        ) from last_error
+
+    with ThreadPoolExecutor(
+        max_workers=parse_workers,
+        thread_name_prefix="enterprise-markdown-parse",
+    ) as executor:
+        # Keep both the worker pool and the pending queue bounded.  ``map`` on
+        # older Python versions eagerly submits every document, which would
+        # retain thousands of futures for the 7,222-document corpus.
+        pending = {
+            executor.submit(parse_one, spec): spec
+            for spec in document_specs[:parse_workers]
+        }
+        next_spec_index = len(pending)
+        parsed_results: dict[int, tuple[list[dict[str, Any]], int]] = {}
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                spec = pending.pop(future)
+                index, chunks, attempts = future.result()
+                parsed_results[index] = (chunks, attempts)
+                if next_spec_index < len(document_specs):
+                    next_spec = document_specs[next_spec_index]
+                    pending[executor.submit(parse_one, next_spec)] = next_spec
+                    next_spec_index += 1
+
+        # Restore source order so chunk IDs, manifests and downstream inserts
+        # remain reproducible regardless of completion timing.
+        for index in sorted(parsed_results):
+            chunks, attempts = parsed_results[index]
+            all_chunks.extend(chunks)
+            if checkpoint_root:
+                spec = document_specs[index]
+                checkpoint = {
+                    "status": "completed",
+                    "doc_id": spec["doc_id"],
+                    "stable_filename": spec["stable_path"].name,
+                    "source_markdown_sha256": spec["source_hash"],
+                    "chunking_strategy": spec["chunking_strategy"],
+                    "chunk_count": len(chunks),
+                    "retry_count": attempts,
+                }
+                _write_json(checkpoint_root / f"{index:06d}.json", checkpoint)
 
     prepared_cases: list[dict[str, Any]] = []
     if language == "zh":
@@ -471,6 +804,17 @@ def _prepare_enterprise_documents(
             str(ENTERPRISE_ROOT / "derived" / "v1" / "zh-primary" / "manual-codex-retranslation" / "canonical" / "documents")
             if language == "zh" else None
         ),
+        "chunking_strategy": chunking_strategy,
+        "chunking_scope": "targeted_rechunk" if targeted_mode else "full_corpus",
+        "targeted_rechunk_document_count": len(target_document_ids),
+        "targeted_rechunk_document_ids": sorted(target_document_ids),
+        "document_parse_workers": parse_workers,
+        "document_parse_retries": parse_retries,
+        "chunking_config_hash": DocumentLoader(
+            chunking_strategy=STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+        ).chunking_config_hash
+        if chunking_strategy == STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+        else None,
     }
     return prepared_cases, [chunk for chunk in all_chunks if chunk["chunk_level"] in (1, 2)], [
         chunk for chunk in all_chunks if chunk["chunk_level"] == 3
@@ -485,13 +829,73 @@ def prepare_run(
     language: Literal["en", "zh"] = "en",
     corpus: Literal["representative", "challenge"] = "representative",
     evaluation_mode: Literal["retrieval", "rag"] = "rag",
+    chunking_strategy: str = DEFAULT_CHUNKING_STRATEGY,
+    rechunk_scope: Literal["full", "targeted"] = "full",
+    target_manifest_path: Path | None = None,
+    document_parse_workers: int | None = None,
 ) -> Path:
     """转换语料、写入独立集合，并持久化样本和清理清单。"""
     run_id = _safe_run_id(run_id)
+    if chunking_strategy not in SUPPORTED_CHUNKING_STRATEGIES:
+        raise ValueError(f"不支持的 document_chunking_strategy：{chunking_strategy}")
+    if dataset != "enterpriserag" and chunking_strategy != DEFAULT_CHUNKING_STRATEGY:
+        raise ValueError("结构化 Markdown 分块只允许用于 EnterpriseRAG 评测")
+    if rechunk_scope not in {"full", "targeted"}:
+        raise ValueError("rechunk_scope 必须是 full 或 targeted")
+    if rechunk_scope == "targeted":
+        if dataset != "enterpriserag" or chunking_strategy != STRUCTURED_MARKDOWN_CHUNKING_STRATEGY:
+            raise ValueError("targeted_rechunk 只允许用于 EnterpriseRAG 的结构化 Markdown 分块")
+        if target_manifest_path is None:
+            raise ValueError("targeted_rechunk 必须提供 --target-manifest")
+        target_manifest_path = target_manifest_path.resolve()
+        target_manifest = _validate_structured_target_manifest_header(target_manifest_path)
+        target_document_ids = {
+            str(value) for value in target_manifest.get("target_document_ids") or []
+        }
+        target_case_ids = {str(value) for value in target_manifest.get("case_ids") or []}
+    elif target_manifest_path is not None:
+        raise ValueError("只有 rechunk_scope=targeted 时才能提供 target manifest")
+    else:
+        target_manifest = None
+        target_document_ids = set()
+        target_case_ids = set()
+
+    evaluation_storage_config: EvaluationStorageConfig | None = None
+    isolated_parent_store: EvaluationParentChunkStore | None = None
+    if chunking_strategy == STRUCTURED_MARKDOWN_CHUNKING_STRATEGY:
+        # This runs before the output directory, Milvus collection, or any chunk
+        # write exists, so a missing/unsafe URL cannot fall back to business data.
+        evaluation_storage_config = EvaluationStorageConfig.from_env()
+        isolated_parent_store = EvaluationParentChunkStore(
+            run_id,
+            config=evaluation_storage_config,
+        )
+        isolated_parent_store.check_connection()
+
     output_dir = run_directory(dataset, run_id)
+    resume_incomplete = False
     if output_dir.exists():
-        raise FileExistsError(f"评测运行目录已存在：{output_dir}。请换一个 run_id，或先执行 cleanup。")
-    output_dir.mkdir(parents=True)
+        existing_manifest_path = output_dir / "manifest.json"
+        if not (
+            rechunk_scope == "targeted"
+            and existing_manifest_path.is_file()
+        ):
+            raise FileExistsError(f"评测运行目录已存在：{output_dir}。请换一个 run_id，或先执行 cleanup。")
+        existing_manifest = _read_json(existing_manifest_path)
+        if existing_manifest.get("prepare_completed"):
+            raise FileExistsError(f"评测运行已完成，拒绝覆盖：{output_dir}")
+        expected_collection_name = _collection_name(dataset, run_id)
+        if (
+            existing_manifest.get("run_id") != run_id
+            or existing_manifest.get("collection_name") != expected_collection_name
+            or existing_manifest.get("rechunk_scope") != "targeted"
+            or existing_manifest.get("document_chunking_strategy") != STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+            or existing_manifest.get("target_manifest_sha256") != _sha256_file(target_manifest_path)
+        ):
+            raise RuntimeError("未完成 targeted run 的不可变配置不匹配，拒绝恢复或覆盖")
+        resume_incomplete = True
+    else:
+        output_dir.mkdir(parents=True)
     collection_name = _collection_name(dataset, run_id)
     markdown_dir = output_dir / "markdown"
     source_root = DATASET_ROOT / ("ecom-retrieval" if dataset == "ecomretrieval" else "multihop-rag")
@@ -531,12 +935,24 @@ def prepare_run(
             profile=profile,
             language=language,
             corpus=corpus,
+            chunking_strategy=chunking_strategy,
+            target_document_ids=target_document_ids,
+            target_case_ids=target_case_ids,
+            checkpoint_dir=output_dir / "preparation-checkpoints",
+            parse_workers=document_parse_workers,
         )
         document_count = (
             enterprise_metadata["required_document_count"]
             + enterprise_metadata["ordinary_document_count"]
             + enterprise_metadata["hard_document_count"]
         )
+        if rechunk_scope == "targeted":
+            # Older frozen manifests may omit target_document_ids; the
+            # preparation helper derives the complete 43-document union from
+            # the immutable case records and returns it in metadata.
+            target_document_ids = set(
+                enterprise_metadata.get("targeted_rechunk_document_ids") or target_document_ids
+            )
 
     if dataset != "ecomretrieval" and not leaf_chunks:
         raise RuntimeError("未生成任何 L3 叶子块，已终止入库")
@@ -555,6 +971,8 @@ def prepare_run(
         # 先落盘未完成状态，进程被系统终止时 evaluate 不会误用部分入库的数据。
         "prepare_completed": False,
         "prepared_at": datetime.now(UTC).isoformat(),
+        "document_chunking_strategy": chunking_strategy,
+        "rechunk_scope": rechunk_scope,
     }
     config = _public_config(
         dataset,
@@ -564,7 +982,21 @@ def prepare_run(
         language=language,
         corpus=corpus,
         evaluation_mode=evaluation_mode,
+        chunking_strategy=chunking_strategy,
+        rechunk_scope=rechunk_scope,
+        document_parse_workers=document_parse_workers,
     )
+    if evaluation_storage_config:
+        manifest.update(evaluation_storage_config.public_metadata(run_id))
+    if target_manifest is not None:
+        manifest.update({
+            "target_manifest_path": str(target_manifest_path),
+            "target_manifest_sha256": _sha256_file(target_manifest_path),
+            "target_case_set": target_manifest.get("case_set"),
+            "target_case_count": target_manifest.get("case_count"),
+            "target_document_count": len(target_document_ids),
+            "target_document_ids": sorted(target_document_ids),
+        })
     _write_json(output_dir / "config.json", config)
     _write_json(output_dir / "manifest.json", manifest)
     if dataset == "multihoprag":
@@ -594,19 +1026,114 @@ def prepare_run(
                 "validation_case_count": len(case_split["validation_case_ids"]),
             })
         manifest["markdown_dir"] = enterprise_metadata["artifact_dir"]
+        if target_manifest is not None:
+            manifest["target_document_count"] = enterprise_metadata.get(
+                "targeted_rechunk_document_count", len(target_document_ids)
+            )
+            manifest["target_document_ids"] = enterprise_metadata.get(
+                "targeted_rechunk_document_ids", sorted(target_document_ids)
+            )
         _write_json(output_dir / "manifest.json", manifest)
 
     store = _evaluation_store(collection_name)
-    parent_store = ParentChunkStore()
+    parent_store = isolated_parent_store or ParentChunkStore()
+    leaf_chunks_to_write = leaf_chunks
+    vector_copy_checkpoint_path = output_dir / "preparation-checkpoints" / "vector-copy.json"
+    vector_copy_result: dict[str, Any] | None = None
+    source_collection_name = ""
     try:
+        if isolated_parent_store and rechunk_scope == "targeted":
+            source_corpus_run_id = str(target_manifest.get("source_corpus_run_id") or "")
+            if not source_corpus_run_id:
+                raise RuntimeError("target manifest 缺少 source_corpus_run_id，拒绝复制旧向量")
+            source_collection_name = _collection_name("enterpriserag", source_corpus_run_id)
+            if source_collection_name == collection_name or source_collection_name == os.getenv(
+                "MILVUS_COLLECTION", "embeddings_collection"
+            ):
+                raise RuntimeError("targeted 旧向量源集合命中了目标/默认业务集合，拒绝复制")
+            source_store = _evaluation_store(source_collection_name)
+            # Check source existence before creating or writing the target
+            # collection.  A missing source must fail, never trigger full
+            # re-embedding as an implicit fallback.
+            if not source_store.has_collection():
+                raise RuntimeError(
+                    f"旧 Representative Milvus 集合不存在，拒绝回退到全量重嵌入：{source_collection_name}"
+                )
+            store.init_collection(int(os.getenv("DENSE_EMBEDDING_DIM", "1024")))
+            vector_copy_result = _copy_non_target_vectors(
+                source_store=source_store,
+                target_store=store,
+                source_collection_name=source_collection_name,
+                source_corpus_run_id=source_corpus_run_id,
+                target_corpus_run_id=run_id,
+                target_document_ids=set(target_document_ids),
+                checkpoint_path=vector_copy_checkpoint_path,
+                batch_size=int(os.getenv("MILVUS_COPY_BATCH_SIZE", "500")),
+                page_size=int(os.getenv("MILVUS_COPY_PAGE_SIZE", "1000")),
+            )
+            target_filenames = {
+                str(enterprise_metadata["document_map"][doc_id])
+                for doc_id in target_document_ids
+                if doc_id in enterprise_metadata["document_map"]
+            }
+            leaf_chunks_to_write = [
+                chunk for chunk in leaf_chunks if str(chunk.get("filename") or "") in target_filenames
+            ]
+            expected_target_leaf_count = sum(
+                1 for chunk in leaf_chunks if str(chunk.get("filename") or "") in target_filenames
+            )
+            if len(leaf_chunks_to_write) != expected_target_leaf_count:
+                raise RuntimeError("target 文档 L3 分块过滤结果不一致，拒绝部分入库")
+            manifest.update({
+                "source_collection_name": source_collection_name,
+                "vector_copy_count": vector_copy_result["vector_copy_count"],
+                "vector_copy_checkpoint": str(vector_copy_checkpoint_path),
+                "vector_copy_status": vector_copy_result["status"],
+                "target_leaf_chunk_count": len(leaf_chunks_to_write),
+                "legacy_vector_copy_enabled": True,
+            })
+            config.update({
+                "source_collection_name": source_collection_name,
+                "vector_copy_count": vector_copy_result["vector_copy_count"],
+                "vector_copy_checkpoint": str(vector_copy_checkpoint_path),
+                "legacy_vector_copy_enabled": True,
+            })
+            _write_json(output_dir / "manifest.json", manifest)
+            _write_json(output_dir / "config.json", config)
         if parent_chunks:
-            parent_store.upsert_documents(parent_chunks)
-        MilvusWriter(embedding_service=embedding_service, milvus_manager=store).write_documents(leaf_chunks)
+            if isolated_parent_store:
+                parent_store.upsert_documents(
+                    parent_chunks,
+                    batch_size=int(os.getenv("EVALUATION_PARENT_BATCH_SIZE", "500")),
+                    progress_callback=lambda processed: _write_json(
+                        output_dir / "preparation-checkpoints" / "parents.json",
+                        {"status": "completed", "processed": processed},
+                    ),
+                )
+            else:
+                parent_store.upsert_documents(parent_chunks)
+        writer = MilvusWriter(embedding_service=embedding_service, milvus_manager=store)
+        if isolated_parent_store:
+            writer.write_documents(
+                leaf_chunks_to_write,
+                batch_size=int(os.getenv("MILVUS_WRITE_BATCH_SIZE", os.getenv("EMBEDDING_BATCH_SIZE", "50"))),
+                embedding_workers=_embedding_worker_count(),
+                progress_callback=lambda processed, total: _write_json(
+                    output_dir / "preparation-checkpoints" / "milvus.json",
+                    {"status": "completed", "processed": processed, "total": total},
+                ),
+            )
+        else:
+            # Keep the legacy preparation call contract unchanged.
+            writer.write_documents(leaf_chunks)
     except Exception:
         # 失败时尽量回收已写入的孤立数据；原异常继续向上抛出，不能伪造准备成功。
         store.drop_collection()
-        for filename in {chunk["filename"] for chunk in parent_chunks}:
-            parent_store.delete_by_filename(filename)
+        if isolated_parent_store:
+            isolated_parent_store.delete_by_corpus_run()
+        else:
+            for filename in {chunk["filename"] for chunk in parent_chunks}:
+                parent_store.delete_by_filename(filename)
         raise
 
     if dataset == "ecomretrieval":
@@ -788,6 +1315,7 @@ _TARGET_MANIFEST_CONTRACTS: dict[str, tuple[int, str]] = {
     "rewrite_candidate_fusion": (15, "rewrite_candidate_fusion"),
     "evidence_candidate_audit": (97, "rewrite_candidate_fusion"),
     "adjacent_l3_expansion": (11, "adjacent_l3_expansion"),
+    "structured_chunking_offline_audit": (30, "document_chunking_strategy"),
 }
 
 
@@ -1159,7 +1687,7 @@ def _select_target_manifest_cases(
 ) -> tuple[list[dict[str, Any]], str]:
     """Validate a frozen analysis target manifest against the current corpus split."""
     if case_set != "analysis":
-        raise ValueError("改写候选融合 target manifest 只能用于 analysis case set")
+        raise ValueError("target manifest 只能用于 analysis case set")
     payload = _read_json(target_manifest_path)
     if payload.get("case_set") != "analysis":
         raise ValueError("target manifest 的 case_set 必须是 analysis")
@@ -1270,6 +1798,33 @@ def _select_target_manifest_cases(
             }
             if baseline_comparison.get(case_id) != expected_baseline:
                 raise ValueError(f"target manifest 的基线摘要与源结果不一致：{case_id}")
+    elif manifest_type == "structured_chunking_offline_audit":
+        review_path = Path(str(payload.get("source_raw_review") or ""))
+        if not review_path.is_file() or _sha256_file(review_path) != payload.get("source_raw_review_sha256"):
+            raise ValueError("结构化分块 target manifest 的人工复核源文件哈希不匹配")
+        review_by_id = {
+            str(record.get("case_id")): record
+            for record in (
+                json.loads(line)
+                for line in review_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        }
+        targets_by_id = {
+            str(target.get("case_id")): target
+            for target in payload.get("targets") or []
+        }
+        if set(targets_by_id) != set(case_ids):
+            raise ValueError("结构化分块 target 的 targets 与 case_ids 不一致")
+        for case_id in case_ids:
+            review = review_by_id.get(case_id)
+            target = targets_by_id[case_id]
+            if review is None or review.get("case_set") != "analysis":
+                raise ValueError(f"结构化分块 target 的人工复核缺少 analysis 题：{case_id}")
+            if review.get("classification") != "same_source_far_leaf_gap":
+                raise ValueError(f"结构化分块 target 含非远距离叶块缺口题：{case_id}")
+            if target.get("case_set") != "analysis" or target.get("source_ref") != review.get("source_ref"):
+                raise ValueError(f"结构化分块 target 的来源摘要不匹配：{case_id}")
     elif manifest_type == "adjacent_l3_expansion":
         review_path = Path(str(payload.get("source_raw_candidate_fact_review_path") or ""))
         if not review_path.is_file() or _sha256_file(review_path) != payload.get("source_raw_candidate_fact_review_sha256"):
@@ -2119,13 +2674,27 @@ def _evaluate_multihop_case(
         )
 
 
+def _evaluation_parent_store_for_runtime(config: dict[str, Any]) -> ParentChunkStore | EvaluationParentChunkStore:
+    """Choose the parent store recorded by the immutable corpus configuration."""
+    strategy = str(config.get("document_chunking_strategy") or DEFAULT_CHUNKING_STRATEGY)
+    if strategy != STRUCTURED_MARKDOWN_CHUNKING_STRATEGY:
+        return ParentChunkStore()
+    corpus_run_id = str(config.get("corpus_run_id") or config.get("run_id") or "")
+    store = EvaluationParentChunkStore(
+        corpus_run_id,
+        config=EvaluationStorageConfig.from_env(),
+    )
+    store.check_connection()
+    return store
+
+
 def _build_multihop_runtime(config: dict[str, Any]) -> tuple[RetrievalRuntime, JudgeConfig | None, requests.Session | None]:
     """在评测工作进程中创建只访问独立 Milvus 集合的运行时依赖。"""
     store = _evaluation_store(config["collection_name"])
     runtime = RetrievalRuntime(
         milvus_store=store,
         embedding_service=embedding_service,
-        parent_chunk_store=ParentChunkStore(),
+        parent_chunk_store=_evaluation_parent_store_for_runtime(config),
         retrieval_mode="hybrid",
         enable_rewrite_candidate_fusion=bool(config.get("rewrite_candidate_fusion_enabled")),
         enable_adjacent_l3_expansion=bool(config.get("adjacent_l3_expansion_enabled")),
@@ -2242,11 +2811,21 @@ def _finalize_multihop_evaluation(
     interruption_error: str,
 ) -> dict[str, Any]:
     """Write the shared terminal progress and metrics for serial or pooled execution."""
+    expected_case_ids = {str(case["id"]) for case in cases}
+    missing_case_count = len(expected_case_ids - completed_case_ids)
+    evaluation_error_count = sum(_has_evaluation_error(record) for record in records)
+    terminal_error = interruption_error
+    if not terminal_error and missing_case_count:
+        terminal_error = f"仍有 {missing_case_count} 道题没有成功记录"
+    if not terminal_error and evaluation_error_count:
+        terminal_error = f"有 {evaluation_error_count} 道题包含 evaluation_error"
     summary = {
         "dataset": config.get("dataset", "multihoprag"),
         "run_id": config["run_id"],
         "judge_request_type": "independent_grade_model",
         "evaluation_worker_count": _evaluation_worker_count(config),
+        "evaluation_error_count": evaluation_error_count,
+        "unresolved_case_count": missing_case_count,
         **multihop_metrics(records),
     }
     summary["by_question_type"] = _enterprise_question_type_summary(
@@ -2257,12 +2836,12 @@ def _finalize_multihop_evaluation(
         output_dir,
         total_cases=len(cases),
         completed_case_ids=completed_case_ids,
-        status="interrupted" if interruption_error else "completed",
-        error=interruption_error,
+        status="interrupted" if terminal_error else "completed",
+        error=terminal_error,
     )
-    summary["evaluation_status"] = "interrupted" if interruption_error else "completed"
-    if interruption_error:
-        summary["interruption_error"] = interruption_error
+    summary["evaluation_status"] = "interrupted" if terminal_error else "completed"
+    if terminal_error:
+        summary["interruption_error"] = terminal_error
     return summary
 
 
@@ -2644,6 +3223,11 @@ def _new_experiment_config(
         language=str(corpus_config.get("language") or "en"),
         corpus=str(corpus_config.get("corpus") or "representative"),
         evaluation_mode=evaluation_mode,
+        chunking_strategy=str(
+            corpus_config.get("document_chunking_strategy") or DEFAULT_CHUNKING_STRATEGY
+        ),
+        rechunk_scope=str(corpus_config.get("rechunk_scope") or "full"),
+        document_parse_workers=corpus_config.get("document_parse_workers"),
     )
     config.update({
         "evaluation_id": evaluation_id,
@@ -2706,6 +3290,10 @@ def evaluate_run(
         raise ValueError(
             "adjacent_l3_expansion 只能通过固定的 11 题 target manifest 评测"
         )
+    if changed_variable == "document_chunking_strategy" and target_manifest_path is None:
+        raise ValueError(
+            "document_chunking_strategy 只能通过冻结的 30 题 structured target manifest 评测"
+        )
     if target_manifest_path is not None:
         if evaluation_id is None:
             raise ValueError("target manifest 评测必须提供独立 evaluation_id，不能写入 corpus 根目录")
@@ -2733,13 +3321,33 @@ def evaluate_run(
             raise ValueError(
                 f"{target_manifest_type} target manifest 必须明确声明 changed_variable={expected_variable}"
             )
-    if target_manifest_type in {"evidence_candidate_audit", "adjacent_l3_expansion"} and not capture_candidate_trace:
+    if target_manifest_type == "structured_chunking_offline_audit" and (
+        corpus_config.get("document_chunking_strategy")
+        != STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+    ):
+        raise ValueError(
+            "结构化分块 target 只能使用 document_chunking_strategy=markdown_header_recursive_v1 的新 corpus run"
+        )
+    if target_manifest_type in {
+        "evidence_candidate_audit",
+        "adjacent_l3_expansion",
+        "structured_chunking_offline_audit",
+    } and not capture_candidate_trace:
         raise ValueError(f"{target_manifest_type} target manifest 必须显式开启 candidate trace")
     if capture_candidate_trace and (
         target_manifest_path is None
-        or changed_variable not in {"rewrite_candidate_fusion", "adjacent_l3_expansion"}
+        or changed_variable not in {
+            "rewrite_candidate_fusion",
+            "adjacent_l3_expansion",
+            "document_chunking_strategy",
+        }
     ):
         raise ValueError("candidate trace 只能在受控的单变量 target manifest 评测中开启")
+    if (
+        target_manifest_type == "structured_chunking_offline_audit"
+        and evaluation_worker_count != 10
+    ):
+        raise ValueError("结构化分块 30 题真实评测必须使用 evaluation_worker_count=10")
     if retry_from_evaluation_id and (evaluation_id is None or mode != "rag" or dataset != "enterpriserag"):
         raise ValueError("retry 只支持 EnterpriseRAG 完整 RAG，且必须提供新的 evaluation_id")
 
@@ -2794,6 +3402,11 @@ def evaluate_run(
         if retry_from_evaluation_id:
             retry_compatibility_ignored = {
                 "run_id", "evaluation_id", "prepared_at", "created_at", "code_version",
+                # Retry metadata describes the current repair hop.  It may
+                # change when a later retry continues from an interrupted
+                # retry, while the actual corpus and RAG inputs remain fixed.
+                "retry_source_evaluation_id", "retry_source_results_sha256",
+                "retry_case_count", "preserved_case_count",
                 # Worker count is an execution budget, not a RAG input.  A
                 # retry may safely use more workers while preserving all model,
                 # retrieval, corpus, and target-manifest inputs.
@@ -2836,6 +3449,7 @@ def evaluate_run(
             immutable_keys = (
                 "corpus_run_id", "source_corpus_manifest_sha256", "source_case_split_sha256",
                 "case_set", "evaluation_mode", "changed_variable", "case_count",
+                "document_chunking_strategy", "rechunk_scope", "document_parse_workers",
                 "model_timeout_seconds", "evaluation_case_timeout_seconds",
                 "retry_source_evaluation_id", "retry_source_results_sha256", "retry_case_count",
                 "preserved_case_count",
@@ -3046,16 +3660,31 @@ def cleanup_run(*, dataset: Literal["ecomretrieval", "multihoprag", "enterpriser
     manifest_path = output_dir / "manifest.json"
     manifest = _read_json(manifest_path)
     collection_name = manifest["collection_name"]
+    uses_isolated_parent_store = (
+        manifest.get("evaluation_storage_mode") == "isolated_postgresql"
+    )
+    if uses_isolated_parent_store:
+        parent_store: ParentChunkStore | EvaluationParentChunkStore = EvaluationParentChunkStore(
+            _safe_run_id(run_id),
+            config=EvaluationStorageConfig.from_env(),
+        )
+        # Validate the dedicated target before deleting the corresponding Milvus
+        # collection.  Never fall back to the business parent store during cleanup.
+        parent_store.check_connection()
+    else:
+        parent_store = ParentChunkStore()
     collection_drop_status = "dropped"
     if _is_valid_milvus_collection_name(collection_name):
         _evaluation_store(collection_name).drop_collection()
     else:
         # 仅兼容修复前生成的非法名称；Milvus 从未能创建这种集合，因此可安全跳过。
         collection_drop_status = "skipped_invalid_legacy_name"
-    parent_store = ParentChunkStore()
-    deleted_parent_chunks = 0
-    for filename in manifest.get("parent_filenames", []):
-        deleted_parent_chunks += parent_store.delete_by_filename(filename)
+    if uses_isolated_parent_store:
+        deleted_parent_chunks = parent_store.delete_by_corpus_run()
+    else:
+        deleted_parent_chunks = 0
+        for filename in manifest.get("parent_filenames", []):
+            deleted_parent_chunks += parent_store.delete_by_filename(filename)
     manifest.update({
         "cleanup_completed": True,
         "cleanup_at": datetime.now(UTC).isoformat(),

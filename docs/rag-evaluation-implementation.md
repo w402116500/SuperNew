@@ -1457,3 +1457,33 @@ T8 仍只描述 analysis 集，不能代表 200 题 validation 泛化结果。
 有 9 道系统异常必须排除：`qst_0023`、`qst_0100` 的回答生成超时；`qst_0287`、`qst_0298`、`qst_0405` 的证据评分不可用；`qst_0343`、`qst_0361`、`qst_0407`、`qst_0443` 的独立判卷超时。它们不属于分块、检索或回答质量失败。
 
 完整人工归因记录位于 `t10-adjacent-l3-expansion-analysis-147-002/manual-review-conclusions.jsonl` 和 `manual-review-conclusions.md`；原始自动队列仍保留在 `manual-review.jsonl`/`.md`。这些全都是 analysis 记录，不能外推为 500 题总体结果，更不能作为 validation 泛化结果。
+
+### 结构化 Markdown 分块与评测存储隔离：30 道 analysis 真实评测完成
+
+本轮的唯一 RAG 输入变量已固定为 `document_chunking_strategy=markdown_header_recursive_v1`。实现保留旧的 `recursive_l1_l2_l3` 默认路径；新路径仅在 EnterpriseRAG 评测显式传参时启用。L1/L2/L3 的目标长度、重叠、Embedding、模型、Prompt、top-k、Rerank 和 Auto-merging 均未改变。
+
+新路径按 Markdown 标题后，在标题范围内保护完整列表、表格和围栏代码块，并保存 `heading_path`、原文范围、结构类型、前后块、策略和配置 hash。评测 L1/L2 的新 store 使用专用 `EVALUATION_DATABASE_URL`，拒绝缺失 URL 或业务库回退；它只操作独立表和 run-scoped Redis key。物理 PostgreSQL 数据库不由应用或 runner 自动创建。
+
+离线审计已冻结 30 道 `analysis` 的 `same_source_far_leaf_gap` 题，产物为 `structured-chunking-offline-audit-002/chunking-target-manifest.json`、`chunk-audit.jsonl`、`chunk-audit.md` 和 `chunk-audit-summary.json`。审计结果为旧 L3 `500`、新 L3 `462`；61 条关键旧 L3 中 17 条边界完全相同、44 条边界变化；只有 3 / 30 题的关键材料位于二级或更深标题。全部 30 条旧关键材料可映射到新块。
+
+这些是结构和可审计性结果，**不是**通过率、证据覆盖率或召回提升。离线过程未连接 PostgreSQL、Redis、Milvus，也没有调用 Embedding、Rerank、回答或判卷模型；没有访问 validation，也没有改动或清理 `tutorial_verify_embeddings` 与已冻结 Representative 集合。30 条并排块记录已经人工复核，随后才进入独立库、新集合和 30 题真实 RAG 对照的受控阶段。
+
+本轮实施记录：结构化 target manifest 的最新版本为 `structured-chunking-offline-audit-002/chunking-target-manifest.json`，文件 SHA-256 为 `7565e1f478f81956224d9cab601883053a8fd2719e84e8c4626906bf7ae5bfe1`。独立 PostgreSQL `enterprise_rag_evaluation`、新 Milvus collection `rag_eval_enterpriserag_enterpriserag_en_representative_structured_targeted_004` 和 run-scoped Redis 已实际用于语料准备；旧业务库、默认业务集合和旧 Representative 集合未被写入或清理。早期 `001` 产物保留作历史记录，不作为结果。
+
+真实评测固定使用 `corpus_run_id=enterpriserag-en-representative-structured-targeted-004`、10 个 worker、单题总时限 600 秒，冻结 30 道 `analysis` 题，只改变 `document_chunking_strategy=markdown_header_recursive_v1`。主运行 `structured-chunking-analysis-30-001` 之后，按缺失/异常题链式使用新 evaluation ID 重试：`retry-002`、`retry-003`、`retry-004`、`retry-005`。retry-005 仍有 3 道整题超时，另有 3 道回答请求超过 90 秒，因此最终 6 道必须归为 `system_error`，不能当作分块失败或优化收益；整体状态保持 `interrupted`。
+
+| 指标 | baseline 对应 30 题 | 结构化分块最终链 30 题 | 变化 |
+| --- | ---: | ---: | ---: |
+| 证据全覆盖率 | 10.00% (3/30) | 50.00% (15/30) | +40.00 个百分点 |
+| 平均证据覆盖率 | 16.76% | 53.98% | +37.22 个百分点 |
+| 回答通过率 | 6.67% (2/30) | 26.67% (8/30) | +20.00 个百分点 |
+
+只保留 baseline 和结构化结果都没有系统错误的 24 道同题对照：证据全覆盖率 `8.33% -> 54.17%`（`+45.83` 个百分点），平均证据覆盖率 `14.70% -> 59.14%`（`+44.44` 个百分点），回答通过率 `4.17% -> 33.33%`（`+29.17` 个百分点）。这仍然是 targeted analysis 结果，不是 500 题总体结果。
+
+自动影响审计把 30 题分为：7 道“证据补回且回答通过候选”、5 道“证据覆盖提升但回答仍失败”、1 道“证据覆盖退化”、11 道“没有可测证据收益”、6 道系统异常。7 道只能作为待人工确认的因果候选；5 道说明材料可能补回但回答仍失败；1 道出现退化，不能计入收益；11 道说明结构化分块没有在本次链路中产生可测证据收益。目标答案文档在初始候选、原始候选、合并后候选、Rerank 输入、最终上下文中的出现数分别为 `14/30`、`21/30`、`21/30`、`21/30`、`20/30`，文件出现不等于关键事实完整进入最终上下文。
+
+真实评测各次 attempt 与最终链式审计位于 `output/rag-evaluations/enterpriserag/enterpriserag-en-representative-structured-targeted-004/evaluations/` 下的 `structured-chunking-analysis-30-001`、`retry-002`、`retry-003`、`retry-004`、`retry-005` 目录。retry-005 的 `attempt-results.jsonl` 保留最后 3 道原始重试结果；`structured-chunking-merged-results.jsonl` 是从完整 retry 链离线合并出的 30 道审计输入，不是新的模型运行。该目录的 `structured-chunking-impact-summary.json/.md` 是新旧对照，`structured-chunking-manual-review.jsonl/.md` 是逐题人工预复核，`manual-review.jsonl/.md` 是最后 attempt 的运行器人工队列。
+
+当前不能据此启动 T9、运行 validation 或重跑 500 题。最后 3 道整题超时已经重试仍未完成；3 道回答请求超时也只保留为系统异常。下一步应由用户确认是否继续人工确认 7 道收益候选；后续每轮仍只能改变一个变量。
+
+离线块审计的 30 道题人工复核已完成，产物位于 `structured-chunking-offline-audit-002` 的 `manual-review.jsonl` 和 `manual-review.md`。这不是新旧 RAG 结果的最终人工因果结论；真实 RAG 结果的 `structured-chunking-manual-review.jsonl/.md` 仍标记为待人工最终确认。离线复核结论为：8 题出现明确的标题/列表/代码/表格结构信号，7 题关键边界基本不变，14 题只是普通文本边界重新分配，1 题旧块定位有重复歧义。复核期间发现 `qst_0300` 的无首尾管道符表格未被识别为表格原子，已修复 `_MARKDOWN_TABLE_SEPARATOR_RE` 并加回归测试；修复后重新运行离线审计。

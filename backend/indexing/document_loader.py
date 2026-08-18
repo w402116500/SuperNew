@@ -4,6 +4,9 @@
 父子关系信息，供后续写入 PostgreSQL、Milvus 和 Auto-merging 检索流程使用。
 """
 
+# hashlib/json are used to record an immutable structured-chunking configuration.
+import hashlib
+import json
 # os 用于遍历文件夹、组合文件路径。
 import os
 # re 用于匹配和替换控制字符、私有区字符。
@@ -16,7 +19,8 @@ from types import SimpleNamespace
 from typing import Dict, List
 
 # RecursiveCharacterTextSplitter 会尽量按自然分隔符切分长文本。
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 from backend.indexing.document_types import NATIVE_TEXT_SUFFIXES, document_type_for_filename, is_rich_document
 
@@ -24,6 +28,21 @@ from backend.indexing.document_types import NATIVE_TEXT_SUFFIXES, document_type_
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # 编译零宽字符和不可见格式化控制字符（零宽空白、BOM 标记、左右强排标志等）
 _INVISIBLE_CHAR_RE = re.compile(r"[\u200b-\u200d\ufeff\u200f\u202a-\u202e]")
+_MARKDOWN_HEADER_RE = re.compile(r"^(#{1,4})[ \t]+(.+?)[ \t]*#*[ \t]*$")
+_MARKDOWN_LIST_RE = re.compile(r"^[ \t]*(?:[-+*]|\d+[.)])[ \t]+.+")
+_MARKDOWN_FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+_MARKDOWN_TABLE_SEPARATOR_RE = re.compile(
+    # Markdown permits omitting both the leading and trailing pipe.  Keep at
+    # least two columns while accepting a final separator without `|`.
+    r"^[ \t]*\|?(?:[ \t]*:?-{3,}:?[ \t]*\|)+[ \t]*:?-{3,}:?[ \t]*\|?[ \t]*$"
+)
+
+DEFAULT_CHUNKING_STRATEGY = "recursive_l1_l2_l3"
+STRUCTURED_MARKDOWN_CHUNKING_STRATEGY = "markdown_header_recursive_v1"
+SUPPORTED_CHUNKING_STRATEGIES = {
+    DEFAULT_CHUNKING_STRATEGY,
+    STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+}
 
 
 # 所有格式先经过同一文本清洗入口，避免非法字符直到写数据库时才报错。
@@ -94,13 +113,24 @@ class DocumentLoader:
         _splitter_level_3: 最小的叶子块切分器，通常用于向量检索。
     """
 
-    def __init__(self, chunk_size: int = 800, chunk_overlap: int = 100):
+    def __init__(
+        self,
+        chunk_size: int = 800,
+        chunk_overlap: int = 100,
+        chunking_strategy: str = DEFAULT_CHUNKING_STRATEGY,
+    ):
         """使用指定的基础大小和重叠大小初始化三个文本切分器。
 
         Args:
             chunk_size: L3 的基础块大小，默认 800 个字符左右。
             chunk_overlap: L3 相邻块的基础重叠大小，默认 100 个字符左右。
         """
+        if chunking_strategy not in SUPPORTED_CHUNKING_STRATEGIES:
+            raise ValueError(
+                "不支持的分块策略："
+                f"{chunking_strategy}；可选值为 {sorted(SUPPORTED_CHUNKING_STRATEGIES)}"
+            )
+        self.chunking_strategy = chunking_strategy
         # 这里的“大小”和“重叠”默认按 Python len(text) 计算，也就是字符数，
         # 不是大模型的 Token 数。中文汉字、英文字符、标点和空格都会占用长度。
         # L1 最大、L2 居中、L3 最小，三个层级不是把同一组块简单复制三次。
@@ -157,6 +187,61 @@ class DocumentLoader:
             # 使用与 L1、L2 相同的分隔策略。
             separators=["\n\n", "。", "！", "？", "\n", "，", "、", " ", ""],
         )
+        # Structured Markdown keeps boundaries inside a heading.  English punctuation
+        # is included because EnterpriseRAG's formal corpus is English-only.
+        structured_separators = ["\n\n", "\n", ". ", "; ", ": ", ", ", " ", ""]
+        self._structured_splitters = {
+            1: RecursiveCharacterTextSplitter(
+                chunk_size=level_1_size,
+                chunk_overlap=level_1_overlap,
+                add_start_index=True,
+                separators=structured_separators,
+            ),
+            2: RecursiveCharacterTextSplitter(
+                chunk_size=level_2_size,
+                chunk_overlap=level_2_overlap,
+                add_start_index=True,
+                separators=structured_separators,
+            ),
+            3: RecursiveCharacterTextSplitter(
+                chunk_size=level_3_size,
+                chunk_overlap=level_3_overlap,
+                add_start_index=True,
+                separators=structured_separators,
+            ),
+        }
+        self._structured_level_sizes = {
+            1: level_1_size,
+            2: level_2_size,
+            3: level_3_size,
+        }
+        self._structured_config_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "strategy": STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+                    "headers": ["#", "##", "###", "####"],
+                    "level_sizes": self._structured_level_sizes,
+                    "level_overlaps": {
+                        1: level_1_overlap,
+                        2: level_2_overlap,
+                        3: level_3_overlap,
+                    },
+                    "separators": structured_separators,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self.chunking_config_hash = (
+            self._structured_config_hash
+            if chunking_strategy == STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+            else None
+        )
+        self._markdown_header_splitter = MarkdownHeaderTextSplitter(
+            headers_to_split_on=[("#", "h1"), ("##", "h2"), ("###", "h3"), ("####", "h4")],
+            strip_headers=False,
+        )
 
     # 文件名、页码、层级和序号共同组成稳定 ID，后续才能准确恢复父子关系。
     @staticmethod
@@ -174,6 +259,345 @@ class DocumentLoader:
         """
         # f-string 会把四个参数插入固定格式，形成可复现的文本 ID。
         return f"{filename}::p{page_number}::l{level}::{index}"
+
+    @staticmethod
+    def _trimmed_atom(text: str, start: int, end: int, kind: str) -> dict | None:
+        """Normalize one Markdown structural unit while retaining its source span."""
+        # Remove only line separators here.  A meaningful trailing space before a
+        # Markdown line break must stay in the block so its source span is auditable.
+        leading = len(text) - len(text.lstrip("\r\n"))
+        trailing = len(text) - len(text.rstrip("\r\n"))
+        body = text.strip("\r\n")
+        if not body.strip():
+            return None
+        return {
+            "text": body,
+            "start": start + leading,
+            "end": end - trailing,
+            "kind": kind,
+        }
+
+    def _markdown_sections(self, text: str) -> list[dict]:
+        """Return heading-scoped source ranges, ignoring heading-like code lines."""
+        # LangChain is the authoritative Markdown-header parser used by this path.
+        # The manual range scan complements it with exact offsets for offline audits.
+        langchain_sections = self._markdown_header_splitter.split_text(text)
+        known_paths = {
+            tuple(
+                str(document.metadata[key]).strip()
+                for key in ("h1", "h2", "h3", "h4")
+                if document.metadata.get(key)
+            )
+            for document in langchain_sections
+        }
+
+        headers: list[dict] = []
+        source_offset = 0
+        in_fence: str | None = None
+        for line in text.splitlines(keepends=True):
+            stripped = line.rstrip("\r\n")
+            fence_match = _MARKDOWN_FENCE_RE.match(stripped)
+            if fence_match:
+                marker = fence_match.group(1)[0]
+                if in_fence is None:
+                    in_fence = marker
+                elif marker == in_fence:
+                    in_fence = None
+                source_offset += len(line)
+                continue
+            header_match = None if in_fence else _MARKDOWN_HEADER_RE.match(stripped)
+            if header_match:
+                headers.append({
+                    "start": source_offset,
+                    "level": len(header_match.group(1)),
+                    "title": header_match.group(2).strip(),
+                })
+            source_offset += len(line)
+
+        if not headers:
+            return [{
+                "text": text,
+                "start": 0,
+                "end": len(text),
+                "heading_path": "",
+                "heading_level": 0,
+            }]
+
+        sections: list[dict] = []
+        if headers[0]["start"] > 0:
+            sections.append({
+                "text": text[:headers[0]["start"]],
+                "start": 0,
+                "end": headers[0]["start"],
+                "heading_path": "",
+                "heading_level": 0,
+            })
+
+        stack: list[tuple[int, str]] = []
+        for index, header in enumerate(headers):
+            level = int(header["level"])
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, str(header["title"])))
+            path_parts = tuple(title for _, title in stack)
+            # The LangChain parse confirms ordinary headings.  A range-scanned
+            # heading still remains valid when it follows text LangChain coalesced.
+            heading_path = " > ".join(path_parts)
+            if path_parts not in known_paths and langchain_sections:
+                heading_path = " > ".join(path_parts)
+            end = headers[index + 1]["start"] if index + 1 < len(headers) else len(text)
+            sections.append({
+                "text": text[header["start"]:end],
+                "start": header["start"],
+                "end": end,
+                "heading_path": heading_path,
+                "heading_level": level,
+            })
+        return sections
+
+    def _markdown_atoms(self, section: dict) -> list[dict]:
+        """Keep code fences, table bodies, and list runs intact as structural atoms."""
+        source = str(section["text"])
+        lines = source.splitlines(keepends=True)
+        offsets: list[int] = []
+        offset = 0
+        for line in lines:
+            offsets.append(offset)
+            offset += len(line)
+
+        atoms: list[dict] = []
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            stripped = line.rstrip("\r\n")
+            absolute_start = int(section["start"]) + offsets[index]
+            fence_match = _MARKDOWN_FENCE_RE.match(stripped)
+            if fence_match:
+                marker = fence_match.group(1)[0]
+                end_index = index + 1
+                while end_index < len(lines):
+                    candidate = lines[end_index].rstrip("\r\n")
+                    closing = _MARKDOWN_FENCE_RE.match(candidate)
+                    end_index += 1
+                    if closing and closing.group(1)[0] == marker:
+                        break
+                atom = self._trimmed_atom(
+                    "".join(lines[index:end_index]),
+                    absolute_start,
+                    int(section["start"]) + (offsets[end_index] if end_index < len(lines) else len(source)),
+                    "code",
+                )
+                if atom:
+                    atoms.append(atom)
+                index = end_index
+                continue
+
+            is_table_start = (
+                "|" in stripped
+                and index + 1 < len(lines)
+                and bool(_MARKDOWN_TABLE_SEPARATOR_RE.match(lines[index + 1].rstrip("\r\n")))
+            )
+            if is_table_start:
+                end_index = index + 2
+                while end_index < len(lines) and "|" in lines[end_index].rstrip("\r\n"):
+                    end_index += 1
+                atom = self._trimmed_atom(
+                    "".join(lines[index:end_index]),
+                    absolute_start,
+                    int(section["start"]) + (offsets[end_index] if end_index < len(lines) else len(source)),
+                    "table",
+                )
+                if atom:
+                    atoms.append(atom)
+                index = end_index
+                continue
+
+            if _MARKDOWN_LIST_RE.match(stripped):
+                end_index = index + 1
+                while end_index < len(lines):
+                    candidate = lines[end_index]
+                    candidate_stripped = candidate.rstrip("\r\n")
+                    if _MARKDOWN_LIST_RE.match(candidate_stripped) or not candidate_stripped.strip() or candidate[:1] in {" ", "\t"}:
+                        end_index += 1
+                        continue
+                    break
+                atom = self._trimmed_atom(
+                    "".join(lines[index:end_index]),
+                    absolute_start,
+                    int(section["start"]) + (offsets[end_index] if end_index < len(lines) else len(source)),
+                    "list",
+                )
+                if atom:
+                    atoms.append(atom)
+                index = end_index
+                continue
+
+            end_index = index + 1
+            while end_index < len(lines):
+                candidate = lines[end_index]
+                candidate_stripped = candidate.rstrip("\r\n")
+                next_is_fence = bool(_MARKDOWN_FENCE_RE.match(candidate_stripped))
+                next_is_table = (
+                    "|" in candidate_stripped
+                    and end_index + 1 < len(lines)
+                    and bool(_MARKDOWN_TABLE_SEPARATOR_RE.match(lines[end_index + 1].rstrip("\r\n")))
+                )
+                if not candidate_stripped.strip() or _MARKDOWN_LIST_RE.match(candidate_stripped) or next_is_fence or next_is_table:
+                    break
+                end_index += 1
+            atom = self._trimmed_atom(
+                "".join(lines[index:end_index]),
+                absolute_start,
+                int(section["start"]) + (offsets[end_index] if end_index < len(lines) else len(source)),
+                "paragraph",
+            )
+            if atom:
+                atoms.append(atom)
+            index = end_index
+            while index < len(lines) and not lines[index].strip():
+                index += 1
+        return atoms
+
+    def _split_long_paragraph(self, atom: dict, level: int) -> list[dict]:
+        """Apply the configured LangChain recursive splitter inside one prose atom."""
+        source = str(atom["text"])
+        document = Document(page_content=source, metadata={"source_start_index": atom["start"]})
+        split_documents = self._structured_splitters[level].split_documents([document])
+        parts: list[dict] = []
+        cursor = 0
+        for item in split_documents:
+            body = (item.page_content or "").strip()
+            if not body:
+                continue
+            relative_start = item.metadata.get("start_index")
+            if not isinstance(relative_start, int) or relative_start < 0:
+                relative_start = source.find(body, max(0, cursor - len(body)))
+            if relative_start < 0:
+                relative_start = cursor
+            cursor = max(cursor, relative_start + max(1, len(body)))
+            parts.append({
+                "text": body,
+                "start": int(atom["start"]) + relative_start,
+                "end": int(atom["start"]) + relative_start + len(body),
+                "kind": "paragraph",
+            })
+        return parts or [atom]
+
+    @staticmethod
+    def _piece_from_atoms(atoms: list[dict]) -> dict:
+        kinds = {str(atom["kind"]) for atom in atoms}
+        return {
+            "atoms": atoms,
+            "text": "\n\n".join(str(atom["text"]) for atom in atoms),
+            "start": min(int(atom["start"]) for atom in atoms),
+            "end": max(int(atom["end"]) for atom in atoms),
+            "kind": next(iter(kinds)) if len(kinds) == 1 else "mixed",
+        }
+
+    def _pack_markdown_atoms(self, atoms: list[dict], level: int) -> list[dict]:
+        """Pack atoms to one level without allowing a chunk to cross a heading."""
+        if not atoms:
+            return []
+        target_size = self._structured_level_sizes[level]
+        pieces: list[dict] = []
+        pending: list[dict] = []
+
+        def flush() -> None:
+            if pending:
+                pieces.append(self._piece_from_atoms(list(pending)))
+                pending.clear()
+
+        for atom in atoms:
+            atom_length = len(str(atom["text"]))
+            if atom_length > target_size:
+                flush()
+                if atom["kind"] == "paragraph":
+                    for split_atom in self._split_long_paragraph(atom, level):
+                        pieces.append(self._piece_from_atoms([split_atom]))
+                else:
+                    # Structural blocks remain whole even when they exceed the target.
+                    pieces.append(self._piece_from_atoms([atom]))
+                continue
+            pending_length = sum(len(str(item["text"])) for item in pending)
+            separator_length = 2 * len(pending) if pending else 0
+            if pending and pending_length + separator_length + atom_length > target_size:
+                flush()
+            pending.append(atom)
+        flush()
+        return pieces
+
+    @staticmethod
+    def _structured_text(heading_path: str, body: str) -> str:
+        """Prefix an in-context title without changing the recorded source offsets."""
+        if not heading_path:
+            return body
+        return f"Section: {heading_path}\n\n{body}"
+
+    def _split_markdown_to_three_levels(self, text: str, base_doc: Dict, page_global_chunk_idx: int) -> List[Dict]:
+        """Build nested L1/L2/L3 chunks independently inside each Markdown heading."""
+        if not text:
+            return []
+        page_number = int(base_doc.get("page_number", 0))
+        filename = str(base_doc["filename"])
+        level_counters = {1: 0, 2: 0, 3: 0}
+        chunks: list[dict] = []
+
+        def add_chunk(piece: dict, section: dict, level: int, parent_id: str, root_id: str) -> dict:
+            nonlocal page_global_chunk_idx
+            index = level_counters[level]
+            level_counters[level] += 1
+            chunk_id = self._build_chunk_id(filename, page_number, level, index)
+            root_chunk_id = chunk_id if level == 1 else root_id
+            chunk = {
+                **base_doc,
+                "text": self._structured_text(str(section["heading_path"]), str(piece["text"])),
+                "chunk_id": chunk_id,
+                "parent_chunk_id": parent_id,
+                "root_chunk_id": root_chunk_id,
+                "chunk_level": level,
+                "chunk_idx": page_global_chunk_idx,
+                "heading_path": str(section["heading_path"]),
+                "heading_level": int(section["heading_level"]),
+                "source_start_index": int(piece["start"]),
+                "source_end_index": int(piece["end"]),
+                "content_kind": str(piece["kind"]),
+                "previous_chunk_id": "",
+                "next_chunk_id": "",
+                "chunking_strategy": STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+                "chunking_config_hash": self._structured_config_hash,
+            }
+            page_global_chunk_idx += 1
+            chunks.append(chunk)
+            return chunk
+
+        for section in self._markdown_sections(text):
+            atoms = self._markdown_atoms(section)
+            for level_1_piece in self._pack_markdown_atoms(atoms, 1):
+                level_1 = add_chunk(level_1_piece, section, 1, "", "")
+                for level_2_piece in self._pack_markdown_atoms(level_1_piece["atoms"], 2):
+                    level_2 = add_chunk(level_2_piece, section, 2, level_1["chunk_id"], level_1["chunk_id"])
+                    for level_3_piece in self._pack_markdown_atoms(level_2_piece["atoms"], 3):
+                        add_chunk(
+                            level_3_piece,
+                            section,
+                            3,
+                            level_2["chunk_id"],
+                            level_1["chunk_id"],
+                        )
+
+        by_heading_and_level: dict[tuple[str, int], list[dict]] = {}
+        for chunk in chunks:
+            by_heading_and_level.setdefault(
+                (str(chunk["heading_path"]), int(chunk["chunk_level"])), []
+            ).append(chunk)
+        for siblings in by_heading_and_level.values():
+            siblings.sort(key=lambda item: int(item["chunk_idx"]))
+            for index, chunk in enumerate(siblings):
+                if index:
+                    chunk["previous_chunk_id"] = siblings[index - 1]["chunk_id"]
+                if index + 1 < len(siblings):
+                    chunk["next_chunk_id"] = siblings[index + 1]["chunk_id"]
+        return chunks
 
     def _split_page_to_three_levels(
         self,
@@ -327,6 +751,22 @@ class DocumentLoader:
         """读取 Markdown/TXT 纯文本文件，并复用统一的三层分块流程。"""
         with open(file_path, "r", encoding="utf-8-sig") as file:
             text = file.read()
+
+        if (
+            self.chunking_strategy == STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+            and file_path.lower().endswith(".md")
+        ):
+            base_doc = {
+                "filename": sanitize_text(filename),
+                "file_path": sanitize_text(source_file_path or file_path),
+                "file_type": sanitize_text(doc_type),
+                "page_number": 0,
+            }
+            return self._split_markdown_to_three_levels(
+                sanitize_text(text.strip()),
+                base_doc,
+                page_global_chunk_idx=0,
+            )
 
         raw_docs = [SimpleNamespace(page_content=text, metadata={"page": 0})]
         return self._load_from_langchain_docs(raw_docs, source_file_path or file_path, filename, doc_type)

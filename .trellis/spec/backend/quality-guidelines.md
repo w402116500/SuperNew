@@ -455,3 +455,88 @@ if t9_coverage > baseline_coverage:
 if trace.get("rewrite_candidate_fusion_applied") and t9_coverage > baseline_coverage:
     fusion_gain += 1
 ```
+
+## Scenario: Structured Chunking Evaluation Isolation
+
+### 1. Scope / Trigger
+
+This contract applies when an EnterpriseRAG evaluation opts into
+`document_chunking_strategy="markdown_header_recursive_v1"` or writes parent
+chunks for a new evaluation corpus. The default business loader and collection
+remain on `recursive_l1_l2_l3`.
+
+### 2. Signatures
+
+```text
+prepare --chunking-strategy markdown_header_recursive_v1 \
+        --rechunk-scope targeted --target-manifest <analysis-only manifest>
+evaluate --evaluation-id <new id> --case-set analysis \
+         --changed-variable document_chunking_strategy --workers 10
+```
+
+Evaluation parent chunks use `EvaluationParentChunkStore` with
+`EVALUATION_DATABASE_URL`; L3 chunks use a new corpus-specific Milvus
+collection and the Redis prefix
+`rag_eval_chunking:<corpus_run_id>:parent_chunk:<chunk_id>`.
+
+### 3. Contracts
+
+- `EVALUATION_DATABASE_URL` is required and must resolve to a database name
+  different from the business `DATABASE_URL`; snapshots contain only the
+  database name, table, namespace, and schema version, never credentials.
+- The structured strategy preserves `heading_path`, source start/end offsets,
+  `content_kind`, previous/next chunk IDs, parent/child IDs, strategy name,
+  and configuration hash in candidate traces.
+- Targeted runs use a new corpus run ID, collection, evaluation ID, and frozen
+  `analysis` manifest. `evaluation_worker_count=10` is throughput metadata, not
+  the changed RAG variable.
+- A 30-case targeted result is an analysis diagnostic. It cannot be reported as
+  a 500-case or validation generalization result.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required behavior |
+| --- | --- |
+| Evaluation URL missing, invalid, or same database as business URL | Fail before any PostgreSQL, Milvus, or Redis write. |
+| Target manifest contains validation, duplicate IDs, or hash drift | Reject before preparing or evaluating. |
+| Existing evaluation has immutable config differences | Reject overwrite; only resume matching checkpoints. |
+| Any case has `evaluation_error`, generation error, grader error, or unavailable evidence grading | Mark the run `interrupted`; classify as `system_error`, not chunking or answer failure. |
+| Structured summary contains a manual-review wrapper | Read `case_id` from `item["record"]["case_id"]` and never emit `None`. |
+
+### 5. Good/Base/Bad Cases
+
+- Good: a new isolated run records every case trace, separates eight timed-out
+  cases from 22 usable comparisons, and preserves the original collection.
+- Base: structured chunking improves a case only when the changed chunks put
+  the required fact into final context; a document hit alone is not evidence
+  of gain.
+- Bad: reuse the baseline collection or business database, overwrite a
+  prepared manifest, or count a timeout as a retrieval failure.
+
+### 6. Tests Required
+
+- Assert URL isolation and fail-before-write behavior for missing, invalid, and
+  business-database URLs.
+- Assert structured metadata survives loader -> parent store -> Milvus ->
+  candidate trace, including heading path and source offsets.
+- Assert targeted manifests reject validation IDs and hash drift, and that
+  successful checkpoints are not rerun.
+- Assert interrupted summaries remain interrupted when any case has a system
+  error, and assert the impact summary emits real manual-review case IDs.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```python
+summary["manual_review_queue"]["case_ids"] = [item.get("case_id") for item in queue]
+```
+
+#### Correct
+
+```python
+summary["manual_review_queue"]["case_ids"] = [
+    (item.get("record") or {}).get("case_id") or item.get("case_id")
+    for item in queue
+]
+```

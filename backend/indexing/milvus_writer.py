@@ -7,11 +7,15 @@
 
 # os 用于读取环境变量中的密集向量维度。
 import os
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from itertools import chain, islice
 from typing import Iterable
 
 # EmbeddingService 用于生成密集向量；默认单例避免重复加载模型权重。
 from backend.indexing.embedding import EmbeddingService, embedding_service as _default_embedding_service
+# Keep structured Markdown fields visible in dynamic-field Milvus collections.
+from backend.indexing.chunk_metadata import structured_chunk_metadata
 # MilvusStore 封装集合写入；get_milvus_store 获取全局 Store 实例。
 from backend.indexing.milvus_client import MilvusStore, get_milvus_store
 
@@ -35,7 +39,14 @@ class MilvusWriter:
         # 使用调用方注入的 Store，或通过工厂取得全局配置 Store。
         self.milvus_manager = milvus_manager or get_milvus_store()
 
-    def write_documents(self, documents: Iterable[dict], batch_size: int = 50, progress_callback=None):
+    def write_documents(
+        self,
+        documents: Iterable[dict],
+        batch_size: int = 50,
+        progress_callback=None,
+        max_retries: int | None = None,
+        embedding_workers: int | None = None,
+    ):
         """分批生成文档块的密集向量，并写入 Milvus。
 
         Args:
@@ -57,29 +68,47 @@ class MilvusWriter:
 
         # Milvus dense_embedding 字段的维度必须与嵌入模型输出长度一致。
         dense_dim = int(os.getenv("DENSE_EMBEDDING_DIM", "1024"))
+        if batch_size <= 0:
+            raise ValueError("MilvusWriter batch_size 必须是正整数")
+        if max_retries is None:
+            try:
+                max_retries = int(os.getenv("MILVUS_WRITE_RETRIES", "3"))
+            except ValueError:
+                max_retries = 3
+        max_retries = min(max(int(max_retries), 0), 5)
+        if embedding_workers is None:
+            try:
+                # Legacy callers keep the previous serial behavior unless the
+                # evaluation runner opts into its explicit 10-worker setting.
+                embedding_workers = int(os.getenv("EMBEDDING_MAX_WORKERS", "1"))
+            except ValueError:
+                embedding_workers = 1
+        embedding_workers = min(max(int(embedding_workers), 1), 10)
 
         # total 用于切片边界和进度回调。
         # 写入前确保集合、schema 和索引存在；已存在时该操作不会重复创建。
         self.milvus_manager.init_collection(dense_dim)
 
         # 按批向量化和插入，支持生成器以控制大语料的峰值内存。
-        processed = 0
-        while batch := list(islice(iterator, batch_size)):
-            # 提取当前批次每个字典中的正文，保持与 batch 完全相同的顺序。
+        def embed_batch(batch_index: int, batch: list[dict]) -> tuple[int, list[dict], list[list[float]]]:
             texts = [doc["text"] for doc in batch]
-            # 当前批次先一次性生成 Dense 向量，再与原文按位置配对。
-            # 返回的 dense_embeddings 外层长度应与 texts、batch 的长度相同。
-            dense_embeddings = self.embedding_service.get_embeddings(texts)
+            last_error = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return batch_index, batch, self.embedding_service.get_embeddings(texts)
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < max_retries:
+                        time.sleep(min(2 ** attempt, 4))
+            raise RuntimeError(
+                f"Embedding 批次失败，已重试 {max_retries} 次，batch_size={len(batch)}"
+            ) from last_error
 
-            # 构造 Milvus 插入行。写入 text 时，Milvus 的 BM25 Function 会自动生成 sparse_embedding。
-            # 同时保留 parent/root ID，召回后才能沿血缘恢复父块。
+        def insert_batch(batch: list[dict], dense_embeddings: list[list[float]]) -> None:
             insert_data = [
                 {
-                    # 当前文本对应的密集浮点数向量。
                     "dense_embedding": dense_emb,
-                    # 正文既用于展示，也作为 Milvus 自动生成 BM25 稀疏向量的输入。
                     "text": doc["text"],
-                    # 以下字段用于来源展示、过滤和 Auto-merging 上卷。
                     "filename": doc["filename"],
                     "file_type": doc["file_type"],
                     "file_path": doc.get("file_path", ""),
@@ -89,17 +118,77 @@ class MilvusWriter:
                     "parent_chunk_id": doc.get("parent_chunk_id", ""),
                     "root_chunk_id": doc.get("root_chunk_id", ""),
                     "chunk_level": doc.get("chunk_level", 0),
+                    **structured_chunk_metadata(doc),
                 }
-                # zip 按相同下标将第 i 个 doc 与第 i 个 dense_emb 配对。
-                # 若两者长度不一致，zip 会按较短者截断，因此嵌入服务应保证一一对应。
                 for doc, dense_emb in zip(batch, dense_embeddings)
             ]
+            remaining = insert_data
+            last_error = None
+            for attempt in range(max_retries + 1):
+                if not remaining:
+                    return
+                try:
+                    self.milvus_manager.insert(remaining)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < max_retries:
+                        # A transport timeout may have committed the batch.  Query
+                        # stable chunk IDs before retrying, so only missing rows are
+                        # sent again instead of duplicating an accepted batch.
+                        try:
+                            ids = [str(row.get("chunk_id") or "") for row in remaining]
+                            existing = self.milvus_manager.get_chunks_by_ids(ids)
+                            existing_ids = {
+                                str(row.get("chunk_id") or "") for row in (existing or [])
+                            }
+                            remaining = [
+                                row for row in remaining
+                                if str(row.get("chunk_id") or "") not in existing_ids
+                            ]
+                        except Exception:
+                            # If the read-back is unavailable, retain the full
+                            # batch and surface the original write error on failure.
+                            remaining = insert_data
+                        if remaining:
+                            time.sleep(min(2 ** attempt, 4))
+            raise RuntimeError(
+                f"Milvus 批量写入失败，已重试 {max_retries} 次，batch_size={len(insert_data)}"
+            ) from last_error
 
-            # 只有向量和 metadata 都组装完成后才提交这一批。
-            # insert 会通过 MilvusStore 创建短连接、执行写入、再关闭连接。
-            self.milvus_manager.insert(insert_data)
-            processed += len(batch)
-
-            if progress_callback and total is not None:
-                # 只有输入总数可知时才报告百分比进度。
-                progress_callback(processed, total)
+        # Keep at most embedding_workers batches in flight.  Embedding calls can
+        # overlap, while this loop remains the single Milvus writer and commits
+        # batches in deterministic input order.
+        processed = 0
+        next_batch_index = 0
+        next_to_write = 0
+        pending = {}
+        completed: dict[int, tuple[list[dict], list[list[float]]]] = {}
+        exhausted = False
+        with ThreadPoolExecutor(
+            max_workers=embedding_workers,
+            thread_name_prefix="enterprise-embedding",
+        ) as executor:
+            while pending or not exhausted:
+                while not exhausted and len(pending) < embedding_workers:
+                    batch = list(islice(iterator, batch_size))
+                    if not batch:
+                        exhausted = True
+                        break
+                    future = executor.submit(embed_batch, next_batch_index, batch)
+                    pending[future] = next_batch_index
+                    next_batch_index += 1
+                if not pending:
+                    continue
+                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    pending.pop(future)
+                    batch_index, batch, vectors = future.result()
+                    completed[batch_index] = (batch, vectors)
+                while next_to_write in completed:
+                    batch, vectors = completed.pop(next_to_write)
+                    insert_batch(batch, vectors)
+                    processed += len(batch)
+                    next_to_write += 1
+                    if progress_callback and total is not None:
+                        progress_callback(processed, total)

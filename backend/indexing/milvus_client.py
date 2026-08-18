@@ -10,6 +10,7 @@ from __future__ import annotations
 
 # os 用于读取 Milvus 主机、端口、集合名、超时等环境变量。
 import os
+import json
 # contextmanager 用于把“创建连接 → 使用 → 关闭连接”写成 with 语句。
 from contextlib import contextmanager
 # dataclass 用于简洁定义 MilvusSettings 配置数据类。
@@ -21,10 +22,24 @@ from typing import Callable, Iterator, TypeVar
 # MilvusClient 是客户端；RRFRanker 合并混合检索结果；Function/FunctionType 配置 BM25。
 from pymilvus import AnnSearchRequest, DataType, MilvusClient, RRFRanker, Function, FunctionType
 
+from backend.indexing.chunk_metadata import STRUCTURED_CHUNK_METADATA_FIELDS
+
 # 单次 Milvus query 的最大返回数量，分页查询会以此值分批拉取。
 QUERY_MAX_LIMIT = 16384
 # 泛型 T 表示 _run 传入的操作返回什么类型，_run 就返回同样类型。
 T = TypeVar("T")
+_DOCUMENT_OUTPUT_FIELDS = [
+    "text",
+    "filename",
+    "file_type",
+    "page_number",
+    "chunk_id",
+    "parent_chunk_id",
+    "root_chunk_id",
+    "chunk_level",
+    "chunk_idx",
+    *STRUCTURED_CHUNK_METADATA_FIELDS,
+]
 
 
 @dataclass(frozen=True)
@@ -337,6 +352,41 @@ class MilvusStore:
 
         return self._run(_query_all)
 
+    def query_iterator(
+        self,
+        filter_expr: str = "",
+        output_fields: list[str] | None = None,
+        batch_size: int = 1000,
+        limit: int = -1,
+    ):
+        """Stream scalar-query batches without offset pagination.
+
+        Milvus limits ``offset + limit`` to 16,384 for ``query``.  The native
+        iterator uses a server-side cursor, so large collections can be read
+        past that window without losing or repeating rows.
+        """
+        if batch_size <= 0:
+            raise ValueError("Milvus query_iterator batch_size 必须是正整数")
+        fields = output_fields or ["filename", "file_type"]
+        expr = _normalize_filter(filter_expr)
+
+        with milvus_client_session(self._settings) as client:
+            iterator = client.query_iterator(
+                collection_name=self.collection_name,
+                filter=expr,
+                output_fields=fields,
+                batch_size=min(batch_size, QUERY_MAX_LIMIT),
+                limit=limit,
+            )
+            try:
+                while True:
+                    batch = iterator.next()
+                    if not batch:
+                        break
+                    yield batch
+            finally:
+                iterator.close()
+
     def get_chunks_by_ids(self, chunk_ids: list[str]) -> list[dict]:
         """根据块 ID 列表从 Milvus 读取对应块及其父子关系元数据。
 
@@ -350,22 +400,12 @@ class MilvusStore:
         ids = [item for item in chunk_ids if item]
         if not ids:
             return []
-        # Milvus IN 表达式中的字符串需要用双引号包裹并用逗号连接。
-        quoted_ids = ", ".join(f'"{item}"' for item in ids)
+        # 用 JSON 字符串字面量转义 ID，避免文件名中的引号破坏 Milvus IN 表达式。
+        quoted_ids = ", ".join(json.dumps(item, ensure_ascii=False) for item in ids)
         # 复用通用 query()，只取恢复上下文所需字段。
         return self.query(
             filter_expr=f"chunk_id in [{quoted_ids}]",
-            output_fields=[
-                "text",
-                "filename",
-                "file_type",
-                "page_number",
-                "chunk_id",
-                "parent_chunk_id",
-                "root_chunk_id",
-                "chunk_level",
-                "chunk_idx",
-            ],
+            output_fields=_DOCUMENT_OUTPUT_FIELDS,
             limit=len(ids),
         )
 
@@ -390,17 +430,7 @@ class MilvusStore:
             list[dict]: 统一格式的检索结果，包含块元数据和融合后的 score。
         """
         # output_fields 指定最终命中结果中需要带回的业务字段。
-        output_fields = [
-            "text",
-            "filename",
-            "file_type",
-            "page_number",
-            "chunk_id",
-            "parent_chunk_id",
-            "root_chunk_id",
-            "chunk_level",
-            "chunk_idx",
-        ]
+        output_fields = _DOCUMENT_OUTPUT_FIELDS
         # 第一条搜索请求：对 dense_embedding 字段执行内积语义相似度检索。
         dense_search = AnnSearchRequest(
             # Milvus 批量接口要求外层列表，即使当前只有一个查询向量。
@@ -451,6 +481,11 @@ class MilvusStore:
                     "chunk_level": hit.get("chunk_level", 0),
                     "chunk_idx": hit.get("chunk_idx", 0),
                     "score": hit.get("distance", 0.0),
+                    **{
+                        field: hit[field]
+                        for field in STRUCTURED_CHUNK_METADATA_FIELDS
+                        if field in hit
+                    },
                 })
         return formatted_results
 
@@ -478,17 +513,7 @@ class MilvusStore:
                 anns_field="dense_embedding",
                 search_params={"metric_type": "IP", "params": {"ef": 64}},
                 limit=top_k,
-                output_fields=[
-                    "text",
-                    "filename",
-                    "file_type",
-                    "page_number",
-                    "chunk_id",
-                    "parent_chunk_id",
-                    "root_chunk_id",
-                    "chunk_level",
-                    "chunk_idx",
-                ],
+                output_fields=_DOCUMENT_OUTPUT_FIELDS,
                 filter=filter_expr,
             )
 
@@ -510,6 +535,11 @@ class MilvusStore:
                     "chunk_level": hit.get("entity", {}).get("chunk_level", 0),
                     "chunk_idx": hit.get("entity", {}).get("chunk_idx", 0),
                     "score": hit.get("distance", 0.0),
+                    **{
+                        field: hit.get("entity", {})[field]
+                        for field in STRUCTURED_CHUNK_METADATA_FIELDS
+                        if field in hit.get("entity", {})
+                    },
                 })
         return formatted_results
 
@@ -524,17 +554,7 @@ class MilvusStore:
         ``sparse_embedding`` 由集合 schema 中的 BM25 Function 从 ``text`` 自动生成，
         查询时直接传入原始文本即可，不在客户端重复维护分词或稀疏向量统计。
         """
-        output_fields = [
-            "text",
-            "filename",
-            "file_type",
-            "page_number",
-            "chunk_id",
-            "parent_chunk_id",
-            "root_chunk_id",
-            "chunk_level",
-            "chunk_idx",
-        ]
+        output_fields = _DOCUMENT_OUTPUT_FIELDS
 
         def _search(client: MilvusClient):
             return client.search(
@@ -564,6 +584,11 @@ class MilvusStore:
                     "chunk_level": hit.get("chunk_level", entity.get("chunk_level", 0)),
                     "chunk_idx": hit.get("chunk_idx", entity.get("chunk_idx", 0)),
                     "score": hit.get("distance", 0.0),
+                    **{
+                        field: hit.get(field, entity.get(field))
+                        for field in STRUCTURED_CHUNK_METADATA_FIELDS
+                        if field in hit or field in entity
+                    },
                 })
         return formatted_results
 

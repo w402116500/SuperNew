@@ -7,6 +7,8 @@
 
 # os 用于读取环境变量中的模型名称、provider 和 API 配置。
 import os
+import time
+from collections import deque
 # Lock 防止并发请求在首次使用时重复加载数 GB 的模型权重。
 from threading import Lock
 
@@ -56,6 +58,8 @@ def embedding_public_config() -> dict[str, str]:
             else ""
         ),
         "embedding_batch_size": str(_embedding_batch_size()),
+        "embedding_max_rpm": os.getenv("EMBEDDING_MAX_RPM", "2000"),
+        "embedding_max_tpm": os.getenv("EMBEDDING_MAX_TPM", "500000"),
     }
 
 
@@ -150,6 +154,50 @@ class EmbeddingService:
         # 向量化时才加载模型。
         self._embedder = None
         self._embedder_lock = Lock()
+        self._rate_limit_lock = Lock()
+        self._request_times: deque[float] = deque()
+        self._token_events: deque[tuple[float, int]] = deque()
+
+    @staticmethod
+    def _limit(name: str, default: int) -> int:
+        try:
+            value = int(os.getenv(name, str(default)))
+        except ValueError:
+            value = default
+        return max(value, 0)
+
+    def _wait_for_rate_limit(self, texts: list[str]) -> None:
+        """Apply process-local RPM/TPM limits before a provider request."""
+        max_rpm = self._limit("EMBEDDING_MAX_RPM", 2000)
+        max_tpm = self._limit("EMBEDDING_MAX_TPM", 500000)
+        if max_rpm == 0 and max_tpm == 0:
+            return
+        estimated_tokens = sum(len(text) for text in texts)
+        while True:
+            now = time.monotonic()
+            with self._rate_limit_lock:
+                while self._request_times and now - self._request_times[0] >= 60:
+                    self._request_times.popleft()
+                while self._token_events and now - self._token_events[0][0] >= 60:
+                    self._token_events.popleft()
+                request_blocked = max_rpm > 0 and len(self._request_times) >= max_rpm
+                token_total = sum(value for _, value in self._token_events)
+                token_blocked = (
+                    max_tpm > 0
+                    and token_total + estimated_tokens > max_tpm
+                    and bool(self._token_events)
+                )
+                if not request_blocked and not token_blocked:
+                    self._request_times.append(now)
+                    self._token_events.append((now, estimated_tokens))
+                    return
+                waits = []
+                if request_blocked:
+                    waits.append(60 - (now - self._request_times[0]))
+                if token_blocked:
+                    waits.append(60 - (now - self._token_events[0][0]))
+                delay = max(0.01, min(waits))
+            time.sleep(delay)
 
     def _get_embedder(self) -> HuggingFaceEmbeddings | OpenAIEmbeddings:
         """按需加载并缓存底层模型，保证并发首次调用只初始化一次。"""
@@ -177,6 +225,7 @@ class EmbeddingService:
         if not texts:
             return []
         try:
+            self._wait_for_rate_limit(texts)
             # embed_documents 接收文本列表，返回与 texts 等长的向量列表。
             # 例如 texts 有 2 项时，结果形式为 [[...第 1 个向量...], [...第 2 个向量...]]。
             return self._get_embedder().embed_documents(texts)

@@ -19,7 +19,11 @@
   "pr_url": null,
   "subtasks": [],
   "children": [
-    "08-17-enterpriserag-rewrite-candidate-fusion"
+    "08-17-enterpriserag-rewrite-candidate-fusion",
+    "08-17-enterpriserag-failure-candidate-audit",
+    "08-17-enterpriserag-adjacent-l3-expansion",
+    "08-18-enterpriserag-adjacent-l3-expansion-analysis-147",
+    "08-18-enterpriserag-structured-chunking-isolation"
   ],
   "parent": null,
   "relatedFiles": [],

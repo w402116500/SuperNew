@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 from backend.indexing.milvus_client import get_milvus_store
 from backend.indexing.embedding import embedding_service as _embedding_service
 from backend.indexing.parent_chunk_store import ParentChunkStore
+from backend.indexing.chunk_metadata import STRUCTURED_CHUNK_METADATA_FIELDS
 from backend.model_settings import model_timeout_seconds
 
 
@@ -463,6 +464,7 @@ def _candidate_snapshot(doc: dict, raw_rank: int | None = None) -> dict:
         "merged_from_children", "merged_child_count", "_rewrite_candidate_sources",
         "post_merge_rank", "rerank_input_rank", "rerank_output_rank",
         "threshold_rejected", "final_context_rank",
+        *STRUCTURED_CHUNK_METADATA_FIELDS,
     )
     snapshot = {key: doc.get(key) for key in fields if key in doc}
     if raw_rank is not None:
