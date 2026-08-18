@@ -108,6 +108,7 @@ class RagTraceFields(StrictSchema):
     rerank_model: Optional[str] = None
     rerank_endpoint: Optional[str] = None
     rerank_error: Optional[str] = None
+    rerank_elapsed_seconds: Optional[float] = None
     rerank_timeout_seconds: Optional[float] = None
     rerank_min_score: Optional[float] = None
     post_rerank_count: Optional[int] = None
@@ -144,6 +145,16 @@ class RagTraceFields(StrictSchema):
     rewrite_candidate_fusion_fused_candidate_count: Optional[int] = None
     rewrite_candidate_fusion_final_document_sources: Optional[List[str]] = None
     rewrite_candidate_fusion_fallback_reason: Optional[str] = None
+    # T10 相邻 L3 扩展只在离线评测显式开启；仅暴露计数和回退原因，不暴露候选正文。
+    adjacent_l3_expansion_enabled: Optional[bool] = None
+    adjacent_l3_expansion_applied: Optional[bool] = None
+    adjacent_l3_expansion_original_candidate_count: Optional[int] = None
+    adjacent_l3_expansion_requested_neighbor_count: Optional[int] = None
+    adjacent_l3_expansion_retrieved_neighbor_count: Optional[int] = None
+    adjacent_l3_expansion_added_candidate_count: Optional[int] = None
+    adjacent_l3_expansion_deduplicated_candidate_count: Optional[int] = None
+    adjacent_l3_expansion_skipped_candidate_count: Optional[int] = None
+    adjacent_l3_expansion_fallback_reason: Optional[str] = None
     # 复杂度路由：问题复杂度、拆分出的子问题、子 Agent 数量和最终合并数量。
     complexity: Optional[str] = None
     complexity_reason: Optional[str] = None
