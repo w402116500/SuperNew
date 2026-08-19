@@ -88,6 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
                 default=1,
                 help="并发评测 worker 数；仅改变执行吞吐，默认 1。",
             )
+            command_parser.add_argument(
+                "--subquestion-language-policy",
+                choices=["legacy", "preserve_input_language_v1"],
+                default="legacy",
+                help="复杂题拆分后的小问题语言策略；默认保持既有行为。",
+            )
     return parser
 
 
@@ -121,6 +127,7 @@ def main() -> int:
             target_manifest_path=Path(args.target_manifest) if args.target_manifest else None,
             capture_candidate_trace=bool(args.capture_candidate_trace),
             evaluation_worker_count=args.workers,
+            subquestion_language_policy=args.subquestion_language_policy,
         )
     else:
         result = cleanup_run(dataset=args.dataset, run_id=run_id)

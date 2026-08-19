@@ -32,6 +32,7 @@ from backend.evaluation.datasets import (
 from backend.evaluation.metrics import multihop_metrics, retrieval_metrics
 from backend.evaluation.runner import (
     _append_result_checkpoint,
+    _TARGET_MANIFEST_CONTRACTS,
     _write_case_review_report,
     _collection_name,
     _evidence_coverage,
@@ -614,6 +615,56 @@ class CleanupAndJudgeTests(unittest.TestCase):
         self.assertEqual(by_id["1"]["answer"], "latest")
         self.assertEqual(by_id["2"]["answer"], "second")
 
+    def test_multihop_resume_retries_failed_checkpoints_and_preserves_history(self):
+        case = {
+            "id": "retry-me",
+            "question": "retry question",
+            "reference_answer": "retry answer",
+            "question_type": "basic",
+            "evidence_filenames": ["evidence.md"],
+        }
+        failed = _multihop_error_record(
+            case,
+            RuntimeError("worker exited"),
+            elapsed_seconds=1,
+        )
+        succeeded = {
+            "case_id": "retry-me",
+            "question_type": "basic",
+            "retrieved_filenames": ["evidence.md"],
+            "answer_grade": {"verdict": "pass"},
+            "evaluation_error": "",
+            "end_to_end_seconds": 0.1,
+        }
+
+        with TemporaryDirectory() as directory, patch(
+            "backend.evaluation.runner._start_multihop_worker", return_value=Mock()
+        ) as start_worker, patch(
+            "backend.evaluation.runner._run_case_in_worker", return_value=succeeded
+        ) as run_case, patch("backend.evaluation.runner._stop_multihop_worker"):
+            output_dir = Path(directory)
+            _append_result_checkpoint(output_dir / "results.jsonl", failed)
+            records, summary = evaluate_multihop(
+                output_dir,
+                {"run_id": "unit", "evaluation_worker_count": 2},
+                [case],
+            )
+
+            history = [
+                json.loads(line)
+                for line in (output_dir / "results-retry-history.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+
+        start_worker.assert_called_once()
+        run_case.assert_called_once()
+        self.assertEqual(records, [succeeded])
+        self.assertEqual(summary["evaluation_status"], "completed")
+        self.assertEqual(summary["evaluation_error_count"], 0)
+        self.assertEqual(history[0]["record"]["case_id"], "retry-me")
+        self.assertIn("worker exited", history[0]["record"]["evaluation_error"])
+
     def test_cleanup_is_idempotent_from_manifest(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1117,6 +1168,12 @@ class EnterpriseFormalEvaluationTests(unittest.TestCase):
         for question_type, quota in first["question_types"].items():
             self.assertEqual(len(quota["analysis_case_ids"]), ENTERPRISE_ANALYSIS_QUOTAS[question_type])
             self.assertEqual(len(quota["validation_case_ids"]), ENTERPRISE_VALIDATION_QUOTAS[question_type])
+
+    def test_rerank_model_comparison_is_a_frozen_analysis_contract(self):
+        self.assertEqual(
+            _TARGET_MANIFEST_CONTRACTS["rerank_model_comparison"],
+            (30, "rerank_model"),
+        )
 
     def test_formal_experiments_reuse_corpus_and_do_not_overwrite_config(self):
         with TemporaryDirectory() as directory:

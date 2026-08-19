@@ -39,6 +39,7 @@
 | [第 19 节](#19-最新讨论先定向替换错题答案文档再验证新分块) | 定向实验方案及执行过程 |
 | [第 20 节](#20-新分块真实成果与逐题问题复核) | 本轮真实结果、严格候选统计和逐题复核结论 |
 | [第 20.8 节](#208-更换-qwenqwen35-35b-a3b-后的-30-题测试) | Qwen 模型对照测试 |
+| [第 20.9 节](#209-更换-qwenqwen3-vl-reranker-8b-后的-30-题对照) | Rerank 模型对照测试 |
 
 ### 关键文件索引
 
@@ -1645,3 +1646,86 @@ output/rag-evaluations/enterpriserag/enterpriserag-en-representative-structured-
 ```
 
 由于还有 3 道未拿到稳定判定，运行器按规则没有写出一个虚假的 30 道合并 `results.jsonl`；旧运行和每次补跑的 `attempt-results.jsonl` 均保留，可继续复查。下一步如果要形成严格的完整 30 题模型对照，需要在判定服务稳定后只重试这 3 道，或者明确接受它们作为系统异常；在用户确认前不运行 validation、不重跑 500 题、不改变其他 RAG 变量。
+
+### 英文子问题保持英文：30 道 DeepSeek 对照（完成）
+
+这轮只改了一个地方：英文题被拆成多个小问题后，小问题必须继续用英文找资料。模型、Embedding、Rerank、top-k、Auto-merging、结构化分块、语料、集合和 10 并发都没有改变；只读取已有的结构化英文 collection，没有重新入库，也没有触碰 validation 或 `tutorial_verify_embeddings`。
+
+首次执行时，评测数据库密码与容器保存的旧密码不一致，30 个 worker 都在返回结果前退出。数据库恢复后发现恢复逻辑把这些异常记录误当成“已完成”；已修复为“成功题复用，接口、模型、生成或判卷异常题必须重跑”，并把旧异常单独留在 `results-retry-history.jsonl`。这次 30 / 30 真正完成，系统异常为 0；不是把旧异常当作新结果。
+
+语言检查显示 30 道英文题中有 16 道实际走了复杂题拆分路径；这 16 道的所有小问题和实际检索文字均不含中文。因此可以确认“英文小问题检索”确实发生了，不能再把它当作只改了提示词而没有进入实际链路。
+
+主比较只保留旧结构化运行和本轮都没有系统异常的 27 道同题：标准证据文件全覆盖 `55.56% -> 62.96%`，平均文件覆盖 `59.98% -> 68.21%`，但自动回答通过 `8 / 27 -> 7 / 27`。这里的“覆盖”只表示标准文件是否进入最终结果，不等于答案所需的每个关键事实都在最后给模型看的内容里，更不等于模型一定会正确使用。
+
+更直接地看，旧链路确实使用中文小问题的 10 道题，本轮表现是文件全覆盖 `60.00% -> 50.00%`、平均覆盖 `71.94% -> 64.17%`、通过 `3 / 10 -> 1 / 10`。其中 `qst_0227` 本轮被判为简单题，不实际使用该变量；去掉它的 9 道复杂题对照同样没有改善。也就是说，当前结果没有证明“强制英文小问题”能带来稳定收益，不能默认开启，更不能外推到 500 题或 validation。
+
+变化题的人工预复核也说明不能只看文件命中：`qst_0233`、`qst_0300`、`qst_0320` 虽然从未覆盖变为标准文件覆盖完整，但仍拒答、选错结论或漏掉数值；`qst_0189`、`qst_0331` 的标准文件一直完整，回答却从通过变成失败或待复核。它们分别是“文件或材料阶段改善但回答没用好”和“材料在、回答组织变化”的例子，不能算英文检索收益。
+
+完整产物位于 `output/rag-evaluations/enterpriserag/enterpriserag-en-representative-structured-targeted-004/evaluations/english-subquestion-language-deepseek-analysis-30-001/`：`evaluation-config.json`、`results.jsonl`、`candidate-audit.md`、`case-review.md`、`manual-review.jsonl/.md`、`subquestion-language-compliance.json/.md`、`english-subquestion-language-impact-summary.md` 和 `english-subquestion-language-manual-review.md`。这些都是 analysis 记录，不能当成 validation 泛化结果。
+
+### 20.9 更换 `Qwen/Qwen3-VL-Reranker-8B` 后的 30 题对照
+
+这轮只改 Rerank 模型：从 `Qwen/Qwen3-Reranker-4B` 改为 `Qwen/Qwen3-VL-Reranker-8B`。回答模型和判卷模型仍是 `deepseek-ai/DeepSeek-V4-Flash`；Embedding、提示词、候选数 30、最终 8 段、Auto-merging、结构化分块语料、Milvus collection 和 analysis 30 题清单均没有改变。没有运行 validation、没有重跑 500 题、没有重新入库，也没有写入 `tutorial_verify_embeddings`。
+
+这次必须把两个测试分开看：一个测试“在同一批资料里，8B 会不会把正确资料挑出来”；另一个测试“整条链路最后能不能答对”。前者能直接看 Rerank，后者还会受到第一次找资料、复杂题拆分、回答和判卷服务波动影响。
+
+#### A. 固定同一批资料后，8B 有一处真实改善
+
+固定旧 4B 当时收到的问题和候选资料，让 8B 在完全相同输入上重新挑最后 8 段；不调用回答模型和判卷模型。30 道题里有 5 道缺少可用的旧候选记录，因此可比较的是 25 道。5 并发下 48 / 48 次挑选请求成功，8B 自身没有超时。
+
+| 指标 | 旧 4B | 新 8B |
+| --- | ---: | ---: |
+| 正确资料全部保留到最后 8 段 | 76.00% | 80.00% |
+| 正确资料平均保留程度 | 78.22% | 82.22% |
+| 资料保留改善的题 | 0 | `qst_0295` |
+| 资料保留变差的题 | 0 | 0 |
+
+`qst_0295` 是旧 4B 把正确资料从最终 8 段排掉、8B 保住正确资料的一处明确例子。因此可以说：**在候选资料已经一样时，8B 对这道相似事故干扰题更会挑资料。** 但它只改善了 1 道，不能据此说 8B 整体明显更强，也不能解决“正确资料第一次根本没找进来”的题。
+
+#### B. 放回完整链路后，没有看到整体收益
+
+完整 30 题首先以 5 并发运行，随后只补跑服务异常题：11 道以 2 并发补跑，剩余 4 道以 1 并发补跑。最终 30 道中有 27 道拿到可用记录，仍有 3 道服务异常：`qst_0275`、`qst_0345` 是单题超过 600 秒总时限，`qst_0335` 是判卷服务超过 90 秒。它们不是 8B 挑错资料，不能算作模型答错。
+
+27 道可用记录本身的结果是：最终标准文件全部到位 15 / 27（55.56%），平均文件覆盖 57.20%，回答通过 8 / 27（29.63%）。这只是本次运行的记录，不可直接和旧 4B 的不同异常题相减。
+
+为公平比较，只保留旧 4B 和新 8B 都没有服务异常的同 22 道题：
+
+| 指标 | 旧 4B | 新 8B |
+| --- | ---: | ---: |
+| 最终标准文件全部到位 | 54.55% | 50.00% |
+| 最终标准文件平均覆盖 | 59.97% | 52.02% |
+| 回答通过 | 31.82% | 27.27% |
+
+8B 在 `qst_0320` 把标准文件补到最终结果，但 `qst_0037`、`qst_0189`、`qst_0356` 的文件覆盖变差；没有新增答对题，`qst_0189` 从旧 4B 的通过变为失败。完整链路每次第一次找出的资料池和分支会有波动，因此这些下降不能全部归罪于 8B；但它们足以说明目前**没有证据证明换成 8B 会带来整条链路的净收益**。
+
+#### C. 运行稳定性和当前决策
+
+8B 在 10 并发、5 秒单次超时下不稳定；固定资料池测试中 48 次请求有 30 次超时。降到 5 并发后 48 / 48 成功，说明 5 是当前可用的 Rerank 并发上限。后续回答和判卷服务的超时发生在 DeepSeek 链路，不应误记为 8B 的能力或稳定性问题。
+
+当前结论是：**不把 8B 当作 4B 的默认替代方案，也不把这次对照写成优化成功。** 8B 在固定资料池里有一处可复核改善，但在真实完整链路中没有形成整体提升。当前 `.env` 的临时配置不在本节自动回退；任何默认配置变更都应在用户确认后单独处理。
+
+本轮可复查产物如下：
+
+```text
+output/rag-evaluations/enterpriserag/enterpriserag-en-representative-structured-targeted-004/
+  evaluations/rerank-qwen3-vl-8b-shadow-30-retry-003/
+    evaluation-config.json
+    results.jsonl
+    summary.json
+    report.md
+    case-summary.json
+  evaluations/rerank-qwen3-vl-8b-analysis-30-workers5-004/
+    evaluation-config.json
+    results.jsonl
+    candidate-audit.md
+  evaluations/rerank-qwen3-vl-8b-analysis-30-workers2-retry-005/
+    evaluation-config.json
+    retry-manifest.json
+    attempt-results.jsonl
+  evaluations/rerank-qwen3-vl-8b-analysis-30-workers1-retry-006/
+    evaluation-config.json
+    retry-manifest.json
+    attempt-results.jsonl
+```
+
+下一步若要继续验证，应扩大“固定同一批资料池”的 Rerank 对照范围，只看正确资料是否被保留到最后 8 段，不混入回答和判卷服务波动。它仍然只能在 analysis 范围内找原因，不能替代 validation 泛化验证。

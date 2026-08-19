@@ -1487,3 +1487,11 @@ T8 仍只描述 analysis 集，不能代表 200 题 validation 泛化结果。
 当前不能据此启动 T9、运行 validation 或重跑 500 题。最后 3 道整题超时已经重试仍未完成；3 道回答请求超时也只保留为系统异常。下一步应由用户确认是否继续人工确认 7 道收益候选；后续每轮仍只能改变一个变量。
 
 离线块审计的 30 道题人工复核已完成，产物位于 `structured-chunking-offline-audit-002` 的 `manual-review.jsonl` 和 `manual-review.md`。这不是新旧 RAG 结果的最终人工因果结论；真实 RAG 结果的 `structured-chunking-manual-review.jsonl/.md` 仍标记为待人工最终确认。离线复核结论为：8 题出现明确的标题/列表/代码/表格结构信号，7 题关键边界基本不变，14 题只是普通文本边界重新分配，1 题旧块定位有重复歧义。复核期间发现 `qst_0300` 的无首尾管道符表格未被识别为表格原子，已修复 `_MARKDOWN_TABLE_SEPARATOR_RE` 并加回归测试；修复后重新运行离线审计。
+
+## 英文子问题语言控制评测（2026-08-19）
+
+新建 evaluation ID `english-subquestion-language-deepseek-analysis-30-001`，复用结构化英文 corpus run `enterpriserag-en-representative-structured-targeted-004` 和 collection `rag_eval_enterpriserag_enterpriserag_en_representative_structured_targeted_004`。唯一变量为 `subquestion_language_policy=preserve_input_language_v1`；30 道 frozen analysis、10 worker、DeepSeek-V4-Flash 三个模型角色、Embedding、Rerank、top-k、Auto-merging 和分块均固定。没有执行 prepare、cleanup、入库、validation 或 500 题。
+
+首次运行暴露出两项运行问题：隔离 PostgreSQL 的认证配置需要恢复；恢复逻辑还把历史 `evaluation_error` 当作完成记录。现已将隔离库连接恢复，并修复 checkpoint 恢复：成功记录复用，`evaluation_error`、回答生成错误和判卷错误重新进入待跑队列；旧异常写入 `results-retry-history.jsonl` 供审计，不混入新的 `results.jsonl`。相应单元测试覆盖该情形。
+
+恢复后，30 / 30 完成，`evaluation_error=0`。16 道实际复杂题的小问题和实际检索文字均已检查为英文，语言控制合规。完整配置、逐题 JSONL、候选 trace、自动人工队列、语言检查、前后对照和人工预复核均在该 evaluation 目录；结论只限 30 道 analysis，当前没有证据支持默认启用该策略。

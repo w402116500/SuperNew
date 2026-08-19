@@ -199,6 +199,9 @@ class RetrievalRuntime:
     # T10 is evaluation-only. It adds directly adjacent persisted L3 chunks to
     # the initial candidate pool without running another embedding or search.
     enable_adjacent_l3_expansion: bool = False
+    # This evaluation-only policy keeps complex-question sub-queries in the
+    # input language.  The default deliberately preserves online behavior.
+    subquestion_language_policy: Literal["legacy", "preserve_input_language_v1"] = "legacy"
     # Offline-only observation switch. Candidate text is retained only by the
     # evaluation worker; public RagTrace remains a whitelist projection.
     capture_candidate_trace: bool = False

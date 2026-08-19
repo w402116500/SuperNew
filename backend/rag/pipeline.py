@@ -838,6 +838,20 @@ COMPLEXITY_PROMPT = (
     "如果是简单问题，sub_questions 留空。"
 )
 
+_PRESERVE_INPUT_LANGUAGE_PROMPT = (
+    "\n\n【子问题语言规则】\n"
+    "sub_questions 必须与用户问题使用相同语言。用户问题是英文时，所有 sub_questions 必须是英文；"
+    "不要把英文问题翻译成中文。保留原问题中的人名、产品名、区域、版本号、数字和时间。"
+)
+
+
+def _complexity_prompt(question: str, runtime: RetrievalRuntime | None) -> str:
+    """Build the planner prompt without changing the legacy online default."""
+    prompt = COMPLEXITY_PROMPT.format(question=question)
+    if runtime and runtime.subquestion_language_policy == "preserve_input_language_v1":
+        return prompt + _PRESERVE_INPUT_LANGUAGE_PROMPT
+    return prompt
+
 # 关键词规则只用于高置信度的简单问题快速放行；复杂度模型仍是兜底判断来源。
 _SIMPLE_QUERY_MARKERS = (
     "是什么",
@@ -956,7 +970,7 @@ def classify_complexity(state: RAGState) -> RAGState:
     if not model:  # 无法规划复杂度时明确提示缺失配置。
         raise RuntimeError("FAST_MODEL is required for complexity planning")
 
-    prompt = COMPLEXITY_PROMPT.format(question=question)  # 将原问题填入复杂度规划提示词。
+    prompt = _complexity_prompt(question, state.get("retrieval_runtime"))
     result = invoke_structured_output(  # 强制模型返回 ComplexityResult 结构。
         model,
         ComplexityResult,

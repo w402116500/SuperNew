@@ -1203,6 +1203,41 @@ def _read_multihop_checkpoints(path: Path) -> list[dict[str, Any]]:
     return list(records_by_case_id.values())
 
 
+def _resume_multihop_checkpoints(
+    output_dir: Path,
+    checkpoint_path: Path,
+    cases_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep completed checkpoints and make runtime failures eligible for another attempt."""
+    checkpoint_records = _read_multihop_checkpoints(checkpoint_path)
+    normalized_records = [
+        _normalize_checkpoint_record(record, cases_by_id[str(record["case_id"])])
+        if str(record.get("case_id")) in cases_by_id else record
+        for record in checkpoint_records
+    ]
+    retryable_records = [
+        record for record in normalized_records if _has_retryable_error(record)
+    ]
+    if not retryable_records:
+        return normalized_records
+
+    # Keep the failed attempt separate from the next attempt's clean result set.
+    history_path = output_dir / f"{checkpoint_path.stem}-retry-history.jsonl"
+    archived_at = datetime.now(UTC).isoformat()
+    with history_path.open("a", encoding="utf-8", newline="\n") as handle:
+        for record in retryable_records:
+            history = {
+                "checkpoint_filename": checkpoint_path.name,
+                "archived_at": archived_at,
+                "record": record,
+            }
+            handle.write(json.dumps(history, ensure_ascii=False, default=_json_default) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    return [record for record in normalized_records if not _has_retryable_error(record)]
+
+
 def _has_evaluation_error(record: dict[str, Any]) -> bool:
     """Return whether a checkpoint is a transport/runtime failure, not a model review."""
     return bool(str(record.get("evaluation_error") or "").strip())
@@ -1327,7 +1362,78 @@ _TARGET_MANIFEST_CONTRACTS: dict[str, tuple[int, str]] = {
     "adjacent_l3_expansion": (11, "adjacent_l3_expansion"),
     "structured_chunking_offline_audit": (30, "document_chunking_strategy"),
     "model_comparison": (30, "model"),
+    "rerank_model_comparison": (30, "rerank_model"),
+    "subquestion_language_policy": (30, "subquestion_language_policy"),
 }
+
+
+def create_subquestion_language_manifest(
+    *,
+    source_target_manifest_path: Path,
+    source_results_path: Path,
+    case_split_path: Path,
+    output_path: Path,
+    source_evaluation_id: str,
+    expected_count: int = 30,
+) -> Path:
+    """Freeze the existing 30 structured analysis cases for language control."""
+    for path in (source_target_manifest_path, source_results_path, case_split_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"缺少英文子问题语言清单源文件：{path}")
+
+    source_target = _read_json(source_target_manifest_path)
+    if source_target.get("manifest_type") != "model_comparison":
+        raise ValueError("英文子问题语言清单必须从冻结的 30 题 model_comparison 清单创建")
+    if source_target.get("manifest_sha256") != _manifest_payload_hash(source_target):
+        raise ValueError("英文子问题语言清单的源 target manifest 哈希不匹配")
+    case_ids = [str(case_id) for case_id in source_target.get("case_ids") or []]
+    if len(case_ids) != expected_count or len(set(case_ids)) != expected_count:
+        raise ValueError(f"英文子问题语言清单必须固定包含 {expected_count} 道唯一题目")
+
+    split = _read_json(case_split_path)
+    split_hash = _sha256_file(case_split_path)
+    analysis_ids = {str(case_id) for case_id in split.get("analysis_case_ids") or []}
+    validation_ids = {str(case_id) for case_id in split.get("validation_case_ids") or []}
+    if set(case_ids) - analysis_ids or set(case_ids) & validation_ids:
+        raise ValueError("英文子问题语言清单包含非 analysis 或 validation 题目")
+
+    source_records: dict[str, dict[str, Any]] = {}
+    for line_number, line in enumerate(source_results_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        case_id = str(record.get("case_id") or "")
+        if case_id in source_records:
+            raise ValueError(f"源评测包含重复 case ID：{case_id}（第 {line_number} 行）")
+        if case_id:
+            source_records[case_id] = record
+    missing_ids = [case_id for case_id in case_ids if case_id not in source_records]
+    if missing_ids:
+        raise ValueError(f"源评测缺少英文子问题语言目标题：{missing_ids[:5]}")
+    if any(source_records[case_id].get("case_set") != "analysis" for case_id in case_ids):
+        raise ValueError("英文子问题语言清单的源记录必须全部是 analysis")
+
+    manifest: dict[str, Any] = {
+        "manifest_version": 1,
+        "manifest_type": "subquestion_language_policy",
+        "changed_variable": "subquestion_language_policy",
+        "selection_rule": "same 30 analysis cases as the structured-chunking DeepSeek comparison",
+        "source_target_manifest_path": str(source_target_manifest_path),
+        "source_target_manifest_sha256": _sha256_file(source_target_manifest_path),
+        "source_evaluation_id": source_evaluation_id,
+        "source_results_path": str(source_results_path),
+        "source_results_sha256": _sha256_file(source_results_path),
+        "source_case_split_path": str(case_split_path),
+        "source_case_split_sha256": split_hash,
+        "case_set": "analysis",
+        "case_count": len(case_ids),
+        "case_ids": case_ids,
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    manifest["manifest_sha256"] = _manifest_payload_hash(manifest)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(output_path, manifest)
+    return output_path
 
 
 def create_rewrite_candidate_fusion_manifest(
@@ -2709,6 +2815,7 @@ def _build_multihop_runtime(config: dict[str, Any]) -> tuple[RetrievalRuntime, J
         retrieval_mode="hybrid",
         enable_rewrite_candidate_fusion=bool(config.get("rewrite_candidate_fusion_enabled")),
         enable_adjacent_l3_expansion=bool(config.get("adjacent_l3_expansion_enabled")),
+        subquestion_language_policy=str(config.get("subquestion_language_policy") or "legacy"),
         capture_candidate_trace=bool(config.get("candidate_trace_capture_enabled")),
     )
     judge_config = _judge_config()
@@ -2871,13 +2978,8 @@ def _evaluate_multihop_concurrently(
     evaluation cases to overlap.
     """
     checkpoint_path = output_dir / checkpoint_filename
-    records = _read_multihop_checkpoints(checkpoint_path)
     cases_by_id = {str(case["id"]): case for case in cases}
-    records = [
-        _normalize_checkpoint_record(record, cases_by_id[str(record["case_id"])])
-        if str(record.get("case_id")) in cases_by_id else record
-        for record in records
-    ]
+    records = _resume_multihop_checkpoints(output_dir, checkpoint_path, cases_by_id)
     completed_case_ids = {str(record["case_id"]) for record in records}
     pending_cases = [case for case in cases if str(case["id"]) not in completed_case_ids]
     _write_evaluation_progress(
@@ -3015,13 +3117,8 @@ def evaluate_multihop(
         runtime, judge_config, judge_client = _build_multihop_runtime(config)
 
     checkpoint_path = output_dir / checkpoint_filename
-    records = _read_multihop_checkpoints(checkpoint_path)
     cases_by_id = {str(case["id"]): case for case in cases}
-    records = [
-        _normalize_checkpoint_record(record, cases_by_id[str(record["case_id"])])
-        if str(record.get("case_id")) in cases_by_id else record
-        for record in records
-    ]
+    records = _resume_multihop_checkpoints(output_dir, checkpoint_path, cases_by_id)
     completed_case_ids = {str(record["case_id"]) for record in records}
     _write_evaluation_progress(
         output_dir,
@@ -3210,6 +3307,130 @@ def _candidate_audit_report(results: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+_CJK_CHARACTER_PATTERN = re.compile(r"[\u3400-\u9fff]")
+
+
+def _subquestion_language_compliance(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Audit the text that the complex-question path actually sent to retrieval."""
+    checked_cases: list[dict[str, Any]] = []
+    violations: list[dict[str, Any]] = []
+    system_error_case_ids: list[str] = []
+    english_case_ids: list[str] = []
+
+    for record in records:
+        question = str(record.get("question") or "")
+        trace = record.get("rag_trace") or {}
+        if not re.search(r"[A-Za-z]", question):
+            continue
+        case_id = str(record.get("case_id") or "")
+        english_case_ids.append(case_id)
+        if _has_retryable_error(record):
+            system_error_case_ids.append(case_id)
+            continue
+        if trace.get("complexity") != "complex":
+            continue
+
+        observations: list[dict[str, str]] = []
+        for index, query in enumerate(trace.get("sub_questions") or [], 1):
+            if str(query).strip():
+                observations.append({
+                    "location": f"rag_trace.sub_questions[{index}]",
+                    "query": str(query).strip(),
+                })
+        for audit_index, audit in enumerate(record.get("candidate_audits") or [], 1):
+            query = str((audit or {}).get("query") or "").strip()
+            if query:
+                observations.append({
+                    "location": f"candidate_audits[{audit_index}].query",
+                    "query": query,
+                })
+
+        missing_trace = not any(item["location"].startswith("rag_trace.") for item in observations)
+        missing_candidate_query = not any(item["location"].startswith("candidate_audits") for item in observations)
+        case_violations = [
+            {"case_id": case_id, **item}
+            for item in observations
+            if _CJK_CHARACTER_PATTERN.search(item["query"])
+        ]
+        if missing_trace:
+            case_violations.append({
+                "case_id": case_id,
+                "location": "rag_trace.sub_questions",
+                "query": "",
+                "reason": "missing_actual_sub_questions",
+            })
+        if missing_candidate_query:
+            case_violations.append({
+                "case_id": case_id,
+                "location": "candidate_audits",
+                "query": "",
+                "reason": "missing_actual_retrieval_query",
+            })
+        violations.extend(case_violations)
+        checked_cases.append({
+            "case_id": case_id,
+            "observation_count": len(observations),
+            "language_policy_compliant": not case_violations,
+        })
+
+    language_policy_compliant: bool | None = (
+        None if not checked_cases and not violations else not violations
+    )
+    return {
+        "policy": "preserve_input_language_v1",
+        "english_case_count": len(english_case_ids),
+        "complex_english_case_count": len(checked_cases),
+        "checked_case_count": len(checked_cases),
+        "system_error_case_ids": system_error_case_ids,
+        "checked_cases": checked_cases,
+        "noncompliant_observations": violations,
+        "language_policy_compliant": language_policy_compliant,
+    }
+
+
+def _write_subquestion_language_compliance_report(
+    output_dir: Path,
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Write a separate audit so a configuration name cannot stand in for evidence."""
+    payload = _subquestion_language_compliance(records)
+    _write_json(output_dir / "subquestion-language-compliance.json", payload)
+    compliance_label = (
+        "是"
+        if payload["language_policy_compliant"] is True
+        else "否"
+        if payload["language_policy_compliant"] is False
+        else "无法确认"
+    )
+    lines = [
+        "# 英文子问题语言检查",
+        "",
+        f"- 英文题：{payload['english_case_count']}。",
+        f"- 实际进入复杂题路径：{payload['complex_english_case_count']}。",
+        f"- 可实际检查：{payload['checked_case_count']}。",
+        f"- 系统异常、未纳入语言判断：{len(payload['system_error_case_ids'])}。",
+        f"- 语言控制合规：{compliance_label}。",
+        "",
+    ]
+    if payload["noncompliant_observations"]:
+        lines.extend([
+            "## 不合规或无法核验",
+            "",
+            "| 题目 | 位置 | 实际检索文字 / 原因 |",
+            "| --- | --- | --- |",
+        ])
+        for item in payload["noncompliant_observations"]:
+            observed = str(item.get("query") or item.get("reason") or "").replace("|", "\\|").replace("\n", " ")
+            lines.append(f"| `{item['case_id']}` | `{item['location']}` | `{observed}` |")
+    else:
+        lines.append("所有可检查的英文复杂题，其实际子问题和实际检索文字均未出现中文字符。")
+    lines.append("")
+    (output_dir / "subquestion-language-compliance.md").write_text(
+        "\n".join(lines), encoding="utf-8", newline="\n"
+    )
+    return payload
+
+
 def _new_experiment_config(
     *,
     dataset: str,
@@ -3223,6 +3444,7 @@ def _new_experiment_config(
     changed_variable: str | None,
     case_count: int,
     evaluation_worker_count: int,
+    subquestion_language_policy: Literal["legacy", "preserve_input_language_v1"],
 ) -> dict[str, Any]:
     """Capture the complete, non-secret input snapshot for one experiment."""
     corpus_manifest = _read_json(corpus_manifest_path)
@@ -3254,6 +3476,7 @@ def _new_experiment_config(
         "evaluation_worker_count": evaluation_worker_count,
         "rewrite_candidate_fusion_enabled": changed_variable == "rewrite_candidate_fusion",
         "adjacent_l3_expansion_enabled": changed_variable == "adjacent_l3_expansion",
+        "subquestion_language_policy": subquestion_language_policy,
         "candidate_trace_capture_enabled": False,
         "code_version": _code_version(),
         "created_at": datetime.now(UTC).isoformat(),
@@ -3273,6 +3496,7 @@ def evaluate_run(
     target_manifest_path: Path | None = None,
     capture_candidate_trace: bool = False,
     evaluation_worker_count: int = 1,
+    subquestion_language_policy: Literal["legacy", "preserve_input_language_v1"] = "legacy",
 ) -> Path:
     """Evaluate a prepared corpus, optionally in a non-overlapping experiment run.
 
@@ -3283,6 +3507,18 @@ def evaluate_run(
         raise ValueError(
             f"evaluation_worker_count 必须在 1 到 {MAX_EVALUATION_WORKERS} 之间"
         )
+    if subquestion_language_policy not in {"legacy", "preserve_input_language_v1"}:
+        raise ValueError("subquestion_language_policy 只支持 legacy 或 preserve_input_language_v1")
+    if (
+        subquestion_language_policy == "preserve_input_language_v1"
+        and changed_variable != "subquestion_language_policy"
+    ):
+        raise ValueError("英文子问题语言控制必须声明 changed_variable=subquestion_language_policy")
+    if (
+        changed_variable == "subquestion_language_policy"
+        and subquestion_language_policy != "preserve_input_language_v1"
+    ):
+        raise ValueError("subquestion_language_policy 实验必须使用 preserve_input_language_v1")
 
     corpus_dir = run_directory(dataset, run_id)
     corpus_config = _read_json(corpus_dir / "config.json")
@@ -3304,6 +3540,10 @@ def evaluate_run(
     if changed_variable == "document_chunking_strategy" and target_manifest_path is None:
         raise ValueError(
             "document_chunking_strategy 只能通过冻结的 30 题 structured target manifest 评测"
+        )
+    if changed_variable == "subquestion_language_policy" and target_manifest_path is None:
+        raise ValueError(
+            "subquestion_language_policy 只能通过冻结的 30 题 target manifest 评测"
         )
     if target_manifest_path is not None:
         if evaluation_id is None:
@@ -3343,6 +3583,7 @@ def evaluate_run(
         "evidence_candidate_audit",
         "adjacent_l3_expansion",
         "structured_chunking_offline_audit",
+        "subquestion_language_policy",
     } and not capture_candidate_trace:
         raise ValueError(f"{target_manifest_type} target manifest 必须显式开启 candidate trace")
     if capture_candidate_trace and (
@@ -3352,14 +3593,13 @@ def evaluate_run(
             "adjacent_l3_expansion",
             "document_chunking_strategy",
             "model",
+            "rerank_model",
+            "subquestion_language_policy",
         }
     ):
         raise ValueError("candidate trace 只能在受控的单变量 target manifest 评测中开启")
-    if (
-        target_manifest_type == "structured_chunking_offline_audit"
-        and evaluation_worker_count != 10
-    ):
-        raise ValueError("结构化分块 30 题真实评测必须使用 evaluation_worker_count=10")
+    if target_manifest_type in {"structured_chunking_offline_audit", "subquestion_language_policy"} and evaluation_worker_count != 10:
+        raise ValueError("本轮 30 题真实评测必须使用 evaluation_worker_count=10")
     if retry_from_evaluation_id and (evaluation_id is None or mode != "rag" or dataset != "enterpriserag"):
         raise ValueError("retry 只支持 EnterpriseRAG 完整 RAG，且必须提供新的 evaluation_id")
 
@@ -3403,6 +3643,7 @@ def evaluate_run(
             changed_variable=changed_variable,
             case_count=len(cases),
             evaluation_worker_count=evaluation_worker_count,
+            subquestion_language_policy=subquestion_language_policy,
         )
         if target_manifest_path is not None:
             requested_config.update({
@@ -3467,12 +3708,18 @@ def evaluate_run(
                 "preserved_case_count",
                 "evaluation_worker_count",
                 "rewrite_candidate_fusion_enabled", "adjacent_l3_expansion_enabled",
+                "subquestion_language_policy",
                 "target_manifest_path", "target_manifest_sha256",
                 "candidate_trace_capture_enabled",
             )
             changed = [
                 key for key in immutable_keys
-                if config.get(key, False if key == "candidate_trace_capture_enabled" else None)
+                if config.get(
+                    key,
+                    False if key == "candidate_trace_capture_enabled"
+                    else "legacy" if key == "subquestion_language_policy"
+                    else None,
+                )
                 != requested_config.get(key)
             ]
             if changed:
@@ -3653,6 +3900,10 @@ def evaluate_run(
     if config.get("candidate_trace_capture_enabled"):
         (output_dir / "candidate-audit.md").write_text(
             _candidate_audit_report(results), encoding="utf-8", newline="\n"
+        )
+    if config.get("subquestion_language_policy") == "preserve_input_language_v1":
+        summary["subquestion_language_compliance"] = _write_subquestion_language_compliance_report(
+            output_dir, results
         )
     _write_case_review_report(
         output_dir,
