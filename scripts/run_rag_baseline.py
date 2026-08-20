@@ -17,7 +17,6 @@ import requests
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CASES = PROJECT_ROOT / "data" / "rag-samples" / "vivo-store-v1" / "evaluation" / "test-cases.jsonl"
 
 
 @dataclass(frozen=True)
@@ -192,7 +191,7 @@ def _answer_judge_prompt(case: dict[str, Any], answer: str) -> str:
         "assistant_answer": answer,
     }
     return (
-        "你是客服回答的严格阅卷器，不是回答用户的客服。只根据给出的评分标准判卷，"
+        "你是知识库问答的严格阅卷器，不是回答用户的助手。只根据给出的评分标准判卷，"
         "不要引入外部知识。语义等价的表述应视为满足事实；缺少、矛盾或擅自断言均不通过。"
         "对于资料未覆盖的问题，只有明确说明无法从现有资料确认才算通过。\n\n"
         "只输出一个 JSON 对象，字段必须完整：\n"
@@ -393,7 +392,7 @@ def _rank_summary(record: dict[str, Any]) -> str:
 def build_markdown_report(records: list[dict[str, Any]], summary: dict[str, Any]) -> str:
     """Create the human-readable scorecard used to review and discuss bad cases."""
     lines = [
-        "# AI智能知识检索系统 RAG 评测成绩单",
+        "# 企业知识库智能问答系统 RAG 评测成绩单",
         "",
         "## 汇总",
         "",
@@ -456,8 +455,8 @@ def resolve_answer_judge_config(args: argparse.Namespace) -> AnswerJudgeConfig |
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the local RAG baseline evaluation set")
-    parser.add_argument("--cases", type=Path, default=DEFAULT_CASES)
+    parser = argparse.ArgumentParser(description="Run a local RAG evaluation set")
+    parser.add_argument("--cases", type=Path, required=True, help="JSONL evaluation set path")
     parser.add_argument("--base-url", default="http://127.0.0.1:8050")
     parser.add_argument("--username", required=True)
     parser.add_argument("--password-env", default="EVAL_PASSWORD")
