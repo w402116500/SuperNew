@@ -12,7 +12,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.evaluation.runner import cleanup_run, default_run_id, evaluate_run, prepare_run
-from backend.indexing.document_loader import DEFAULT_CHUNKING_STRATEGY, STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+from backend.indexing.document_loader import (
+    DEFAULT_CHUNKING_STRATEGY,
+    SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
+    STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,9 +37,13 @@ def build_parser() -> argparse.ArgumentParser:
             command_parser.add_argument("--mode", choices=["retrieval", "rag"], default="rag")
             command_parser.add_argument(
                 "--chunking-strategy",
-                choices=[DEFAULT_CHUNKING_STRATEGY, STRUCTURED_MARKDOWN_CHUNKING_STRATEGY],
+                choices=[
+                    DEFAULT_CHUNKING_STRATEGY,
+                    STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+                    SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
+                ],
                 default=DEFAULT_CHUNKING_STRATEGY,
-                help="仅 EnterpriseRAG 评测可显式选择结构化 Markdown 分块；默认保持旧分块。",
+                help="仅 EnterpriseRAG 评测可显式选择结构化 Markdown 或语义增强分块；默认保持旧分块。",
             )
             command_parser.add_argument(
                 "--rechunk-scope",
@@ -54,13 +62,23 @@ def build_parser() -> argparse.ArgumentParser:
                 default=None,
                 help="Markdown 文档解析并发数，默认由 ENTERPRISE_DOCUMENT_PARSE_WORKERS 控制。",
             )
+            command_parser.add_argument(
+                "--ordinary-document-count",
+                type=int,
+                default=None,
+                help="EnterpriseRAG 普通干扰文档数量；不传时沿用旧 profile 默认值。",
+            )
         elif command == "evaluate":
             command_parser.add_argument(
                 "--evaluation-id",
                 default=None,
                 help="实验标识；提供后在 corpus 下创建独立实验目录，不覆盖其他结果。",
             )
-            command_parser.add_argument("--case-set", choices=["all", "analysis", "validation"], default="all")
+            command_parser.add_argument(
+                "--case-set",
+                choices=["all", "analysis", "validation", "development_all_500_v1"],
+                default="all",
+            )
             command_parser.add_argument("--mode", choices=["retrieval", "rag"], default=None)
             command_parser.add_argument(
                 "--changed-variable",
@@ -80,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
             command_parser.add_argument(
                 "--capture-candidate-trace",
                 action="store_true",
-                help="在受控 target 实验中保存原始候选和阶段快照。",
+                help="在受控 target 实验或 development_all_500_v1 中保存原始候选和阶段快照。",
             )
             command_parser.add_argument(
                 "--workers",
@@ -114,6 +132,7 @@ def main() -> int:
             rechunk_scope=args.rechunk_scope,
             target_manifest_path=Path(args.target_manifest) if args.target_manifest else None,
             document_parse_workers=args.document_parse_workers,
+            ordinary_document_count=args.ordinary_document_count,
         )
     elif args.command == "evaluate":
         output = evaluate_run(

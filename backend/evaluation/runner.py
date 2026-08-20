@@ -47,11 +47,17 @@ from backend.evaluation.metrics import multihop_metrics, retrieval_metrics
 from backend.evaluation.translation import TranslationClient, TranslationConfig
 from backend.indexing.document_loader import (
     DEFAULT_CHUNKING_STRATEGY,
+    SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
     STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
     SUPPORTED_CHUNKING_STRATEGIES,
     DocumentLoader,
+    sanitize_text,
 )
 from backend.indexing.embedding import embedding_public_config, embedding_service
+from backend.indexing.semantic_chunking import (
+    SEMANTIC_PARAGRAPH_MIN_CHARS,
+    plan_paragraph_boundaries,
+)
 from backend.indexing.chunk_metadata import structured_chunk_metadata
 from backend.indexing.milvus_client import MilvusSettings, MilvusStore
 from backend.indexing.milvus_writer import MilvusWriter
@@ -65,6 +71,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EVALUATION_ROOT = PROJECT_ROOT / "output" / "rag-evaluations"
 DATASET_ROOT = PROJECT_ROOT / "tmp" / "rag-benchmarks"
 ENTERPRISE_ROOT = DATASET_ROOT / "enterprise-rag-bench"
+DEVELOPMENT_ALL_500_CASE_SET = "development_all_500_v1"
 
 
 @dataclass(frozen=True)
@@ -322,6 +329,7 @@ def _public_config(
     chunking_strategy: str = DEFAULT_CHUNKING_STRATEGY,
     rechunk_scope: str = "full",
     document_parse_workers: int | None = None,
+    ordinary_document_count: int | None = None,
 ) -> dict[str, Any]:
     """保存可复现实验配置，明确排除所有密钥类环境变量。"""
     return {
@@ -358,6 +366,7 @@ def _public_config(
         "document_chunking_strategy": chunking_strategy,
         "rechunk_scope": rechunk_scope,
         "document_parse_workers": _normalize_enterprise_document_parse_workers(document_parse_workers),
+        "ordinary_document_count": ordinary_document_count,
         "embedding_rate_limit_rpm": os.getenv("EMBEDDING_MAX_RPM", "2000"),
         "embedding_rate_limit_tpm": os.getenv("EMBEDDING_MAX_TPM", "500000"),
         "embedding_workers": _embedding_worker_count(),
@@ -536,6 +545,7 @@ def _prepare_enterprise_documents(
     target_case_ids: set[str] | None = None,
     checkpoint_dir: Path | None = None,
     parse_workers: int | None = None,
+    ordinary_document_count: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """选择 EnterpriseRAG 语料、生成 Markdown，并返回三级分块与审计元数据。"""
     all_cases = load_enterprise_cases(ENTERPRISE_ROOT)
@@ -557,10 +567,16 @@ def _prepare_enterprise_documents(
         for doc_id in case["expected_doc_ids"]
     }
     ordinary_target = (
-        ENTERPRISE_FULL_ORDINARY_COUNT
-        if profile == "full"
-        else ENTERPRISE_SMOKE_ORDINARY_COUNT
+        int(ordinary_document_count)
+        if ordinary_document_count is not None
+        else (
+            ENTERPRISE_FULL_ORDINARY_COUNT
+            if profile == "full"
+            else ENTERPRISE_SMOKE_ORDINARY_COUNT
+        )
     )
+    if ordinary_target < 0:
+        raise ValueError("ordinary_document_count 不能为负数")
     ordinary_ids, source_quotas, source_actual = select_enterprise_ordinary_ids(
         ENTERPRISE_ROOT,
         required_ids,
@@ -640,8 +656,11 @@ def _prepare_enterprise_documents(
             "runtime_filename": runtime_filename,
             "source_hash": sha256(markdown.encode("utf-8")).hexdigest(),
             "chunking_strategy": (
-                STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
-                if chunking_strategy == STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+                chunking_strategy
+                if chunking_strategy in {
+                    STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+                    SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
+                }
                 and (not targeted_mode or doc_id in target_document_ids)
                 else DEFAULT_CHUNKING_STRATEGY
             ),
@@ -670,6 +689,69 @@ def _prepare_enterprise_documents(
             "targeted_rechunk": targeted_mode and doc_id in target_document_ids,
         })
 
+    semantic_plan_by_document: dict[str, list[dict[str, Any]]] = {}
+    semantic_boundary_path: Path | None = None
+    semantic_boundary_sha256: str | None = None
+    semantic_embedding_input_count = 0
+    if chunking_strategy == SEMANTIC_MARKDOWN_CHUNKING_STRATEGY:
+        # Freeze all semantic decisions in the main thread before parser workers
+        # start.  Workers only consume these records and never call Embedding.
+        planner = DocumentLoader(chunking_strategy=SEMANTIC_MARKDOWN_CHUNKING_STRATEGY)
+        paragraphs: list[dict[str, Any]] = []
+        for spec in document_specs:
+            source_text = sanitize_text(
+                spec["stable_path"].read_text(encoding="utf-8-sig").strip()
+            )
+            for atom in planner.markdown_paragraph_atoms(source_text):
+                if len(str(atom.get("text") or "")) <= SEMANTIC_PARAGRAPH_MIN_CHARS:
+                    continue
+                paragraphs.append({
+                    "document_id": spec["runtime_filename"],
+                    "source_start": int(atom["start"]),
+                    "source_end": int(atom["end"]),
+                    "text": str(atom["text"]),
+                })
+
+        try:
+            semantic_embedding_batch_size = int(
+                os.getenv("EMBEDDING_BATCH_SIZE", "32")
+            )
+        except ValueError as exc:
+            raise ValueError("EMBEDDING_BATCH_SIZE 必须是正整数") from exc
+        if semantic_embedding_batch_size <= 0:
+            raise ValueError("EMBEDDING_BATCH_SIZE 必须是正整数")
+
+        def embed_windows(texts: list[str]) -> list[list[float]]:
+            """Embed semantic windows in bounded provider requests.
+
+            A single long paragraph can produce hundreds of overlapping
+            windows. Keep each provider request within the same batch limit
+            used by Milvus writes instead of sending one oversized payload.
+            """
+            nonlocal semantic_embedding_input_count
+            vectors: list[list[float]] = []
+            for start in range(0, len(texts), semantic_embedding_batch_size):
+                batch = texts[start : start + semantic_embedding_batch_size]
+                batch_vectors = embedding_service.get_embeddings(batch)
+                if len(batch_vectors) != len(batch):
+                    raise RuntimeError(
+                        "语义断点 Embedding 返回数量与当前批次输入不一致"
+                    )
+                vectors.extend(batch_vectors)
+                semantic_embedding_input_count += len(batch)
+            return vectors
+
+        for paragraph in paragraphs:
+            plan = plan_paragraph_boundaries(paragraph, embed_windows)
+            semantic_plan_by_document.setdefault(str(paragraph["document_id"]), []).append(plan)
+        semantic_boundary_path = (checkpoint_dir.parent if checkpoint_dir else artifact_dir) / "semantic-boundaries.jsonl"
+        semantic_boundary_path.parent.mkdir(parents=True, exist_ok=True)
+        with semantic_boundary_path.open("w", encoding="utf-8", newline="\n") as handle:
+            for document_id in sorted(semantic_plan_by_document):
+                for plan in semantic_plan_by_document[document_id]:
+                    handle.write(json.dumps(plan, ensure_ascii=False, sort_keys=True) + "\n")
+        semantic_boundary_sha256 = _sha256_file(semantic_boundary_path)
+
     # Each worker owns its loader because LangChain splitters are not shared
     # mutable state.  Results are reassembled in source order and only the
     # main thread writes checkpoint files, keeping persistence single-writer.
@@ -683,7 +765,12 @@ def _prepare_enterprise_documents(
         last_error: Exception | None = None
         for attempt in range(parse_retries + 1):
             try:
-                loader = DocumentLoader(chunking_strategy=spec["chunking_strategy"])
+                loader = DocumentLoader(
+                    chunking_strategy=spec["chunking_strategy"],
+                    semantic_boundary_plan=semantic_plan_by_document.get(
+                        str(spec["runtime_filename"]), []
+                    ),
+                )
                 chunks = loader.load_document(
                     str(spec["stable_path"]),
                     spec["runtime_filename"],
@@ -784,6 +871,7 @@ def _prepare_enterprise_documents(
         "selected_case_count": len(prepared_cases),
         "required_document_count": len(required_ids),
         "ordinary_document_count": len(ordinary_ids),
+        "ordinary_document_target": ordinary_target,
         "hard_document_count": len(hard_ids),
         "source_quotas": source_quotas,
         "source_actual": source_actual,
@@ -811,14 +899,51 @@ def _prepare_enterprise_documents(
         "document_parse_workers": parse_workers,
         "document_parse_retries": parse_retries,
         "chunking_config_hash": DocumentLoader(
-            chunking_strategy=STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+            chunking_strategy=chunking_strategy
         ).chunking_config_hash
-        if chunking_strategy == STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+        if chunking_strategy in {
+            STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+            SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
+        }
         else None,
+        "semantic_boundary_plan_path": str(semantic_boundary_path) if semantic_boundary_path else None,
+        "semantic_boundary_plan_sha256": semantic_boundary_sha256,
+        "semantic_paragraph_count": len(paragraphs) if chunking_strategy == SEMANTIC_MARKDOWN_CHUNKING_STRATEGY else 0,
+        "semantic_boundary_count": sum(
+            len(plan.get("selected_boundaries") or [])
+            for plans in semantic_plan_by_document.values()
+            for plan in plans
+        ) if chunking_strategy == SEMANTIC_MARKDOWN_CHUNKING_STRATEGY else 0,
+        "semantic_embedding_input_count": semantic_embedding_input_count,
     }
     return prepared_cases, [chunk for chunk in all_chunks if chunk["chunk_level"] in (1, 2)], [
         chunk for chunk in all_chunks if chunk["chunk_level"] == 3
     ], metadata
+
+
+def _is_enterprise_development_300_corpus(
+    *,
+    dataset: str,
+    profile: str,
+    language: str,
+    corpus: str,
+    chunking_strategy: str,
+    ordinary_document_count: int | None,
+) -> bool:
+    """Identify the fixed 722-evidence plus 300-distractor development corpus.
+
+    This narrow check keeps the legacy recursive strategy away from the
+    business parent store only for the explicit same-corpus comparison.  It is
+    not a change to the default online or formal-baseline storage behavior.
+    """
+    return (
+        dataset == "enterpriserag"
+        and profile == "full"
+        and language == "en"
+        and corpus == "representative"
+        and ordinary_document_count == 300
+        and chunking_strategy in SUPPORTED_CHUNKING_STRATEGIES
+    )
 
 
 def prepare_run(
@@ -833,6 +958,7 @@ def prepare_run(
     rechunk_scope: Literal["full", "targeted"] = "full",
     target_manifest_path: Path | None = None,
     document_parse_workers: int | None = None,
+    ordinary_document_count: int | None = None,
 ) -> Path:
     """转换语料、写入独立集合，并持久化样本和清理清单。"""
     run_id = _safe_run_id(run_id)
@@ -862,7 +988,20 @@ def prepare_run(
 
     evaluation_storage_config: EvaluationStorageConfig | None = None
     isolated_parent_store: EvaluationParentChunkStore | None = None
-    if chunking_strategy == STRUCTURED_MARKDOWN_CHUNKING_STRATEGY:
+    if (
+        chunking_strategy in {
+            STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+            SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
+        }
+        or _is_enterprise_development_300_corpus(
+            dataset=dataset,
+            profile=profile,
+            language=language,
+            corpus=corpus,
+            chunking_strategy=chunking_strategy,
+            ordinary_document_count=ordinary_document_count,
+        )
+    ):
         # This runs before the output directory, Milvus collection, or any chunk
         # write exists, so a missing/unsafe URL cannot fall back to business data.
         evaluation_storage_config = EvaluationStorageConfig.from_env()
@@ -940,6 +1079,7 @@ def prepare_run(
             target_case_ids=target_case_ids,
             checkpoint_dir=output_dir / "preparation-checkpoints",
             parse_workers=document_parse_workers,
+            ordinary_document_count=ordinary_document_count,
         )
         document_count = (
             enterprise_metadata["required_document_count"]
@@ -985,6 +1125,7 @@ def prepare_run(
         chunking_strategy=chunking_strategy,
         rechunk_scope=rechunk_scope,
         document_parse_workers=document_parse_workers,
+        ordinary_document_count=ordinary_document_count,
     )
     if evaluation_storage_config:
         manifest.update(evaluation_storage_config.public_metadata(run_id))
@@ -1126,6 +1267,23 @@ def prepare_run(
         else:
             # Keep the legacy preparation call contract unchanged.
             writer.write_documents(leaf_chunks)
+        if isinstance(store, MilvusStore) and dataset != "ecomretrieval":
+            verified_leaf_count = sum(
+                len(batch)
+                for batch in store.query_iterator(
+                    filter_expr="chunk_level == 3",
+                    output_fields=["chunk_id"],
+                    batch_size=1000,
+                )
+            )
+            expected_leaf_count = len(leaf_chunks_to_write)
+            if verified_leaf_count != expected_leaf_count:
+                raise RuntimeError(
+                    "Milvus L3 逐条核对数量不一致："
+                    f"expected={expected_leaf_count}, actual={verified_leaf_count}"
+                )
+            manifest["verified_leaf_chunk_count"] = verified_leaf_count
+            _write_json(output_dir / "manifest.json", manifest)
     except Exception:
         # 失败时尽量回收已写入的孤立数据；原异常继续向上抛出，不能伪造准备成功。
         store.drop_collection()
@@ -1319,7 +1477,7 @@ def _read_retry_source_records(
 def _select_experiment_cases(
     corpus_dir: Path,
     cases: list[dict[str, Any]],
-    case_set: Literal["all", "analysis", "validation"],
+    case_set: Literal["all", "analysis", "validation", "development_all_500_v1"],
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Select formal cases from the frozen split without changing the corpus run."""
     if case_set == "all":
@@ -1333,6 +1491,28 @@ def _select_experiment_cases(
     manifest = json.loads(expected_hash)
     if manifest.get("case_split_sha256") and manifest["case_split_sha256"] != split_hash:
         raise RuntimeError("case-split.json 哈希与 corpus manifest 不匹配，拒绝使用可能被改写的题集")
+    if case_set == DEVELOPMENT_ALL_500_CASE_SET:
+        frozen_ids = [
+            *(str(case_id) for case_id in split.get("analysis_case_ids") or []),
+            *(str(case_id) for case_id in split.get("validation_case_ids") or []),
+        ]
+        if len(frozen_ids) != len(set(frozen_ids)):
+            raise RuntimeError("冻结题集包含重复题目，拒绝生成可见开发对照")
+        by_id = {str(case.get("id")): case for case in cases}
+        missing_ids = [case_id for case_id in frozen_ids if case_id not in by_id]
+        unexpected_ids = sorted(set(by_id) - set(frozen_ids))
+        if missing_ids or unexpected_ids:
+            raise RuntimeError(
+                "开发对照题集与冻结 500 题不一致："
+                f"缺失 {missing_ids[:5]}，额外 {unexpected_ids[:5]}"
+            )
+        selected = []
+        for case in cases:
+            visible_case = dict(case)
+            visible_case["formal_case_set"] = str(case.get("case_set") or "unknown")
+            visible_case["case_set"] = DEVELOPMENT_ALL_500_CASE_SET
+            selected.append(visible_case)
+        return selected, split_hash
     requested_ids = split.get(f"{case_set}_case_ids") or []
     by_id = {str(case.get("id")): case for case in cases}
     missing_ids = [str(case_id) for case_id in requested_ids if str(case_id) not in by_id]
@@ -2794,7 +2974,14 @@ def _evaluate_multihop_case(
 def _evaluation_parent_store_for_runtime(config: dict[str, Any]) -> ParentChunkStore | EvaluationParentChunkStore:
     """Choose the parent store recorded by the immutable corpus configuration."""
     strategy = str(config.get("document_chunking_strategy") or DEFAULT_CHUNKING_STRATEGY)
-    if strategy != STRUCTURED_MARKDOWN_CHUNKING_STRATEGY:
+    uses_isolated_store = (
+        config.get("evaluation_storage_mode") == "isolated_postgresql"
+        or strategy in {
+            STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+            SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
+        }
+    )
+    if not uses_isolated_store:
         return ParentChunkStore()
     corpus_run_id = str(config.get("corpus_run_id") or config.get("run_id") or "")
     store = EvaluationParentChunkStore(
@@ -3438,7 +3625,7 @@ def _new_experiment_config(
     evaluation_id: str,
     corpus_config: dict[str, Any],
     corpus_manifest_path: Path,
-    case_set: Literal["all", "analysis", "validation"],
+    case_set: Literal["all", "analysis", "validation", "development_all_500_v1"],
     case_split_sha256: str | None,
     evaluation_mode: Literal["retrieval", "rag"],
     changed_variable: str | None,
@@ -3461,6 +3648,7 @@ def _new_experiment_config(
         ),
         rechunk_scope=str(corpus_config.get("rechunk_scope") or "full"),
         document_parse_workers=corpus_config.get("document_parse_workers"),
+        ordinary_document_count=corpus_config.get("ordinary_document_count"),
     )
     config.update({
         "evaluation_id": evaluation_id,
@@ -3481,7 +3669,54 @@ def _new_experiment_config(
         "code_version": _code_version(),
         "created_at": datetime.now(UTC).isoformat(),
     })
+    # The manifest is written by prepare before any evaluation output exists.
+    # Copy only non-secret isolation facts so runtime retrieval can never fall
+    # back to the business parent store for this corpus.
+    for key in (
+        "evaluation_storage_mode",
+        "evaluation_database_name",
+        "evaluation_parent_chunk_table",
+        "evaluation_storage_schema_version",
+        "evaluation_redis_prefix",
+    ):
+        if key in corpus_manifest:
+            config[key] = corpus_manifest[key]
     return config
+
+
+def _retry_execution_budget_changes(
+    source_config: dict[str, Any],
+    requested_config: dict[str, Any],
+) -> list[dict[str, float]]:
+    """Record explicit retry-only increases to evaluator wait budgets.
+
+    These deadlines only decide how long the evaluator waits before recording
+    a system error.  They do not alter the corpus, retrieval, answer, or
+    grading inputs.  We still require an increase and retain every hop so a
+    repaired evaluation cannot conceal its execution-budget history.
+    """
+    prior_changes = source_config.get("retry_execution_budget_changes", [])
+    if not isinstance(prior_changes, list):
+        raise ValueError("retry source 的 retry_execution_budget_changes 格式无效")
+
+    changes = list(prior_changes)
+    for field in ("model_timeout_seconds", "evaluation_case_timeout_seconds"):
+        source_timeout = source_config.get(field)
+        requested_timeout = requested_config.get(field)
+        if source_timeout == requested_timeout:
+            continue
+        if not isinstance(source_timeout, (int, float)) or not isinstance(requested_timeout, (int, float)):
+            raise ValueError(f"补跑的 {field} 必须是数值")
+        if requested_timeout <= source_timeout:
+            raise FileExistsError(
+                f"补跑只能提高 {field}，不能降低或更换该执行时限"
+            )
+        changes.append({
+            "field": field,
+            "source_value": float(source_timeout),
+            "requested_value": float(requested_timeout),
+        })
+    return changes
 
 
 def evaluate_run(
@@ -3489,7 +3724,7 @@ def evaluate_run(
     dataset: Literal["ecomretrieval", "multihoprag", "enterpriserag"],
     run_id: str,
     evaluation_id: str | None = None,
-    case_set: Literal["all", "analysis", "validation"] = "all",
+    case_set: Literal["all", "analysis", "validation", "development_all_500_v1"] = "all",
     evaluation_mode: Literal["retrieval", "rag"] | None = None,
     changed_variable: str | None = None,
     retry_from_evaluation_id: str | None = None,
@@ -3529,17 +3764,39 @@ def evaluate_run(
     if not manifest.get("prepare_completed"):
         raise RuntimeError("该运行尚未完成入库，不能评测；请执行 cleanup 后重新 prepare。")
     if dataset != "enterpriserag" and case_set != "all":
-        raise ValueError("只有 EnterpriseRAG 正式语料支持 analysis/validation case set")
-
+        raise ValueError("只有 EnterpriseRAG 正式语料支持 analysis、validation 或开发对照题集")
     all_cases = read_cases(corpus_dir / "cases.jsonl")
     target_manifest_type: str | None = None
     if changed_variable == "adjacent_l3_expansion" and target_manifest_path is None:
         raise ValueError(
             "adjacent_l3_expansion 只能通过固定的 11 题 target manifest 评测"
         )
-    if changed_variable == "document_chunking_strategy" and target_manifest_path is None:
+    if (
+        changed_variable == "document_chunking_strategy"
+        and target_manifest_path is None
+        and case_set != DEVELOPMENT_ALL_500_CASE_SET
+        and not (
+            case_set == "analysis"
+            and evaluation_id is not None
+            and dataset == "enterpriserag"
+            and corpus_config.get("document_chunking_strategy") == DEFAULT_CHUNKING_STRATEGY
+            and _is_enterprise_development_300_corpus(
+                dataset=dataset,
+                profile=str(corpus_config.get("profile") or ""),
+                language=str(corpus_config.get("language") or ""),
+                corpus=str(corpus_config.get("corpus") or ""),
+                chunking_strategy=str(corpus_config.get("document_chunking_strategy") or ""),
+                ordinary_document_count=corpus_config.get("ordinary_document_count"),
+            )
+            and int(manifest.get("required_document_count", -1)) == 722
+            and int(manifest.get("ordinary_document_count", -1)) == 300
+            and int(manifest.get("hard_document_count", -1)) == 0
+            and manifest.get("evaluation_storage_mode") == "isolated_postgresql"
+        )
+    ):
         raise ValueError(
-            "document_chunking_strategy 只能通过冻结的 30 题 structured target manifest 评测"
+            "document_chunking_strategy 只能通过冻结的 30 题 structured target manifest，"
+            "或固定 1,022 篇资料的旧递归 300 题开发对照评测"
         )
     if changed_variable == "subquestion_language_policy" and target_manifest_path is None:
         raise ValueError(
@@ -3564,6 +3821,44 @@ def evaluate_run(
     mode = evaluation_mode or str(corpus_config.get("evaluation_mode") or "rag")
     if mode not in {"retrieval", "rag"}:
         raise ValueError(f"不支持的评测模式：{mode}")
+    is_recursive_development_analysis_300 = (
+        case_set == "analysis"
+        and evaluation_id is not None
+        and dataset == "enterpriserag"
+        and mode == "rag"
+        and corpus_config.get("document_chunking_strategy") == DEFAULT_CHUNKING_STRATEGY
+        and _is_enterprise_development_300_corpus(
+            dataset=dataset,
+            profile=str(corpus_config.get("profile") or ""),
+            language=str(corpus_config.get("language") or ""),
+            corpus=str(corpus_config.get("corpus") or ""),
+            chunking_strategy=str(corpus_config.get("document_chunking_strategy") or ""),
+            ordinary_document_count=corpus_config.get("ordinary_document_count"),
+        )
+        and int(manifest.get("required_document_count", -1)) == 722
+        and int(manifest.get("ordinary_document_count", -1)) == 300
+        and int(manifest.get("hard_document_count", -1)) == 0
+        and manifest.get("evaluation_storage_mode") == "isolated_postgresql"
+        and len(cases) == 300
+    )
+    if case_set == DEVELOPMENT_ALL_500_CASE_SET:
+        if dataset != "enterpriserag" or evaluation_id is None or mode != "rag":
+            raise ValueError("development_all_500_v1 只支持 EnterpriseRAG 的独立完整 RAG 实验")
+        if changed_variable != "document_chunking_strategy":
+            raise ValueError("development_all_500_v1 必须明确声明 changed_variable=document_chunking_strategy")
+        if corpus_config.get("document_chunking_strategy") not in {
+            STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+            SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
+        }:
+            raise ValueError("development_all_500_v1 只能比较 Markdown 结构化切分与语义切分语料")
+        if int(manifest.get("required_document_count", -1)) != 722:
+            raise ValueError("development_all_500_v1 必须使用 722 篇标准证据文档")
+        if int(manifest.get("ordinary_document_count", -1)) != 300:
+            raise ValueError("development_all_500_v1 必须使用固定的 300 篇普通干扰文档")
+        if int(manifest.get("hard_document_count", -1)) != 0:
+            raise ValueError("development_all_500_v1 不允许额外 hard distractor 文档")
+        if len(cases) != 500:
+            raise ValueError("development_all_500_v1 必须完整运行冻结的 500 道题")
     if target_manifest_path is not None:
         if mode != "rag":
             raise ValueError("target manifest 评测必须使用完整 RAG 模式")
@@ -3587,7 +3882,11 @@ def evaluate_run(
     } and not capture_candidate_trace:
         raise ValueError(f"{target_manifest_type} target manifest 必须显式开启 candidate trace")
     if capture_candidate_trace and (
-        target_manifest_path is None
+        (
+            target_manifest_path is None
+            and case_set != DEVELOPMENT_ALL_500_CASE_SET
+            and not is_recursive_development_analysis_300
+        )
         or changed_variable not in {
             "rewrite_candidate_fusion",
             "adjacent_l3_expansion",
@@ -3598,6 +3897,10 @@ def evaluate_run(
         }
     ):
         raise ValueError("candidate trace 只能在受控的单变量 target manifest 评测中开启")
+    if case_set == DEVELOPMENT_ALL_500_CASE_SET and not capture_candidate_trace:
+        raise ValueError("development_all_500_v1 必须保存 candidate trace")
+    if is_recursive_development_analysis_300 and not capture_candidate_trace:
+        raise ValueError("固定 1,022 篇资料的旧递归 300 题开发对照必须保存 candidate trace")
     if target_manifest_type in {"structured_chunking_offline_audit", "subquestion_language_policy"} and evaluation_worker_count != 10:
         raise ValueError("本轮 30 题真实评测必须使用 evaluation_worker_count=10")
     if retry_from_evaluation_id and (evaluation_id is None or mode != "rag" or dataset != "enterpriserag"):
@@ -3653,6 +3956,9 @@ def evaluate_run(
         if capture_candidate_trace:
             requested_config["candidate_trace_capture_enabled"] = True
         if retry_from_evaluation_id:
+            retry_execution_budget_changes = _retry_execution_budget_changes(
+                source_config, requested_config
+            )
             retry_compatibility_ignored = {
                 "run_id", "evaluation_id", "prepared_at", "created_at", "code_version",
                 # Retry metadata describes the current repair hop.  It may
@@ -3665,12 +3971,13 @@ def evaluate_run(
                 # retrieval, corpus, and target-manifest inputs.
                 "evaluation_worker_count",
             }
-            # A retry may intentionally change only the outer evaluation budget;
-            # all model, retrieval, corpus, and case-set inputs must still match.
-            if changed_variable == "evaluation_case_timeout_seconds":
-                retry_compatibility_ignored.update({
-                    "changed_variable", "evaluation_case_timeout_seconds",
-                })
+            # A longer outer deadline repairs an execution timeout only.  Keep
+            # changed_variable as the original RAG experiment variable, so the
+            # retry cannot be mistaken for a second RAG optimization.
+            retry_compatibility_ignored.update({
+                change["field"]
+                for change in retry_execution_budget_changes
+            })
             changed = [
                 key for key in requested_config
                 if key in source_config
@@ -3681,18 +3988,12 @@ def evaluate_run(
                 raise FileExistsError(
                     f"retry source 与当前配置不兼容，拒绝混合结果：{changed}"
                 )
-            if (
-                changed_variable == "evaluation_case_timeout_seconds"
-                and source_config.get("changed_variable") not in {None, "evaluation_case_timeout_seconds"}
-            ):
-                raise FileExistsError(
-                    "retry source 已包含其他 changed_variable，不能再混合评测运行预算"
-                )
             requested_config.update({
                 "retry_source_evaluation_id": retry_source_id,
                 "retry_source_results_sha256": _sha256_file(source_results_path),
                 "retry_case_count": len(retry_cases),
                 "preserved_case_count": len(preserved_case_ids),
+                "retry_execution_budget_changes": retry_execution_budget_changes,
             })
         config_path = output_dir / "evaluation-config.json"
         if output_dir.exists():
@@ -3706,6 +4007,7 @@ def evaluate_run(
                 "model_timeout_seconds", "evaluation_case_timeout_seconds",
                 "retry_source_evaluation_id", "retry_source_results_sha256", "retry_case_count",
                 "preserved_case_count",
+                "retry_execution_budget_changes",
                 "evaluation_worker_count",
                 "rewrite_candidate_fusion_enabled", "adjacent_l3_expansion_enabled",
                 "subquestion_language_policy",
@@ -3898,6 +4200,17 @@ def evaluate_run(
     })
     _write_results(output_dir / "results.jsonl", results)
     if config.get("candidate_trace_capture_enabled"):
+        _write_results(
+            output_dir / "candidate-trace.jsonl",
+            [
+                {
+                    "case_id": record.get("case_id"),
+                    "case_set": record.get("case_set"),
+                    "rag_trace": record.get("rag_trace") or {},
+                }
+                for record in results
+            ],
+        )
         (output_dir / "candidate-audit.md").write_text(
             _candidate_audit_report(results), encoding="utf-8", newline="\n"
         )

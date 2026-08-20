@@ -37,12 +37,14 @@ from backend.evaluation.runner import (
     _collection_name,
     _evidence_coverage,
     _evaluate_multihop_case,
+    _has_retryable_error,
     _prepare_enterprise_documents,
     _multihop_error_record,
     _manual_review_records,
     _public_config,
     _read_retry_source_records,
     _read_multihop_checkpoints,
+    _retry_case_selection,
     _run_case_in_worker,
     _stop_multihop_worker,
     _translate_markdown_documents,
@@ -208,6 +210,47 @@ class DatasetAdapterTests(unittest.TestCase):
 
 
 class FailureClassificationTests(unittest.TestCase):
+    def test_retry_selection_distinguishes_human_review_from_generation_and_grader_errors(self):
+        """Only a complete answer-and-grade outcome may be preserved across retries."""
+        cases = [
+            {"id": "completed"},
+            {"id": "human-review"},
+            {"id": "generation-timeout"},
+            {"id": "grader-timeout"},
+        ]
+        source_records = [
+            {"case_id": "completed", "answer_grade": {"verdict": "pass"}},
+            # A review verdict without a transport error is a valid outcome that
+            # awaits human review, not a reason to rerun the whole RAG chain.
+            {"case_id": "human-review", "answer_grade": {"verdict": "review"}},
+            {
+                "case_id": "generation-timeout",
+                "answer_generation_error": "Request timed out.",
+                "answer_grade": {"verdict": "fail"},
+            },
+            {
+                # The four interrupted recursive cases use this exact shape:
+                # the top-level evaluation error is empty, but independent
+                # grading timed out and the outcome is not usable.
+                "case_id": "grader-timeout",
+                "evaluation_error": "",
+                "answer_generation_error": "",
+                "answer_grade": {
+                    "verdict": "review",
+                    "grader_error": "HTTPSConnectionPool: Read timed out.",
+                },
+            },
+        ]
+
+        retry_cases, preserved_ids, retry_ids = _retry_case_selection(cases, source_records)
+
+        self.assertFalse(_has_retryable_error(source_records[1]))
+        self.assertTrue(_has_retryable_error(source_records[2]))
+        self.assertTrue(_has_retryable_error(source_records[3]))
+        self.assertEqual(preserved_ids, {"completed", "human-review"})
+        self.assertEqual(retry_ids, {"generation-timeout", "grader-timeout"})
+        self.assertEqual([case["id"] for case in retry_cases], ["generation-timeout", "grader-timeout"])
+
     def test_review_without_error_is_human_review_not_system_error(self):
         from scripts.analyze_rag_failures import _classify
 
@@ -1492,6 +1535,82 @@ class EnterpriseFormalEvaluationTests(unittest.TestCase):
         self.assertEqual(source_config["evaluation_worker_count"], 1)
         self.assertEqual(retry_config["evaluation_worker_count"], 10)
         self.assertEqual(retry_config["changed_variable"], source_config["changed_variable"])
+        self.assertEqual(retry_config["collection_name"], source_config["collection_name"])
+
+    def test_retry_can_increase_execution_timeouts_without_changing_rag_variable(self):
+        with TemporaryDirectory() as directory:
+            corpus_dir = Path(directory) / "corpus"
+            self._corpus_files(corpus_dir)
+
+            def fake_rag(output_dir, config, selected_cases, **kwargs):
+                records = []
+                for case in selected_cases:
+                    failed = (
+                        config.get("retry_source_evaluation_id") is None
+                        and case["id"] == "validation-1"
+                    )
+                    records.append({
+                        "case_id": case["id"],
+                        "question": case["question"],
+                        "question_type": case["question_type"],
+                        "reference_answer": "A",
+                        "answer": "A",
+                        "expected_evidence_filenames": case["evidence_filenames"],
+                        "retrieved_filenames": case["evidence_filenames"],
+                        "evidence_coverage": 1.0,
+                        "answer_grade": {"verdict": "review" if failed else "pass"},
+                        "evaluation_error": "TimeoutError: source timeout" if failed else "",
+                        "rag_trace": {},
+                        "end_to_end_seconds": 0.1,
+                    })
+                return records, {"dataset": "enterpriserag", "run_id": config["run_id"]}
+
+            with patch("backend.evaluation.runner.run_directory", return_value=corpus_dir), patch(
+                "backend.evaluation.runner.evaluate_multihop", side_effect=fake_rag
+            ), patch.dict(os.environ, {"EVALUATION_CASE_TIMEOUT_SECONDS": "600"}, clear=False):
+                source = evaluate_run(
+                    dataset="enterpriserag",
+                    run_id="corpus",
+                    evaluation_id="model-rag-003",
+                    evaluation_mode="rag",
+                    changed_variable="model",
+                )
+
+            with patch("backend.evaluation.runner.run_directory", return_value=corpus_dir), patch(
+                "backend.evaluation.runner.evaluate_multihop", side_effect=fake_rag
+            ), patch.dict(os.environ, {
+                "EVALUATION_CASE_TIMEOUT_SECONDS": "1200",
+                "MODEL_TIMEOUT_SECONDS": "180",
+            }, clear=False):
+                retry = evaluate_run(
+                    dataset="enterpriserag",
+                    run_id="corpus",
+                    evaluation_id="model-rag-004",
+                    evaluation_mode="rag",
+                    changed_variable="model",
+                    retry_from_evaluation_id="model-rag-003",
+                )
+
+            source_config = json.loads((source / "evaluation-config.json").read_text(encoding="utf-8"))
+            retry_config = json.loads((retry / "evaluation-config.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(source_config["changed_variable"], "model")
+        self.assertEqual(retry_config["changed_variable"], "model")
+        self.assertEqual(source_config["model_timeout_seconds"], 90.0)
+        self.assertEqual(retry_config["model_timeout_seconds"], 180.0)
+        self.assertEqual(retry_config["evaluation_case_timeout_seconds"], 1200.0)
+        self.assertEqual(retry_config["retry_execution_budget_changes"], [
+            {
+                "field": "model_timeout_seconds",
+                "source_value": 90.0,
+                "requested_value": 180.0,
+            },
+            {
+                "field": "evaluation_case_timeout_seconds",
+                "source_value": 600.0,
+                "requested_value": 1200.0,
+            },
+        ])
         self.assertEqual(retry_config["collection_name"], source_config["collection_name"])
 
     def test_retry_with_unresolved_errors_keeps_overall_status_interrupted(self):

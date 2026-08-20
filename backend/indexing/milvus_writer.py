@@ -95,13 +95,19 @@ class MilvusWriter:
             last_error = None
             for attempt in range(max_retries + 1):
                 try:
-                    return batch_index, batch, self.embedding_service.get_embeddings(texts)
+                    vectors = self.embedding_service.get_embeddings(texts)
+                    if len(vectors) != len(batch):
+                        raise RuntimeError(
+                            "Embedding 返回数量与输入文档数量不一致："
+                            f"expected={len(batch)}, actual={len(vectors)}"
+                        )
+                    return batch_index, batch, vectors
                 except Exception as exc:
                     last_error = exc
                     if attempt < max_retries:
                         time.sleep(min(2 ** attempt, 4))
             raise RuntimeError(
-                f"Embedding 批次失败，已重试 {max_retries} 次，batch_size={len(batch)}"
+                f"Embedding 批次失败，已重试 {max_retries} 次，batch_size={len(batch)}：{last_error}"
             ) from last_error
 
         def insert_batch(batch: list[dict], dense_embeddings: list[list[float]]) -> None:

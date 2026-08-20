@@ -75,6 +75,18 @@ class StructuredChunkMetadataTests(TestCase):
         self.assertEqual(embedding.get_embeddings.call_count, 2)
         store.insert.assert_called_once()
 
+    def test_writer_rejects_partial_embedding_batch(self):
+        embedding = Mock()
+        embedding.get_embeddings.return_value = []
+        store = Mock()
+        with patch("backend.indexing.milvus_writer.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "返回数量与输入文档数量不一致"):
+                MilvusWriter(
+                    embedding_service=embedding,
+                    milvus_manager=store,
+                ).write_documents([_leaf()], max_retries=0)
+        store.insert.assert_not_called()
+
     def test_writer_retries_one_failed_milvus_batch(self):
         embedding = Mock()
         embedding.get_embeddings.return_value = [[0.1, 0.2]]

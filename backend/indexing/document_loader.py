@@ -23,6 +23,10 @@ from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 from backend.indexing.document_types import NATIVE_TEXT_SUFFIXES, document_type_for_filename, is_rich_document
+from backend.indexing.semantic_chunking import (
+    SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
+    SemanticChunkingConfig,
+)
 
 # 编译需要移除的 C0 控制字符与 DEL（保留常规排版字：\t、\n、\r）。
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -42,6 +46,7 @@ STRUCTURED_MARKDOWN_CHUNKING_STRATEGY = "markdown_header_recursive_v1"
 SUPPORTED_CHUNKING_STRATEGIES = {
     DEFAULT_CHUNKING_STRATEGY,
     STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+    SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
 }
 
 
@@ -118,6 +123,7 @@ class DocumentLoader:
         chunk_size: int = 800,
         chunk_overlap: int = 100,
         chunking_strategy: str = DEFAULT_CHUNKING_STRATEGY,
+        semantic_boundary_plan: dict | list | None = None,
     ):
         """使用指定的基础大小和重叠大小初始化三个文本切分器。
 
@@ -131,6 +137,8 @@ class DocumentLoader:
                 f"{chunking_strategy}；可选值为 {sorted(SUPPORTED_CHUNKING_STRATEGIES)}"
             )
         self.chunking_strategy = chunking_strategy
+        # 断点计划必须在并发加载前冻结；loader 只读它，绝不在此处调用 Embedding。
+        self._semantic_boundary_plan = semantic_boundary_plan
         # 这里的“大小”和“重叠”默认按 Python len(text) 计算，也就是字符数，
         # 不是大模型的 Token 数。中文汉字、英文字符、标点和空格都会占用长度。
         # L1 最大、L2 居中、L3 最小，三个层级不是把同一组块简单复制三次。
@@ -215,6 +223,20 @@ class DocumentLoader:
             2: level_2_size,
             3: level_3_size,
         }
+        # Semantic planning creates non-overlapping sentence pieces.  A long
+        # prose atom may be explicitly marked as unsuitable (for example, one
+        # sentence is already longer than 800 characters); only then use this
+        # transparent fallback.  Its zero overlap prevents the same leaf from
+        # being generated under adjacent L2 parents.
+        self._semantic_fallback_splitters = {
+            level: RecursiveCharacterTextSplitter(
+                chunk_size=self._structured_level_sizes[level],
+                chunk_overlap=0,
+                add_start_index=True,
+                separators=structured_separators,
+            )
+            for level in (1, 2, 3)
+        }
         self._structured_config_hash = hashlib.sha256(
             json.dumps(
                 {
@@ -238,6 +260,25 @@ class DocumentLoader:
             if chunking_strategy == STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
             else None
         )
+        if chunking_strategy == SEMANTIC_MARKDOWN_CHUNKING_STRATEGY:
+            self._semantic_config = SemanticChunkingConfig(
+                level_sizes=(level_1_size, level_2_size, level_3_size)
+            )
+            self._semantic_config_hash = hashlib.sha256(
+                json.dumps(
+                    {
+                        "strategy": SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
+                        **self._semantic_config.as_dict(),
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            self.chunking_config_hash = self._semantic_config_hash
+        else:
+            self._semantic_config = None
+            self._semantic_config_hash = None
         self._markdown_header_splitter = MarkdownHeaderTextSplitter(
             headers_to_split_on=[("#", "h1"), ("##", "h2"), ("###", "h3"), ("####", "h4")],
             strip_headers=False,
@@ -458,11 +499,144 @@ class DocumentLoader:
                 index += 1
         return atoms
 
+    def markdown_paragraph_atoms(self, text: str) -> list[dict]:
+        """Return paragraph atoms with source offsets for offline planning."""
+        paragraphs: list[dict] = []
+        for section in self._markdown_sections(str(text)):
+            paragraphs.extend(
+                atom
+                for atom in self._markdown_atoms(section)
+                if str(atom.get("kind")) == "paragraph"
+            )
+        return paragraphs
+
+    def _semantic_plan_for_atom(self, atom: dict) -> dict | None:
+        """按文件名和原文范围找到冻结的普通段落断点计划。"""
+        plans = self._semantic_boundary_plan
+        if not plans:
+            return None
+        document_id = str(atom.get("document_id") or atom.get("filename") or "")
+        start = int(atom.get("start", 0))
+        end = int(atom.get("end", 0))
+        key = f"{document_id}::{start}:{end}"
+        if isinstance(plans, dict):
+            direct = plans.get(key) or plans.get((document_id, start, end))
+            # 小型离线测试/单文档调用常用 filename 作为外层键。
+            if not isinstance(direct, dict) and isinstance(plans.get(document_id), dict):
+                nested = plans[document_id]
+                direct = nested if {"source_start", "source_end"}.issubset(nested) else None
+            if isinstance(direct, dict):
+                return direct
+            # prepare 可能把所有记录包装在 plans/items 下。
+            candidates = plans.get("plans") or plans.get("items") or []
+        else:
+            candidates = plans
+        if isinstance(candidates, dict):
+            candidates = list(candidates.values())
+        for plan in candidates or []:
+            if not isinstance(plan, dict):
+                continue
+            plan_document = str(plan.get("document_id") or plan.get("filename") or "")
+            if plan_document and document_id and plan_document != document_id:
+                continue
+            try:
+                if int(plan.get("source_start")) == start and int(plan.get("source_end")) == end:
+                    return plan
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _semantic_parts(atom: dict, plan: dict, target_size: int) -> list[dict] | None:
+        """根据计划的句子边界合并成当前层级大小的段落块。"""
+        source = str(atom["text"])
+        start = int(atom["start"])
+        end = int(atom["end"])
+        raw_boundaries = plan.get("selected_boundaries") or []
+        boundaries: list[int] = []
+        for value in raw_boundaries:
+            relative_boundary = isinstance(value, dict)
+            if isinstance(value, dict):
+                value = value.get("offset")
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return None
+            # 现行 semantic_chunking 计划以段落为基准保存相对 offset；
+            # 同时接受旧审计工具使用的绝对 offset，便于回放冻结 JSONL。
+            plan_start = int(plan.get("source_start", start) or start)
+            absolute = plan_start + parsed if relative_boundary else parsed
+            if start < absolute < end:
+                boundaries.append(absolute)
+        boundaries = sorted(set(boundaries))
+        if not boundaries or plan.get("decision") not in {"planned", "semantic_applied"}:
+            return None
+        boundaries.append(end)
+        parts: list[dict] = []
+        cursor = start
+        pending_start = start
+        pending_end = start
+        for boundary in boundaries:
+            if boundary <= cursor:
+                continue
+            relative_start = pending_start - start
+            relative_end = boundary - start
+            candidate_text = source[relative_start:relative_end]
+            if not candidate_text.strip():
+                pending_end = boundary
+                cursor = boundary
+                continue
+            # 将相邻语义片段尽量合并到当前层级上限，L3 仍保持语义断点。
+            pending_text = source[pending_start - start : pending_end - start] if pending_end > pending_start else ""
+            combined = source[pending_start - start : relative_end]
+            if pending_end > pending_start and len(combined.strip()) > target_size:
+                body = pending_text.strip()
+                if body:
+                    leading = len(pending_text) - len(pending_text.lstrip())
+                    trailing = len(pending_text) - len(pending_text.rstrip())
+                    parts.append({
+                        "text": body,
+                        "start": pending_start + leading,
+                        "end": pending_end - trailing,
+                        "kind": "paragraph",
+                    })
+                pending_start = pending_end
+            pending_end = boundary
+            cursor = boundary
+        if pending_end > pending_start:
+            tail = source[pending_start - start : pending_end - start]
+            body = tail.strip()
+            if body:
+                leading = len(tail) - len(tail.lstrip())
+                trailing = len(tail) - len(tail.rstrip())
+                parts.append({
+                    "text": body,
+                    "start": pending_start + leading,
+                    "end": pending_end - trailing,
+                    "kind": "paragraph",
+                })
+        return parts or None
+
     def _split_long_paragraph(self, atom: dict, level: int) -> list[dict]:
-        """Apply the configured LangChain recursive splitter inside one prose atom."""
+        """按冻结计划切长段落；没有可用计划时沿用安全递归切法。"""
+        if self.chunking_strategy == SEMANTIC_MARKDOWN_CHUNKING_STRATEGY:
+            plan = self._semantic_plan_for_atom(atom)
+            if plan is not None:
+                planned_parts = self._semantic_parts(
+                    atom,
+                    plan,
+                    self._structured_level_sizes[level],
+                )
+                if planned_parts:
+                    return planned_parts
         source = str(atom["text"])
         document = Document(page_content=source, metadata={"source_start_index": atom["start"]})
-        split_documents = self._structured_splitters[level].split_documents([document])
+        splitter = (
+            self._semantic_fallback_splitters[level]
+            if self.chunking_strategy == SEMANTIC_MARKDOWN_CHUNKING_STRATEGY
+            else self._structured_splitters[level]
+        )
+        split_documents = splitter.split_documents([document])
         parts: list[dict] = []
         cursor = 0
         for item in split_documents:
@@ -563,8 +737,8 @@ class DocumentLoader:
                 "content_kind": str(piece["kind"]),
                 "previous_chunk_id": "",
                 "next_chunk_id": "",
-                "chunking_strategy": STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
-                "chunking_config_hash": self._structured_config_hash,
+                "chunking_strategy": self.chunking_strategy,
+                "chunking_config_hash": self.chunking_config_hash,
             }
             page_global_chunk_idx += 1
             chunks.append(chunk)
@@ -753,7 +927,10 @@ class DocumentLoader:
             text = file.read()
 
         if (
-            self.chunking_strategy == STRUCTURED_MARKDOWN_CHUNKING_STRATEGY
+            self.chunking_strategy in {
+                STRUCTURED_MARKDOWN_CHUNKING_STRATEGY,
+                SEMANTIC_MARKDOWN_CHUNKING_STRATEGY,
+            }
             and file_path.lower().endswith(".md")
         ):
             base_doc = {
