@@ -10,6 +10,8 @@ from langchain.chat_models import init_chat_model
 
 # 请求 Context 提供单次请求的 SSE、trace 和知识工具调用额度。
 from backend.chat.request_context import ChatRequestContext
+# 统一模型调用超时，避免上游兼容服务长时间不返回时占住请求。
+from backend.model_settings import model_timeout_seconds
 # 天气工具是无状态共享工具；知识库工具必须为每个请求重新创建。
 from backend.tools import get_current_weather, make_search_knowledge_base
 
@@ -17,11 +19,12 @@ API_KEY = os.getenv("ARK_API_KEY")  # 调用模型服务所需的认证密钥。
 MODEL = os.getenv("MODEL")  # 主模型名称，负责工具决策和最终自然语言回答。
 FAST_MODEL = os.getenv("FAST_MODEL")  # 辅助模型名称，负责较轻、较快的会话相关任务。
 BASE_URL = os.getenv("BASE_URL")  # OpenAI 兼容模型服务的基础地址。
+MODEL_TIMEOUT_SECONDS = model_timeout_seconds()  # 默认 90 秒的单次模型调用上限。
 
 # 系统提示词是 Agent 的最高层行为约束：何时用工具、如何处理 RAG 状态、怎样引用证据。
 SYSTEM_PROMPT = (
     # 角色与工具使用的基础约束。
-    "You are AI智能知识检索系统, a reliable customer-service assistant that gives evidence-based answers from the store knowledge base. "
+    "You are 企业知识库智能问答系统, a reliable knowledge-base assistant that gives evidence-based answers from the available documents. "
     "When responding, you may use tools to assist. "
     "Use search_knowledge_base when users ask document/knowledge questions. "
     # 工具调用预算由提示词提醒，并由 ChatRequestContext 中的代码硬限制兜底。
@@ -50,6 +53,7 @@ model = init_chat_model(
     base_url=BASE_URL,  # 支持官方地址或第三方/自建兼容网关。
     temperature=0.3,  # 保持回答相对稳定，同时保留少量自然表达变化。
     stream_usage=True,  # 收集流式调用用量；不等同于自动向 HTTP 客户端推送文本。
+    timeout=MODEL_TIMEOUT_SECONDS,  # 上游未响应时及时释放 HTTP 请求与工作线程。
 )
 
 # 低延迟模型只维护会话笔记等辅助任务，不替代证据评分模型。
@@ -60,6 +64,7 @@ fast_model = init_chat_model(
     base_url=BASE_URL,  # 复用同一模型服务地址。
     temperature=0.2,  # 辅助任务更偏确定性，因此温度略低于主模型。
     stream_usage=True,  # 统一采集模型调用用量。
+    timeout=MODEL_TIMEOUT_SECONDS,  # 复杂度等辅助调用同样不能无限等待。
 )
 
 
