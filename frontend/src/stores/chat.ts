@@ -35,7 +35,7 @@ export const useChatStore = defineStore('chat', {
       if (pendingHitl) {
         return '输入自定义补充，或选择上方选项后发送...';
       }
-      return '向AI智能知识检索系统提问... (Shift+Enter 换行)';
+      return '向企业知识库智能问答系统提问... (Shift+Enter 换行)';
     },
   },
 

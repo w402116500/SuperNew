@@ -5,15 +5,15 @@
         <i class="fa-solid fa-microscope"></i>
       </div>
       <div class="brand-copy">
-        <h1>AI智能知识检索系统</h1>
-        <span>Store Copilot</span>
+        <h1>企业知识库智能问答系统</h1>
+        <span>Knowledge Copilot</span>
       </div>
     </div>
 
     <div class="workspace-switcher">
       <span class="workspace-orb" aria-hidden="true"></span>
       <span class="workspace-copy">
-        <strong>店铺知识空间</strong>
+        <strong>企业知识空间</strong>
         <small>{{ workspaceMeta }}</small>
       </span>
       <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
@@ -74,7 +74,7 @@
         </button>
 
         <div v-if="!recentSessions.length" class="recent-empty">
-          还没有历史会话，向AI智能知识检索系统提一个问题吧。
+          还没有历史会话，向企业知识库智能问答系统提一个问题吧。
         </div>
       </div>
     </template>

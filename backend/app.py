@@ -25,7 +25,7 @@ FRONTEND_DIR = PROJECT_ROOT / "frontend" / "dist"
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="AI智能知识检索系统 API")
+    app = FastAPI(title="企业知识库智能问答系统 API")
 
     # 这是便于本地联调的宽松配置；生产环境必须限制允许的来源。
     app.add_middleware(

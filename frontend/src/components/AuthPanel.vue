@@ -3,9 +3,9 @@
     <div class="auth-showcase">
       <div class="auth-showcase-badge">
         <i class="fa-solid fa-sparkles"></i>
-        <span>AI智能知识检索系统</span>
+        <span>企业知识库智能问答系统</span>
       </div>
-      <h2>让每一份店铺知识<br />都得到清晰的回答。</h2>
+      <h2>让每一份企业资料<br />都得到清晰的回答。</h2>
       <p>
         混合检索、并行 Agent、证据精排与可追溯引用，
         现在都汇聚在同一个工作台里。
@@ -31,7 +31,7 @@
         <span class="auth-mini-logo"><i class="fa-solid fa-microscope"></i></span>
         <div>
           <span class="auth-eyebrow">{{ authStore.authMode === 'login' ? 'Welcome back' : 'Create account' }}</span>
-          <h1>{{ authStore.authMode === 'login' ? '登录AI智能知识检索系统' : '注册AI智能知识检索系统' }}</h1>
+          <h1>{{ authStore.authMode === 'login' ? '登录企业知识库智能问答系统' : '注册企业知识库智能问答系统' }}</h1>
         </div>
       </div>
       <p class="auth-description">

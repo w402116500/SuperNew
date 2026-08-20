@@ -5,7 +5,7 @@
         <span class="hitl-icon"><i class="fa-solid fa-circle-question"></i></span>
         <span>
           <strong>需要你补充一下</strong>
-          <small>AI智能知识检索系统会沿着你的选择继续原来的检索流程</small>
+          <small>企业知识库智能问答系统会沿着你的选择继续原来的检索流程</small>
         </span>
       </div>
       <div class="hitl-panel-prompt">{{ chatStore.currentPendingHitl.prompt }}</div>

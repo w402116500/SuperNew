@@ -141,7 +141,7 @@ const runSteps = computed<RunStepView[]>(() => {
   if (!currentTrace) {
     return [{
       key: 'answer',
-      label: isRunning.value ? '正在连接AI智能知识检索系统' : '直接回答已完成',
+      label: isRunning.value ? '正在连接企业知识库智能问答系统' : '直接回答已完成',
       detail: isRunning.value ? '准备理解问题与选择工具' : '本次未产生检索轨迹',
     }];
   }

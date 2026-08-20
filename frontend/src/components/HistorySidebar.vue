@@ -23,7 +23,7 @@
         <div v-if="sessionStore.sessions.length === 0" class="empty-history">
           <span class="empty-icon"><i class="fa-regular fa-comments"></i></span>
           <h3>暂无历史记录</h3>
-          <p>开始一段新对话后，AI智能知识检索系统会在这里替你保存。</p>
+          <p>开始一段新对话后，企业知识库智能问答系统会在这里替你保存。</p>
         </div>
 
         <article

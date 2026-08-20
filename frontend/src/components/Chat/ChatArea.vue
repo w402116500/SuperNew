@@ -65,9 +65,9 @@ const sessionTitle = computed(() => {
 });
 
 const generationStatus = computed(() => {
-  if (chatStore.isViewingStreamingSession) return 'AI智能知识检索系统正在生成';
+  if (chatStore.isViewingStreamingSession) return '企业知识库智能问答系统正在生成';
   if (chatStore.currentPendingHitl) return '等待你的补充';
-  return 'AI智能知识检索系统在线';
+  return '企业知识库智能问答系统在线';
 });
 
 onBeforeUpdate(() => {

@@ -9,7 +9,7 @@
 
     <div class="message-column">
       <div v-if="!msg.isUser" class="message-author">
-        <span>AI智能知识检索系统</span>
+        <span>企业知识库智能问答系统</span>
         <small v-if="msg.ragTrace?.retrieved_chunks?.length">
           已引用 {{ msg.ragTrace.retrieved_chunks.length }} 个来源
         </small>
