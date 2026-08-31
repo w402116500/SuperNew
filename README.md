@@ -42,7 +42,7 @@ flowchart LR
 | FastAPI | 认证、会话、上传任务、聊天接口与 SSE 流式响应。 |
 | PostgreSQL | 用户、会话消息和 L1/L2 父级分块。 |
 | Redis | 父级分块和会话相关缓存。 |
-| Milvus 2.5+ | L3 叶子块、稠密向量和服务端 BM25 稀疏特征。 |
+| Milvus 2.5+ 或 Zilliz Cloud | L3 叶子块、稠密向量和服务端 BM25 稀疏特征。 |
 | MinerU | 富文档转 Markdown，并保留可追溯解析产物。 |
 | OpenAI 兼容模型服务 | 复杂度判断、证据判断、查询改写和最终回答。 |
 
@@ -81,6 +81,17 @@ MinerU 转换或分块失败会明确报错，旧版本不会被删除，也不�
 - Docker Desktop、Python 3.12+、[uv](https://docs.astral.sh/uv/)、Node.js 20+ 与 npm。
 - 可用的 OpenAI 兼容模型服务和 Embedding 模型。
 - 已部署的 MinerU Gradio 服务，默认地址为 `http://127.0.0.1:7860`。启动脚本不会自动启动 MinerU。
+- Milvus 可以使用本地 Docker，也可以使用 Zilliz Cloud 等托管服务。
+
+云端 Milvus 配置：
+
+```dotenv
+MILVUS_URI=https://你的云端公开地址
+MILVUS_TOKEN=你的访问令牌
+MILVUS_COLLECTION=embeddings_collection
+```
+
+配置 `MILVUS_URI` 后，后端会优先使用完整地址，并在存在 `MILVUS_TOKEN` 时进行鉴权；本地模式仍使用 `MILVUS_HOST` 和 `MILVUS_PORT`。云端模式下服务器不需要启动本地 Milvus、etcd、MinIO 和 Attu，只保留 PostgreSQL、Redis 与应用服务即可。
 
 ### 首次准备
 

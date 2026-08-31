@@ -65,6 +65,8 @@ class MilvusSettings:
     uri: str
     # 网络请求超时秒数。
     timeout: float
+    # 云端或开启鉴权的 Milvus 访问令牌；本地未鉴权实例为空。
+    token: str = ""
 
     @classmethod
     def from_env(cls) -> MilvusSettings:
@@ -79,13 +81,16 @@ class MilvusSettings:
         collection = os.getenv("MILVUS_COLLECTION", "embeddings_collection")
         # 环境变量读取到的是字符串，float(...) 转换为超时秒数。
         timeout = float(os.getenv("MILVUS_TIMEOUT", "30"))
+        uri = os.getenv("MILVUS_URI", "").strip() or f"http://{host}:{port}"
+        token = os.getenv("MILVUS_TOKEN", "").strip()
         # cls(...) 在类方法中表示当前类，方便未来子类继承此构造逻辑。
         return cls(
             host=host,
             port=port,
             collection_name=collection,
-            uri=f"http://{host}:{port}",
+            uri=uri,
             timeout=timeout,
+            token=token,
         )
 
 
@@ -102,7 +107,10 @@ def milvus_client_session(settings: MilvusSettings | None = None) -> Iterator[Mi
     # 调用方提供配置时优先使用，否则读取当前环境变量。
     cfg = settings or MilvusSettings.from_env()
     # 使用 URI 和超时创建客户端；此对象内部会管理到 Milvus 的网络连接。
-    client = MilvusClient(uri=cfg.uri, timeout=cfg.timeout)
+    client_kwargs = {"uri": cfg.uri, "timeout": cfg.timeout}
+    if cfg.token:
+        client_kwargs["token"] = cfg.token
+    client = MilvusClient(**client_kwargs)
     try:
         # 将客户端交给 with 代码块使用，并在此处暂停函数。
         yield client
