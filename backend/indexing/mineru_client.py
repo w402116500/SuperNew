@@ -219,10 +219,12 @@ class MineruClient:
                 raise RuntimeError("MinerU official API create task returned no file_url")
 
             with source.open("rb") as file_handle:
+                # MinerU 返回的 OSS 地址已经包含完整签名；额外设置 Content-Type
+                # 会改变签名计算，导致 OSS 返回 SignatureDoesNotMatch。
                 upload_response = requests.put(
                     upload_url,
                     data=file_handle,
-                    headers={"Content-Type": "application/octet-stream"},
+                    headers={},
                     timeout=self._settings.api_timeout_seconds,
                 )
             upload_response.raise_for_status()
