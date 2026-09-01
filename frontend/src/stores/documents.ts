@@ -7,11 +7,14 @@ export const useDocumentStore = defineStore('documents', {
     documents: [] as DocumentItem[],
     documentsLoading: false,
     selectedFile: null as File | null,
+    selectedFiles: [] as File[],
     isUploading: false,
     uploadProgress: '',
     uploadSteps: [] as UploadStep[],
     uploadProgressCollapsed: false,
     activeUploadJobId: '',
+    activeUploadJobIds: [] as string[],
+    uploadJobs: [] as any[],
     uploadPollTimer: null as any,
     deleteJobs: {} as Record<string, ActiveDeleteJob>,
     deletePollTimers: {} as Record<string, any>,
@@ -82,8 +85,28 @@ export const useDocumentStore = defineStore('documents', {
       }
     },
 
+    async loadUploadJobs() {
+      try {
+        const response = await api.get('/documents/upload/jobs');
+        this.uploadJobs = Array.isArray(response.data) ? response.data : [];
+        const activeIds = this.uploadJobs
+          .filter((job: any) => ['pending', 'running'].includes(job.status))
+          .map((job: any) => job.job_id)
+          .filter(Boolean);
+        if (activeIds.length) {
+          this.activeUploadJobIds = activeIds;
+          this.activeUploadJobId = activeIds[0];
+          this.isUploading = true;
+          this.startUploadJobPolling(activeIds);
+        }
+      } catch {
+        // 任务恢复失败不应阻止文档列表和上传页面使用。
+      }
+    },
+
     async uploadDocument() {
-      if (!this.selectedFile) {
+      const files = this.selectedFiles.length ? this.selectedFiles : (this.selectedFile ? [this.selectedFile] : []);
+      if (!files.length) {
         throw new Error('请先选择文件');
       }
 
@@ -94,7 +117,7 @@ export const useDocumentStore = defineStore('documents', {
       this.updateUploadStep('upload', 0, 'running', '准备上传');
 
       const formData = new FormData();
-      formData.append('file', this.selectedFile);
+      files.forEach((file) => formData.append('file', file));
 
       try {
         const response = await api.post('/documents/upload/async', formData, {
@@ -111,8 +134,11 @@ export const useDocumentStore = defineStore('documents', {
         const data = response.data;
         this.updateUploadStep('upload', 100, 'completed', '文档上传完成');
         this.uploadProgress = data.message;
-        this.activeUploadJobId = data.job_id;
-        this.startUploadJobPolling(data.job_id);
+        const jobs = Array.isArray(data.jobs) ? data.jobs : [data];
+        this.activeUploadJobIds = jobs.map((job: any) => job.job_id).filter(Boolean);
+        this.uploadJobs = jobs;
+        this.activeUploadJobId = this.activeUploadJobIds[0] || '';
+        this.startUploadJobPolling(this.activeUploadJobIds);
       } catch (error: any) {
         const errMsg = error.response?.data?.detail || error.message || '上传失败';
         this.updateUploadStep('upload', 100, 'failed', errMsg);
@@ -139,23 +165,32 @@ export const useDocumentStore = defineStore('documents', {
       }
     },
 
-    startUploadJobPolling(jobId: string) {
+    startUploadJobPolling(jobIds: string[] | string) {
       this.stopUploadJobPolling();
+      const ids = Array.isArray(jobIds) ? jobIds : [jobIds];
+      const finished = new Set<string>();
 
       const poll = async () => {
         try {
-          const response = await api.get(`/documents/upload/jobs/${encodeURIComponent(jobId)}`);
-          const job = response.data;
-          this.syncUploadJob(job);
+          const jobs = await Promise.all(ids.map(async (id) => {
+            const response = await api.get(`/documents/upload/jobs/${encodeURIComponent(id)}`);
+            return response.data;
+          }));
+          jobs.forEach((job) => {
+            const index = this.uploadJobs.findIndex((item: any) => item.job_id === job.job_id);
+            if (index >= 0) this.uploadJobs[index] = job;
+            else this.uploadJobs.push(job);
+            if (['completed', 'failed', 'interrupted'].includes(job.status)) finished.add(job.job_id);
+          });
+          const active = jobs.find((job) => job.status === 'running' || job.status === 'pending') || jobs[0];
+          if (active) this.syncUploadJob(active);
 
-          if (job.status === 'completed') {
+          if (finished.size === ids.length) {
             this.stopUploadJobPolling();
             this.isUploading = false;
             this.selectedFile = null;
+            this.selectedFiles = [];
             await this.loadDocuments();
-          } else if (job.status === 'failed') {
-            this.stopUploadJobPolling();
-            this.isUploading = false;
           }
         } catch (error: any) {
           this.uploadProgress = '进度查询失败：' + (error.response?.data?.detail || error.message);

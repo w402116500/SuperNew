@@ -1,6 +1,6 @@
-from typing import List, Optional
+from typing import Any, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DocumentInfo(BaseModel):
@@ -27,6 +27,12 @@ class DocumentUploadStartResponse(BaseModel):
     message: str
 
 
+class DocumentBatchUploadStartResponse(BaseModel):
+    batch_id: str
+    jobs: List[DocumentUploadStartResponse]
+    message: str
+
+
 class UploadStepInfo(BaseModel):
     key: str
     label: str
@@ -48,6 +54,8 @@ class DocumentUploadJobResponse(BaseModel):
     created_at: str
     updated_at: str
     steps: List[UploadStepInfo]
+    batch_id: Optional[str] = None
+    config: dict[str, Any] = Field(default_factory=dict)
 
 
 class DocumentDeleteStartResponse(BaseModel):

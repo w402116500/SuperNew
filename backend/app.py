@@ -10,6 +10,7 @@ load_env()
 
 from backend.api.router import router
 from backend.infra.database import init_db
+from backend.jobs.upload_jobs import upload_job_manager
 # 兼容 `python backend/app.py`：脚本直跑时先把仓库根目录加入模块搜索路径。
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -40,6 +41,7 @@ def create_app() -> FastAPI:
     async def startup_init_db():
         # 开发期启动时创建缺失表；它不会迁移已存在表的字段结构。
         init_db()
+        upload_job_manager.mark_incomplete_interrupted()
 
     # 先注册 API，再在入口末尾挂载 `/` 静态目录，避免静态路由吞掉接口。
     app.include_router(router)

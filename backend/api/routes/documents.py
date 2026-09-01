@@ -1,7 +1,9 @@
 """Administrator-only document upload, indexing, and deletion routes."""
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
+from typing import Union
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 
@@ -21,6 +23,7 @@ from backend.api.resources import (
 from backend.api.upload_validation import normalize_upload_filename
 from backend.db.models import User
 from backend.infra.auth import require_admin
+from backend.indexing.mineru_client import MineruClient
 from backend.jobs.upload_jobs import DELETE_STEPS, delete_job_manager, upload_job_manager
 from backend.schemas import (
     DocumentDeleteJobResponse,
@@ -31,6 +34,7 @@ from backend.schemas import (
     DocumentUploadJobResponse,
     DocumentUploadResponse,
     DocumentUploadStartResponse,
+    DocumentBatchUploadStartResponse,
 )
 
 
@@ -106,6 +110,21 @@ def _process_upload_job(job_id: str, staging_dir: str, filename: str) -> None:
         cleanup_staging_dir(staging_dir)
 
 
+def _run_upload_jobs(jobs: list[tuple[str, str, str]]) -> None:
+    """Run independent files with a bounded worker pool."""
+    concurrency = max(1, MineruClient().settings.upload_concurrency)
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="document-upload") as pool:
+        futures = [pool.submit(_process_upload_job, job_id, staging_dir, filename)
+                   for job_id, staging_dir, filename in jobs]
+        for future in futures:
+            # _process_upload_job records failures in the job manager; retrieving the
+            # exception prevents silent worker failures from being lost in the pool.
+            try:
+                future.result()
+            except Exception:
+                continue
+
+
 def _process_delete_job(job_id: str, filename: str) -> None:
     try:
         chunks_deleted = delete_document_transactionally(filename, delete_job_manager, job_id)
@@ -134,35 +153,65 @@ async def list_documents(_: User = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=f"获取文档列表失败: {exc}") from exc
 
 
-@router.post("/documents/upload/async", response_model=DocumentUploadStartResponse)
+@router.post(
+    "/documents/upload/async",
+    response_model=Union[DocumentUploadStartResponse, DocumentBatchUploadStartResponse],
+)
 async def upload_document_async(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
+    file: list[UploadFile] = File(...),
     _: User = Depends(require_admin),
 ):
     try:
-        filename = normalize_upload_filename(file.filename or "")
+        files = file if isinstance(file, list) else [file]
+        settings = MineruClient().settings
+        if not files:
+            raise ValueError("请至少选择一个文件")
+        if len(files) > settings.max_upload_files:
+            raise ValueError(f"单次最多上传 {settings.max_upload_files} 个文件")
+        filenames = [normalize_upload_filename(item.filename or "") for item in files]
+        lowered = [name.casefold() for name in filenames]
+        if len(set(lowered)) != len(lowered):
+            raise ValueError("同一批上传中不能包含同名文件")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     ensure_upload_dir()
-    job = upload_job_manager.create_job(filename)
-    staging_dir = create_staging_dir(job["job_id"])
+    batch_id = uuid4().hex
+    jobs: list[tuple[str, str, str]] = []
+    created_job_ids: list[str] = []
+    staging_dirs: list[str] = []
+    responses: list[DocumentUploadStartResponse] = []
     try:
-        upload_job_manager.update_step(job["job_id"], "upload", 1, "running", "正在保存文件到暂存区")
-        await save_upload_file(file, staging_dir / filename)
-        upload_job_manager.complete_step(job["job_id"], "upload", "文件已上传，等待 MinerU 解析")
+        for upload, filename in zip(files, filenames):
+            job = upload_job_manager.create_job(
+                filename,
+                batch_id=batch_id,
+                config=settings.profile(),
+            )
+            created_job_ids.append(job["job_id"])
+            staging_dir = create_staging_dir(job["job_id"])
+            staging_dirs.append(str(staging_dir))
+            upload_job_manager.update_step(job["job_id"], "upload", 1, "running", "正在保存文件到暂存区")
+            await save_upload_file(upload, staging_dir / filename)
+            upload_job_manager.complete_step(job["job_id"], "upload", "文件已上传，等待 MinerU 解析")
+            jobs.append((job["job_id"], str(staging_dir), filename))
+            responses.append(DocumentUploadStartResponse(job_id=job["job_id"], filename=filename,
+                                                          message="文件已上传，正在后台解析并入库"))
     except Exception as exc:
-        cleanup_staging_dir(staging_dir)
-        upload_job_manager.fail_job(job["job_id"], "upload", f"文件保存失败: {exc}")
+        for staging_dir in staging_dirs:
+            cleanup_staging_dir(staging_dir)
+        # 整批文件尚未全部保存成功时，不会启动后台处理；已创建的子任务
+        # 必须明确失败，否则前端会一直看到无法完成的 pending 任务。
+        for job_id in created_job_ids:
+            upload_job_manager.fail_job(job_id, "upload", f"文件保存失败：{exc}")
         raise HTTPException(status_code=500, detail=f"文件保存失败: {exc}") from exc
 
-    background_tasks.add_task(_process_upload_job, job["job_id"], str(staging_dir), filename)
-    return DocumentUploadStartResponse(
-        job_id=job["job_id"],
-        filename=filename,
-        message="文件已上传，正在后台解析并入库",
-    )
+    background_tasks.add_task(_run_upload_jobs, jobs)
+    if len(responses) == 1:
+        return responses[0]
+    return DocumentBatchUploadStartResponse(batch_id=batch_id, jobs=responses,
+                                            message=f"已接收 {len(responses)} 个文件，正在后台处理")
 
 
 @router.get("/documents/upload/jobs/{job_id}", response_model=DocumentUploadJobResponse)

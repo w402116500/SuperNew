@@ -30,6 +30,7 @@ dependencies = [
   "field>=0.2.0",
   "gradio-client>=2.6.0",
   "pyarrow>=25.0.1",
+  "pypdf>=5.0.0",
 ]
 
 [tool.setuptools.packages.find]

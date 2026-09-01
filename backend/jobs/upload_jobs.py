@@ -22,7 +22,7 @@ from uuid import uuid4
 # StepStatus 表示单个步骤可处于的四种状态。
 StepStatus = Literal["pending", "running", "completed", "failed"]
 # JobStatus 表示整个上传或删除任务可处于的四种状态。
-JobStatus = Literal["pending", "running", "completed", "failed"]
+JobStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
 
 
 # 上传任务默认步骤。每项是 (内部 key, 前端显示标签)。
@@ -73,10 +73,12 @@ class UploadJobManager:
         self,
         filename: str,
         *,
+        batch_id: str | None = None,
         steps: list[tuple[str, str]] | None = None,
         current_step: str = "upload",
         message: str = "等待上传",
         completion_step: str = "vector_store",
+        config: dict | None = None,
     ) -> dict:
         """创建一个待执行任务，并返回不会影响内部状态的任务快照。
 
@@ -99,11 +101,15 @@ class UploadJobManager:
         job = {
             "job_id": job_id,
             "filename": filename,
+            "batch_id": batch_id,
             "status": "pending",
             "current_step": current_step,
             "message": message,
             # 完成节点用于区分上传和删除，避免 complete_job 写死最后一步。
             "completion_step": completion_step,
+            # Keep the effective parsing/scheduling settings with the task so a
+            # later poll can explain which limits were actually applied.
+            "config": deepcopy(config or {}),
             "total_chunks": 0,
             "processed_chunks": 0,
             "error": None,
@@ -268,6 +274,19 @@ class UploadJobManager:
         """返回当前进程中全部任务的深拷贝快照列表。"""
         with self._lock:
             return [deepcopy(job) for job in self._jobs.values()]
+
+    def mark_incomplete_interrupted(self) -> int:
+        """Mark in-memory jobs that cannot resume after a process restart."""
+        changed = 0
+        with self._lock:
+            for job in self._jobs.values():
+                if job.get("status") in {"pending", "running"}:
+                    job["status"] = "interrupted"
+                    job["message"] = "服务重启导致任务中断，请重新提交"
+                    job["error"] = job["message"]
+                    job["updated_at"] = _now_iso()
+                    changed += 1
+        return changed
 
     @staticmethod
     def _find_step(job: dict, step_key: str) -> dict | None:

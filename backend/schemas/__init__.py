@@ -24,6 +24,7 @@ from backend.schemas.documents import (
     DocumentUploadJobResponse,
     DocumentUploadResponse,
     DocumentUploadStartResponse,
+    DocumentBatchUploadStartResponse,
     UploadStepInfo,
 )
 
@@ -41,6 +42,7 @@ __all__ = [
     "DocumentListResponse",
     "DocumentUploadResponse",
     "DocumentUploadStartResponse",
+    "DocumentBatchUploadStartResponse",
     "UploadStepInfo",
     "DocumentUploadJobResponse",
     "DocumentDeleteStartResponse",

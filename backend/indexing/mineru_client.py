@@ -11,9 +11,14 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import requests
 from gradio_client import Client, handle_file
+try:
+    from pypdf import PdfReader
+except ImportError:  # pragma: no cover - optional until dependency is installed
+    PdfReader = None
 
 from backend.indexing.document_types import RICH_DOCUMENT_SUFFIXES, is_rich_document
 
@@ -37,6 +42,10 @@ class MineruSettings:
     api_key: str = ""
     poll_interval_seconds: float = 3.0
     api_timeout_seconds: float = 60.0
+    page_batch_size: int = 200
+    max_upload_files: int = 10
+    upload_concurrency: int = 2
+    max_retries: int = 3
 
     @classmethod
     def from_env(cls) -> "MineruSettings":
@@ -59,12 +68,16 @@ class MineruSettings:
             engine_url=os.getenv("MINERU_ENGINE_URL", "http://localhost:30000").strip(),
             provider=os.getenv("MINERU_PROVIDER", "gradio").strip().lower() or "gradio",
             api_base_url=(
-                os.getenv("MINERU_API_BASE_URL", "https://mineru.net/api/v1/agent").strip()
-                or "https://mineru.net/api/v1/agent"
+                os.getenv("MINERU_API_BASE_URL", "https://mineru.net/api/v4").strip()
+                or "https://mineru.net/api/v4"
             ),
             api_key=os.getenv("MINERU_API_KEY", "").strip(),
             poll_interval_seconds=_positive_float("MINERU_POLL_INTERVAL_SECONDS", 3.0),
             api_timeout_seconds=_positive_float("MINERU_API_TIMEOUT_SECONDS", 60.0),
+            page_batch_size=_positive_int("MINERU_PAGE_BATCH_SIZE", 200),
+            max_upload_files=_positive_int("DOCUMENT_UPLOAD_MAX_FILES", 10),
+            upload_concurrency=_positive_int("DOCUMENT_UPLOAD_CONCURRENCY", 2),
+            max_retries=_positive_int("MINERU_MAX_RETRIES", 3),
         )
 
     def profile(self) -> dict[str, Any]:
@@ -84,7 +97,24 @@ class MineruSettings:
             "engine_url": self.engine_url,
             "poll_interval_seconds": self.poll_interval_seconds,
             "api_timeout_seconds": self.api_timeout_seconds,
+            "page_batch_size": self.page_batch_size,
+            "max_upload_files": self.max_upload_files,
+            "upload_concurrency": self.upload_concurrency,
+            "max_retries": self.max_retries,
         }
+
+    def page_ranges(self, page_count: int) -> list[str]:
+        """Return consecutive MinerU page ranges for a PDF."""
+        if page_count < 1:
+            raise ValueError("PDF 页数必须为正整数")
+        # v1 Agent 接口当前只接受最多 20 页；v4 精准接口才支持最多 200 页。
+        # 不能只看用户配置，否则线上仍使用 v1 时会再次提交 1-200 并失败。
+        provider_limit = 200 if "/api/v4" in self.api_base_url.rstrip("/") else 20
+        size = min(self.page_batch_size, provider_limit)
+        return [
+            f"{start}-{min(start + size - 1, page_count)}"
+            for start in range(1, page_count + 1, size)
+        ]
 
 
 @dataclass(frozen=True)
@@ -127,7 +157,7 @@ class MineruClient:
         self._validate_provider()
         temporary_export: Path | None = None
         if self._settings.provider == "official_api":
-            markdown, content_list_json, export_path = self._convert_official_api(source)
+            markdown, content_list_json, export_path = self._convert_official_api_paged(source)
             temporary_export = export_path
         else:
             markdown, content_list_json, export_path = self._convert_gradio(source)
@@ -190,6 +220,109 @@ class MineruClient:
         return self._validate_result(result)
 
     def _convert_official_api(self, source: Path) -> tuple[str, str, Path | None]:
+        if "/api/v4" in self._settings.api_base_url.rstrip("/"):
+            return self._convert_official_api_v4(source, None)
+        return self._convert_official_api_range(source, None)
+
+    def _convert_official_api_paged(self, source: Path) -> tuple[str, str, Path | None]:
+        if source.suffix.lower() != ".pdf" or PdfReader is None:
+            return self._retry_conversion(lambda: self._convert_official_api(source))
+        try:
+            page_count = len(PdfReader(str(source)).pages)
+        except Exception:
+            return self._retry_conversion(lambda: self._convert_official_api(source))
+        ranges = self.settings.page_ranges(page_count)
+        if len(ranges) == 1:
+            return self._retry_conversion(
+                lambda: self._convert_official_api_v4(source, ranges[0])
+                if "/api/v4" in self._settings.api_base_url.rstrip("/")
+                else self._convert_official_api_range(source, ranges[0])
+            )
+        markdown_parts: list[str] = []
+        content_parts: list[Any] = []
+        exports: list[Path] = []
+        for page_range in ranges:
+            markdown, content_json, export = self._retry_conversion(
+                lambda page_range=page_range: (
+                    self._convert_official_api_v4(source, page_range)
+                    if "/api/v4" in self._settings.api_base_url.rstrip("/")
+                    else self._convert_official_api_range(source, page_range)
+                )
+            )
+            markdown_parts.append(markdown)
+            try:
+                parsed = json.loads(content_json)
+                content_parts.extend(parsed if isinstance(parsed, list) else [parsed])
+            except (TypeError, ValueError):
+                pass
+            if export:
+                exports.append(export)
+        # Multi-part exports are intentionally not merged; Markdown/content list are
+        # the canonical ingestion inputs and each temporary zip is cleaned below.
+        for export in exports:
+            export.unlink(missing_ok=True)
+        return "\n".join(markdown_parts), json.dumps(content_parts, ensure_ascii=False), None
+
+    def _convert_official_api_v4(self, source: Path, page_range: str | None) -> tuple[str, str, Path | None]:
+        """Upload a local file through MinerU v4 and poll its batch result."""
+        base_url = self._settings.api_base_url.rstrip("/")
+        headers = {"Authorization": f"Bearer {self._settings.api_key}", "Content-Type": "application/json"}
+        # data_id 只允许 ASCII 字母、数字、下划线、短横线和句点；文件名可能包含中文或空格，不能直接拿来作为 data_id。
+        file_spec: dict[str, Any] = {"name": source.name, "data_id": f"supermew-{uuid4().hex}"}
+        if page_range and source.suffix.lower() == ".pdf":
+            file_spec["page_ranges"] = page_range
+        payload = {
+            "files": [file_spec],
+            "model_version": "vlm",
+            "enable_table": self._settings.table_enable,
+            "enable_formula": self._settings.formula_enable,
+            "is_ocr": self._settings.is_ocr,
+            "language": self._official_language(),
+        }
+        try:
+            response = requests.post(f"{base_url}/file-urls/batch", json=payload, headers=headers, timeout=self._settings.api_timeout_seconds)
+            data = self._official_response_data(response, "request upload url")
+            urls = data.get("file_urls")
+            batch_id = data.get("batch_id")
+            if not isinstance(urls, list) or not urls or not isinstance(urls[0], str):
+                raise RuntimeError("MinerU official API returned no upload URL")
+            if not isinstance(batch_id, str) or not batch_id:
+                raise RuntimeError("MinerU official API returned no batch_id")
+            with source.open("rb") as file_handle:
+                upload_response = requests.put(urls[0], data=file_handle, headers={}, timeout=self._settings.api_timeout_seconds)
+            upload_response.raise_for_status()
+
+            deadline = time.monotonic() + self._settings.api_timeout_seconds
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"MinerU official API task timed out after {self._settings.api_timeout_seconds:g} seconds")
+                status_response = requests.get(
+                    f"{base_url}/extract-results/batch/{batch_id}",
+                    headers={"Authorization": f"Bearer {self._settings.api_key}"},
+                    timeout=min(self._settings.api_timeout_seconds, remaining),
+                )
+                status_data = self._official_response_data(status_response, "poll task")
+                results = status_data.get("extract_result")
+                result = results[0] if isinstance(results, list) and results else status_data
+                state = str(result.get("state", "")).strip().lower() if isinstance(result, dict) else ""
+                if state == "done":
+                    zip_url = result.get("full_zip_url")
+                    if not isinstance(zip_url, str) or not zip_url:
+                        raise RuntimeError("MinerU official API completed without full_zip_url")
+                    return self._download_official_zip_result(zip_url)
+                if state == "failed":
+                    detail = result.get("err_msg") or "unknown error"
+                    raise RuntimeError(f"MinerU official API task failed: {detail}")
+                time.sleep(min(self._settings.poll_interval_seconds, max(0.0, deadline - time.monotonic())))
+        except RuntimeError:
+            raise
+        except requests.RequestException as exc:
+            raise RuntimeError(f"MinerU official API request failed: {exc}") from exc
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise RuntimeError(f"MinerU official API conversion failed: {exc}") from exc
+
+    def _convert_official_api_range(self, source: Path, page_range: str | None) -> tuple[str, str, Path | None]:
         base_url = self._settings.api_base_url.rstrip("/")
         headers = {"Authorization": f"Bearer {self._settings.api_key}"}
         payload: dict[str, Any] = {
@@ -199,8 +332,8 @@ class MineruClient:
             "is_ocr": self._settings.is_ocr,
             "enable_formula": self._settings.formula_enable,
         }
-        if source.suffix.lower() == ".pdf" and self._settings.end_pages:
-            payload["page_range"] = f"1-{self._settings.end_pages}"
+        if source.suffix.lower() == ".pdf":
+            payload["page_range"] = page_range or f"1-{self._settings.end_pages}"
 
         create_url = f"{base_url}/parse/file"
         try:
@@ -255,6 +388,19 @@ class MineruClient:
             raise RuntimeError(f"MinerU official API request failed: {exc}") from exc
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise RuntimeError(f"MinerU official API conversion failed: {exc}") from exc
+
+    def _retry_conversion(self, operation):
+        attempts = self._settings.max_retries + 1
+        for attempt in range(attempts):
+            try:
+                return operation()
+            except RuntimeError as exc:
+                message = str(exc).lower()
+                transient = any(token in message for token in ("429", "too many", "503", "502", "504", "timeout", "timed out", "connection"))
+                if not transient or attempt >= attempts - 1:
+                    raise
+                time.sleep(min(30.0, float(2 ** attempt)))
+        raise RuntimeError("MinerU conversion retry exhausted")
 
     def _official_language(self) -> str:
         language = self._settings.language.strip().lower()
@@ -324,6 +470,34 @@ class MineruClient:
                 content_list_json = self._content_list_from_export(export_path)
         return markdown.strip() + "\n", content_list_json, export_path
 
+    def _download_official_zip_result(self, zip_url: str) -> tuple[str, str, Path | None]:
+        """Read v4's full.zip result and keep the archive for bundle persistence."""
+        export_path = self._download_export(zip_url)
+        if not zipfile.is_zipfile(export_path):
+            export_path.unlink(missing_ok=True)
+            raise RuntimeError("MinerU official API returned an invalid result archive")
+        with zipfile.ZipFile(export_path) as archive:
+            markdown_member = next(
+                (item for item in archive.namelist() if item.lower().endswith("full.md")),
+                None,
+            )
+            if markdown_member is None:
+                markdown_member = next(
+                    (item for item in archive.namelist() if item.lower().endswith(".md")),
+                    None,
+                )
+            if markdown_member is None:
+                raise RuntimeError("MinerU official API result archive contains no Markdown")
+            markdown = archive.read(markdown_member).decode("utf-8")
+            content_member = next(
+                (item for item in archive.namelist() if item.lower().endswith("content_list.json")),
+                None,
+            )
+            content_list_json = archive.read(content_member).decode("utf-8") if content_member else "[]"
+        if not markdown.strip():
+            raise RuntimeError("MinerU official API returned empty Markdown")
+        return markdown.strip() + "\n", content_list_json, export_path
+
     def _download_export(self, export_url: str) -> Path:
         response = requests.get(export_url, timeout=self._settings.api_timeout_seconds)
         try:
@@ -338,7 +512,7 @@ class MineruClient:
     def _content_list_from_export(export_path: Path) -> str:
         if not zipfile.is_zipfile(export_path):
             return "[]"
-        with ZipFile(export_path) as archive:
+        with zipfile.ZipFile(export_path) as archive:
             member = next(
                 (item for item in archive.namelist() if item.lower().endswith("content_list.json")),
                 None,
