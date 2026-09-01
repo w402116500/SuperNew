@@ -104,6 +104,10 @@ Set-Location ..
 
 在根目录配置 `.env`，不要提交密钥：
 
+本地开发可以参考完整模板 `.env.example`；部署到服务器时建议参考
+`.env.server.example`，它只保留云端 Milvus、MinerU 官方 API、远程模型以及
+PostgreSQL/Redis 所需配置，不包含本地 Milvus、Gradio、MinIO 和 Attu 的备用配置。
+
 ```dotenv
 BASE_URL=
 ARK_API_KEY=
