@@ -4,11 +4,25 @@ const api = axios.create({
   timeout: 60000,
 });
 
-// Request interceptor to attach Bearer token
+export function isPublicAuthRequest(url: string | undefined): boolean {
+  const path = String(url || '');
+  return path.includes('/auth/login') || path.includes('/auth/register');
+}
+
+export function shouldTreatAsExpiredSession(error: {
+  response?: { status?: number };
+  config?: { url?: string };
+} | null | undefined): boolean {
+  if (error?.response?.status !== 401) {
+    return false;
+  }
+  return !isPublicAuthRequest(error.config?.url);
+}
+
 api.interceptors.request.use(
   (config) => {
     const token = localStorage.getItem('accessToken');
-    if (token) {
+    if (token && !isPublicAuthRequest(config.url)) {
       config.headers.Authorization = `Bearer ${token}`;
     }
     return config;
@@ -18,15 +32,13 @@ api.interceptors.request.use(
   }
 );
 
-// Response interceptor to handle session expiration (401)
 api.interceptors.response.use(
   (response) => {
     return response;
   },
   (error) => {
-    if (error.response && error.response.status === 401) {
+    if (shouldTreatAsExpiredSession(error)) {
       localStorage.removeItem('accessToken');
-      // Dispatch a custom event or let store handle the logout redirection
       window.dispatchEvent(new CustomEvent('unauthorized'));
     }
     return Promise.reject(error);

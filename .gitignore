@@ -12,3 +12,18 @@ frontend/node_modules/
 frontend/dist/
 tmp/
 output/rag-evaluations/
+
+# local deploy artifacts, not for GitHub
+Dockerfile
+docker-compose.prod.yml
+.dockerignore
+deploy-*.tar
+.playwright-cli/
+test_shots/
+
+# personal / private local notes
+server-connection.md
+简历.md
+简历投递版.md
+简历说明.md
+简历讨论稿.md

@@ -148,6 +148,16 @@ pwsh -NoLogo -NoProfile -File .\scripts\supermew.ps1 -Action status
 
 也可使用根目录 `start.bat` 和 `stop.bat`。服务地址：
 
+Linux 服务器项目目录（默认 `/opt/supermew`）使用生产 Compose，只启动 app、PostgreSQL 和 Redis：
+
+```bash
+./start.sh
+./stop.sh
+./start.sh --build
+```
+
+`stop.sh` 只停止容器，不会删除 `volumes` 里的数据库数据，也不会动 Nginx 或其他 Docker 项目。
+
 - 前端：<http://127.0.0.1:3000/>
 - 后端健康检查：<http://127.0.0.1:8050/health>
 - FastAPI 文档：<http://127.0.0.1:8050/docs>
