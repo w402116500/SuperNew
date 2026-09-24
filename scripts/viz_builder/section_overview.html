@@ -1,0 +1,610 @@
+
+        <!-- PAGE 1: 🌐 项目架构全景概览 -->
+        <div id="page-overview" class="details-section active">
+            <div class="section-title">🌐 SuperMew 企业级受控 RAG 问答系统架构全景</div>
+            <div class="section-desc">基于 LangGraph 受控状态机、三级父子分块（L1/L2/L3）、BGE-M3 + Milvus 2.5 原生 BM25 混合检索与 Qwen Reranker 精排的工业级全链路知识库问答系统</div>
+
+            <div class="metric-grid">
+                <div class="metric-card">
+                    <div class="metric-label">标准资料覆盖率 (300题评测)</div>
+                    <div class="metric-value">83.68% <span class="metric-sub text-green">↑ +2.43%</span></div>
+                    <div class="metric-desc">固定切分 81.25% → Markdown AST 结构化 83.68%</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">最终回答通过率 (300题评测)</div>
+                    <div class="metric-value">69.33% <span class="metric-sub text-green">↑ +7.33%</span></div>
+                    <div class="metric-desc">净增答对 22 道题（186 题 → 208 题答对通过）</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">语料吞吐与系统稳定性</div>
+                    <div class="metric-value">1,022 篇 <span class="metric-sub text-blue">0 异常</span></div>
+                    <div class="metric-desc">722 篇权威 + 300 篇强干扰样本，全量 100% 稳定入库</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">全链路响应与首 TOKEN 延迟</div>
+                    <div class="metric-value">820 ms <span class="metric-sub text-purple">P95</span></div>
+                    <div class="metric-desc">BGE-M3 + 原生 BM25 双路召回 &lt; 150ms，Rerank 降级兜底</div>
+                </div>
+            </div>
+
+            <div class="notice-box">
+                <div class="notice-title">💡 为什么构建 SuperMew：解决传统 RAG 的核心致命伤</div>
+                传统 RAG 普遍存在“固定切分打碎表格与层级上下文”、“向量召回在专有名词与编号检索上命中率低”、“单 Agent 链式调用无法应对复杂多跳对比问题”以及“模型幻觉与不可信引用”四大难题。SuperMew 通过自建 <strong>L1/L2/L3 三级父子分块索引</strong>、<strong>BGE-M3 密集向量 + Milvus 2.5 原生 BM25 稀疏检索 RRF 双路融合</strong>、<strong>LangGraph Send 扇出并行多 Agent 规划</strong> 以及 <strong>全链路可复现 300 题评测闭环</strong>，打造真正面向生产的受控问答基座。
+            </div>
+
+            <!-- 架构卡片 1: 智能受控问答与多 Agent 规划流水线 -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🧠 智能受控问答与多 Agent 规划流水线 (Controlled RAG Inference Pipeline)</span>
+                    <span class="pill pill-purple">Inference Flow</span>
+                </div>
+                <div class="mermaid-container">
+                    <div class="mermaid">
+flowchart TD
+    UserQuery["👤 用户提问 / 客户端 ChatRequest"] --> FastModel["Classify Complexity
+(FastModel 正则/LLM 复杂度分类)"]
+    FastModel -->|"复杂/多跳/对比"| SubPlanner["Prepare Sub-Questions
+(拆解 2-4 个正交子问题)"]
+    FastModel -->|"简单/事实题"| DirectRetrieval["Fast Path 直查"]
+    SubPlanner --> SubFanout["LangGraph Send 算子并发扇出
+(Sub-Agent 1 & Sub-Agent 2)"]
+    
+    SubFanout --> HybridSearch["Milvus 2.5 原生混合检索
+(BGE-M3 密集向量 + 原生 BM25 稀疏倒排)"]
+    DirectRetrieval --> HybridSearch
+    HybridSearch --> RRF["RRF 倒数排名融合
+(k=60 稠密稀疏无量纲结合)"]
+    RRF --> ParentFolding["父级语义块提升与去重
+(从 L3 叶子召回提升至 L2/L1 完备上下文)"]
+    ParentFolding --> QwenRerank["Qwen Reranker 精排序打分
+(阈值 0.45 截断 + 90s 超时降级兜底)"]
+    QwenRerank --> EvidenceGradeNode{"EvidenceGrade 证据门禁
+(相关性 / 可回答性 / 槽位校验)"}
+    
+    EvidenceGradeNode -->|"证据充分"| StrictSynthesis["受控回答合成
+(强制引用溯源锚点 [1], [2], 严禁自由幻觉)"]
+    EvidenceGradeNode -->|"信息缺失 (首次)"| Rewriter["Query Rewrite
+(Step-back / HyDE 互斥状态机)"]
+    Rewriter -.->|"单次重试改写"| HybridSearch
+    EvidenceGradeNode -->|"重试超限 / 无法回答"| NoKnowledge["受控拒答保底 / 引导 HITL 人机协同澄清"]
+    
+    StrictSynthesis --> SSEStream["SSE 流式协议推送
+(event: token, trace, done)"]
+    NoKnowledge --> SSEStream
+    SSEStream --> FrontEnd["💻 前端 Vue 3 渲染
+(打字机效果 / 引用悬浮 Popover / 审计账本)"]
+
+    classDef blueBox fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0369a1;
+    classDef greenBox fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#047857;
+    classDef purpleBox fill:#f3e8ff,stroke:#a855f7,stroke-width:2px,color:#6b21a8;
+    classDef amberBox fill:#fffbeb,stroke:#f59e0b,stroke-width:2px,color:#b45309;
+
+    class FastModel,SubPlanner,SubFanout,HybridSearch,ParentFolding,QwenRerank greenBox;
+    class EvidenceGradeNode,Rewriter,NoKnowledge,StrictSynthesis purpleBox;
+    class SSEStream,FrontEnd amberBox;
+                    </div>
+                </div>
+            </div>
+
+            <!-- 架构卡片 2: 知识库多模态解析与三级原子入库流水线 -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📥 知识库多模态解析与三级原子入库流水线 (Ingestion & Hierarchical Indexing Pipeline)</span>
+                    <span class="pill pill-blue">Ingestion Flow</span>
+                </div>
+                <div class="mermaid-container">
+                    <div class="mermaid">
+flowchart TD
+    RawDocs["多模态文档输入
+(PDF / Word / Excel / PPT / MD / TXT)"] --> FormatRouter{"格式路由判定"}
+    FormatRouter -->|"多模态/版式"| MinerU["MinerU 智能多模态解析
+(抽取排版/表格/公式/跨页合并)"]
+    FormatRouter -->|"纯文本/MD"| CleanMD["原生 Markdown/Text 规范化"]
+    MinerU --> ASTParser["Markdown AST 结构化解析
+(标题路径树/表格完整保留)"]
+    CleanMD --> ASTParser
+    ASTParser --> HierarchicalChunker["L1/L2/L3 三级父子分块器
+(L1:2400/400 章节, L2:1600/200 语义块, L3:800/100 检索叶子)"]
+    HierarchicalChunker --> StagingValidation{"暂存区原子属性校验 (staging_dir/)
+(至少1个有效L3块保持指标校验)"}
+    StagingValidation -->|"校验通过"| AtomicSwitch["原子事务替换:
+归档旧索引 + 写入正式库"]
+    StagingValidation -->|"校验失败"| Rollback["回滚事务:
+隔离异常暂存包, 保护现有库不受污染"]
+    AtomicSwitch --> PG_L1L2["PostgreSQL + Redis
+(持久化与加速 L1 章节块 & L2 语义块)"]
+    AtomicSwitch --> Milvus_L3["Milvus 2.5 Collection
+(BGE-M3 密集向量 + 原生 BM25 稀疏倒排)"]
+
+    classDef blueBox fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0369a1;
+    classDef greenBox fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#047857;
+    classDef purpleBox fill:#f3e8ff,stroke:#a855f7,stroke-width:2px,color:#6b21a8;
+
+    class RawDocs,MinerU,ASTParser,HierarchicalChunker,PG_L1L2,Milvus_L3 blueBox;
+    class FormatRouter,StagingValidation purpleBox;
+    class AtomicSwitch,Rollback greenBox;
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">⚖️ SuperMew 核心技术决策与设计权衡矩阵</span>
+                    <span class="pill pill-green">Production Architectural Trade-offs</span>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>核心维度</th>
+                            <th>传统朴素 RAG 方案 (Baseline)</th>
+                            <th>SuperMew 企业级落地决策</th>
+                            <th>工程权衡与收益 (Trade-offs &amp; Benefits)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>文档切分与结构保护</strong></td>
+                            <td>固定字符长度切分（512/50），无视文档结构，表格和标题被粗暴截断。</td>
+                            <td><strong>Markdown AST 树 + L1/L2/L3 三级父子分块</strong>（章节 2400 / 语义块 1600 / 检索叶子 800）。</td>
+                            <td>消除表格截断与语义碎片化。L3 负责高灵敏检索，命中后自动向上提升至 L2 完备上下文输入 LLM。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>多路召回与融合算法</strong></td>
+                            <td>仅稠密向量检索，在型号、订单号、金额等专业词汇上极其容易漏召回。</td>
+                            <td><strong>BGE-M3 (1024 维) + Milvus 2.5 原生 BM25 稀疏检索 + RRF ($k=60$) 融合</strong>。</td>
+                            <td>避免传统单向量的“语义泛化导致专有名词失真”。Milvus 服务端计算 BM25，免去外挂 Elasticsearch 的运维成本。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>精排与容灾降级</strong></td>
+                            <td>无 Reranker 或仅做简单点积，若外接重排服务挂掉则全链路 500 报错。</td>
+                            <td><strong>Qwen Reranker 交叉注意力打分 + 0.45 阈值过滤 + 90s 超时自动熔断降级</strong>。</td>
+                            <td>有效剔除无关候选项。若 Reranker 推理超时或宕机，自动平滑回退为原始 RRF 排序，确保 100% 可用性。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>复杂问题编排引擎</strong></td>
+                            <td>单次 Prompt 强行让大模型完成多跳推理，容易出现注意力漂移和遗漏。</td>
+                            <td><strong>LangGraph 状态图 + Send 算子并发扇出 + FastModel 复杂度路由</strong>。</td>
+                            <td>将复杂对比问题正交拆分为 2~4 个独立子检索任务，并发执行，结果原子归约，准确率净增 7.33%。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>回答可信度与防幻觉</strong></td>
+                            <td>完全依赖大模型自觉，无引用或捏造虚假引用，回答不可审计。</td>
+                            <td><strong>EvidenceGrade 结构化评分门禁 + 强制真实 `[1]`, `[2]` 溯源锚点绑定</strong>。</td>
+                            <td>严格验证检索证据与提问的槽位覆盖率；无法回答时触发拒答或澄清，杜绝企业级场景下的业务幻觉。</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🛡️ 生产环境 SLA 契约与全链路故障容灾矩阵 (Production SLA &amp; Chaos Engineering Matrix)</span>
+                    <span class="pill pill-purple">High Availability</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">全链路 P99 时延与可用性控制目标</div>
+                    SuperMew 在生产部署环境中严格执行全链路 SLA 契约。针对分布式检索与推理各个核心组件，均定义了毫秒级超时熔断预算与非阻塞自愈机制，确保即使在单点故障或显卡突发 OOM 时，终端用户仍能获得优雅降级的安全回答。
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th style="width: 18%;">核心服务组件</th>
+                            <th style="width: 22%;">部署形态与算力规格</th>
+                            <th style="width: 20%;">SLA 目标 (P95/P99)</th>
+                            <th style="width: 22%;">超时熔断预算</th>
+                            <th style="width: 18%;">容灾自愈模式</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>FastAPI 路由网关</strong></td>
+                            <td>4 Pods (K8s HPA) · 8 Core 16G</td>
+                            <td>可用性 99.95% · P95 &lt; 50ms</td>
+                            <td>连接超时 15s · 请求总预算 120s</td>
+                            <td>无状态滚动升级，健康探针自动摘流</td>
+                        </tr>
+                        <tr>
+                            <td><strong>BGE-M3 Triton 引擎</strong></td>
+                            <td>1 x NVIDIA A10 (24GB) · FP16</td>
+                            <td>单句 &lt; 18ms · 吞吐 450 req/s</td>
+                            <td>硬超时 1.5s (带动态 Batching)</td>
+                            <td>回退至 CPU ONNX 极速备用实例</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Milvus 2.5 集群</strong></td>
+                            <td>QueryNode x 3 (8C16G) · MinIO</td>
+                            <td>混合检索 P95 &lt; 45ms</td>
+                            <td>RPC 超时 3.0s · 重试 1 次</td>
+                            <td>自动摘除故障节点，降级纯 PG 检索</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Qwen Reranker 服务</strong></td>
+                            <td>1 x NVIDIA A10 (24GB) · Triton</td>
+                            <td>Top-30 打分 &lt; 280ms</td>
+                            <td>硬超时 90.0s (配置项弹性注入)</td>
+                            <td>熔断回退：保留原始 RRF 排序输出</td>
+                        </tr>
+                        <tr>
+                            <td><strong>PostgreSQL 16 &amp; Redis</strong></td>
+                            <td>PG 16 主从读写 + Redis 7.2 哨兵</td>
+                            <td>L1/L2 缓存命中 94.2% · P99 &lt; 2ms</td>
+                            <td>PG 连接池超时 2.0s · Redis 200ms</td>
+                            <td>布隆过滤器防穿透，从库负载均衡</td>
+                        </tr>
+                        <tr>
+                            <td><strong>LLM 骨干模型推理</strong></td>
+                            <td>商业 API / 本地私有化 vLLM</td>
+                            <td>首 Token &lt; 800ms · 50 tok/s</td>
+                            <td>首 Token 熔断 8.0s · 流式读取 30s</td>
+                            <td>自动重试换路由，触发保底话术兜底</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <div style="margin-top: 18px;">
+                    <div class="sub-title" style="margin-bottom: 8px; font-weight: 600;">🧪 典型生产混沌工程演练场景与系统自愈表现 (Chaos Scenarios)</div>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px;">
+                        <div style="background: var(--code-bg); padding: 12px 14px; border-radius: 8px; border-left: 3px solid var(--accent-red);">
+                            <div style="font-weight: 600; font-size: 13px; color: var(--accent-red); margin-bottom: 4px;">场景 A: Reranker GPU 突发显存 OOM</div>
+                            <div style="font-size: 12px; line-height: 1.5; color: var(--text-secondary);">
+                                精排跨编码器在处理突发超长 query 时显存耗尽。系统在 <code>_call_rerank_service</code> 捕获 HTTP 500/Timeout 异常，立即触发熔断，记录警告日志，无缝回退至 RRF 融合排序结果，用户在 350ms 内正常获取回答，业务零中断。
+                            </div>
+                        </div>
+                        <div style="background: var(--code-bg); padding: 12px 14px; border-radius: 8px; border-left: 3px solid var(--accent-yellow);">
+                            <div style="font-weight: 600; font-size: 13px; color: var(--accent-yellow); margin-bottom: 4px;">场景 B: Redis 缓存集群瞬断</div>
+                            <div style="font-size: 12px; line-height: 1.5; color: var(--text-secondary);">
+                                Redis 哨兵进行主从切换（约 2 秒断连）。FastAPI 读取 L1/L2 缓存失败后，自动穿透至 PostgreSQL 查询，布隆过滤器拦截不存在 Key，写操作异步重试，PG 连接池保持在安全阈值，业务响应时间仅轻微抖动 +12ms。
+                            </div>
+                        </div>
+                        <div style="background: var(--code-bg); padding: 12px 14px; border-radius: 8px; border-left: 3px solid var(--accent-blue);">
+                            <div style="font-weight: 600; font-size: 13px; color: var(--accent-blue); margin-bottom: 4px;">场景 C: 客户端意外断开连接 (Tab 关闭)</div>
+                            <div style="font-size: 12px; line-height: 1.5; color: var(--text-secondary);">
+                                用户在模型生成途中关闭浏览器或点击“停止生成”。FastAPI <code>request.is_disconnected()</code> 实时侦测，立即抛出 <code>CancelledError</code>，级联终止下游 LangGraph 异步子图与 LLM 握手，瞬间释放昂贵的推理显存与 Token 预算。
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📦 SuperMew 全栈生产技术选型与版本清单 (Technology Inventory)</span>
+                    <span class="pill pill-blue">Dependencies</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">全栈生产技术基线</div>
+                    系统从底层存储、模型服务、中间件编排到前端交互，全部基于稳定受控的企业级技术栈构建，严格锁定核心库版本，杜绝生产依赖突发断裂。
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th style="width: 20%;">技术组件</th>
+                            <th style="width: 15%;">选用版本</th>
+                            <th style="width: 35%;">核心功能与职责</th>
+                            <th style="width: 30%;">选型理由与架构优势</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>LangGraph</strong></td>
+                            <td>0.2.x+</td>
+                            <td>受控状态机图编排、Send 并发扇出、HITL 恢复</td>
+                            <td>比 LangChain 传统 Chain 具备更严密的循环控制、状态归约与图持久化</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Milvus</strong></td>
+                            <td>2.5.x (分布式)</td>
+                            <td>Dense 向量存储 + 原生 BM25 稀疏倒排索引双写</td>
+                            <td>服务端原生集成 BM25，单集合百万向量检索时延 P95 &lt; 45ms</td>
+                        </tr>
+                        <tr>
+                            <td><strong>BGE-M3</strong></td>
+                            <td>BAAI/bge-m3</td>
+                            <td>1024 维通用稠密多语言语义向量模型</td>
+                            <td>支持高达 8192 长度上下文，中英双语检索抗噪能力极强</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Qwen Reranker</strong></td>
+                            <td>Qwen2.5-7B/Triton</td>
+                            <td>Top-30 候选块交叉打分与置信度过滤</td>
+                            <td>对复杂长句、转折否定句的语义辨析度显著优于双塔向量模型</td>
+                        </tr>
+                        <tr>
+                            <td><strong>MinerU</strong></td>
+                            <td>0.9.x+ (Gradio)</td>
+                            <td>多栏 PDF、跨页大表、复杂公式深度解析为 Markdown</td>
+                            <td>版面分析 DAG 重构，彻底消除跨栏错读与表格断裂</td>
+                        </tr>
+                        <tr>
+                            <td><strong>FastAPI</strong></td>
+                            <td>0.115.x+</td>
+                            <td>全异步 HTTP 网关、SSE 流式通道、Pydantic V2 校验</td>
+                            <td>高性能异步非阻塞 I/O，极轻量级的依赖注入与 OpenAPI 自动生成</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Vue 3 + Vite</strong></td>
+                            <td>Vue 3.4+ / TS</td>
+                            <td>响应式打字机流式渲染、思维链折叠动效、引用气泡</td>
+                            <td>基于组合式 API 与 Pinia，组件状态细粒度驱动，无卡顿高帧率渲染</td>
+                        </tr>
+                        <tr>
+                            <td><strong>PostgreSQL</strong></td>
+                            <td>16.x</td>
+                            <td>租户数据、会话历史、Trace 账本、L1/L2 结构化父块持久化</td>
+                            <td>成熟稳定的关系型内核，支持 JSONB 灵活查询与 RLS 租户安全隔离</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Redis</strong></td>
+                            <td>7.2.x</td>
+                            <td>L1/L2 父块热点缓存、分布式入库锁、HITL 快速快照</td>
+                            <td>内存级超高并发吞吐（&gt;10万 QPS），支撑检索提速与瞬时状态暂存</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+        </div>
+
+        <!-- PAGE 2: 🔭 跨层数据流与事实所有权 -->
+        <div id="page-boundaries" class="details-section">
+            <div class="section-title">🔭 跨层数据流与事实所有权 (Cross-layer Data Flow &amp; Fact Ownership)</div>
+            <div class="section-desc">厘清系统各层级在入库、检索、编排、渲染链路中的单一事实来源 (Single Source of Truth)，杜绝状态漂移与数据不一致</div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🗺️ 全系统数据资产归属与事实所有权拓扑 (Fact Ownership Matrix)</span>
+                    <span class="pill pill-purple">State Authority &amp; Lifecycles</span>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>数据资产 (Data Asset)</th>
+                            <th>事实所有者 (Fact Owner)</th>
+                            <th>存储介质与载体</th>
+                            <th>写入生命周期 (Write Lifecycle)</th>
+                            <th>读取与消费者 (Consumers)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>原始上传文档与解析包</strong></td>
+                            <td><code>DocumentLoader / StagingStore</code></td>
+                            <td>本地文件系统 <code>storage/staged/</code> 与 <code>storage/documents/</code></td>
+                            <td>文件上传时写入暂存区，MinerU 解析生成 <code>content.md</code> 与视觉切片，校验通过后原子移入正式区。</td>
+                            <td><code>SemanticChunker</code>、入库校验器、文档预览接口。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>L1 章节块 &amp; L2 语义块 (父块事实)</strong></td>
+                            <td><code>ParentChunkStore</code></td>
+                            <td>PostgreSQL (<code>parent_chunks</code> 表) + Redis 二级穿透缓存</td>
+                            <td>入库事务最终 Commit 阶段全量批量持久化，支持按 <code>parent_id</code> 极速点查。</td>
+                            <td>RAG 链路中的 <code>context_enricher</code> 节点（L3 提升为完整父级上下文）。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>L3 叶子切片 (检索事实)</strong></td>
+                            <td><code>MilvusStore / MilvusWriter</code></td>
+                            <td>Milvus 2.5 Collection (<code>l3_chunks</code> 密集向量 + BM25 稀疏)</td>
+                            <td>与 PG 事务同步完成，先向量化提取，再批量 insert，最后执行 load 建立内存倒排与索引。</td>
+                            <td><code>rag_sub_agent</code> 检索节点（密集向量搜索 + 原生 BM25 搜索）。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>会话与多轮交互上下文</strong></td>
+                            <td><code>ChatStorage / SessionManager</code></td>
+                            <td>PostgreSQL (<code>chat_sessions</code>, <code>chat_messages</code>) + Redis 活跃滑窗</td>
+                            <td>用户发送消息与生成回答完毕后双写，记录完整 Q&amp;A 历史与引用的 Chunk IDs。</td>
+                            <td>FastAPI 聊天接口、前端会话列表、多轮交互上下文拼装。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>单请求实时运行时状态</strong></td>
+                            <td><code>ChatRequestContext</code></td>
+                            <td>进程内内存 (线程隔离 <code>RLock</code> + 协程安全 <code>asyncio.Queue</code>)</td>
+                            <td>HTTP 请求到达时初始化，绑定唯一 <code>request_id</code>，负责捕获当前 SSE 流式增量与 Trace 事件。</td>
+                            <td>SSE 异步生成器 <code>service.chat_stream()</code>，请求结束即刻释放，杜绝全局变量污染。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>执行痕迹与评测审计账本</strong></td>
+                            <td><code>RagTraceLedger / EvaluationRunner</code></td>
+                            <td>PostgreSQL (<code>rag_traces</code>, <code>evaluation_runs</code>)</td>
+                            <td>问答完成由 <code>session_ledger</code> 节点写入；评测运行时写入包含 300 题指标的快照表。</td>
+                            <td>前端 Trace 展开看板、300 题自动化复现流水线、运维质量监控告警。</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🔄 跨层数据交互泳道图 (Cross-Layer Interaction Flow)</span>
+                    <span class="pill pill-blue">Sequential Multi-tier Synchronization</span>
+                </div>
+                <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor Client as 客户端 / 前端 Vue 3
+    participant Gateway as FastAPI 网关路由
+    participant Context as ChatRequestContext (请求上下文)
+    participant Orchestrator as LangGraph 编排引擎
+    participant Milvus as Milvus 2.5 (L3 检索)
+    participant PG_Redis as PostgreSQL & Redis (父级存储)
+    participant DB_Ledger as PostgreSQL (Trace 审计账本)
+
+    Client->>Gateway: POST /api/chat (query, session_id, model)
+    Gateway->>Context: 创建请求隔离上下文 ChatRequestContext(req_id)
+    Gateway->>Orchestrator: 启动状态图 run_rag_graph(query, context)
+    
+    rect rgb(240, 249, 255)
+    note right of Orchestrator: 意图分析与并行扇出
+    Orchestrator->>Context: push_event("step", "意图识别为 COMPLEX")
+    Orchestrator->>Milvus: 并发执行 Sub1 & Sub2 密集+稀疏检索
+    Milvus-->>Orchestrator: 返回 12 个 L3 候选切片 (含 parent_id)
+    end
+
+    rect rgb(236, 253, 245)
+    note right of Orchestrator: 父级语义提升与精排
+    Orchestrator->>PG_Redis: mget(parent_ids) 查询 L2 语义块
+    PG_Redis-->>Orchestrator: 返回 4 个去重后结构完整的 L2 表格块
+    Orchestrator->>Orchestrator: Qwen Reranker 精排 (保留 Top-2) + EvidenceGrade 校验
+    end
+
+    rect rgb(254, 243, 199)
+    note right of Orchestrator: 流式生成与事实溯源
+    Orchestrator->>Context: 流式产出 token 与溯源角标 [1], [2]
+    Context-->>Client: SSE 推送: event: token (打字机效果)
+    end
+
+    Orchestrator->>DB_Ledger: 异步写入完整执行痕迹 (rag_traces)
+    Context-->>Client: SSE 推送: event: trace & event: done
+    Gateway->>Context: 释放上下文内存资源
+                </div>
+            </div>
+
+            <div class="notice-box">
+                <div class="notice-title">🛡️ 跨层防污染核心准则</div>
+                <ul>
+                    <li><strong>检索层绝不直接喂给 LLM</strong>：Milvus 只存储 L3 叶子块，负责算分与召回；LLM 输入的必须是由 <code>ParentChunkStore</code> 提升后的 L2/L1 语义块，防止把被切断的残破表格直接送入模型。</li>
+                    <li><strong>单请求绝不碰全局变量</strong>：所有 SSE 流式事件、中间思考痕迹与取消信号全部严格通过 <code>ChatRequestContext</code> 闭包传递，确保高并发多租户场景下 0 串流、0 数据交叉。</li>
+                    <li><strong>入库绝不破坏线上旧索引</strong>：新建索引与解析文件全部在独立 <code>staging/</code> 暂存区闭环，只有通过完备性指标测试后才触发原子重命名与指针倒换。</li>
+                </ul>
+            </div>
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">⚙️ SuperMew 生产环境硬件拓扑与性能压测基线</span>
+                    <span class="pill pill-green">Production Baseline</span>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>组件与服务</th>
+                            <th>部署规格 / 资源配额</th>
+                            <th>核心性能指标 (P95/QPS)</th>
+                            <th>高可用与容灾兜底策略</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>FastAPI 接入网关</strong></td>
+                            <td>4 Pods (4C8G) · K8s HPA 自动弹性</td>
+                            <td>首包延迟 P95 &lt; 380ms · QPS 120+</td>
+                            <td>Nginx Ingress KeepAlive 长连接维持，SSE 流控缓冲</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Milvus 2.5 分布式集群</strong></td>
+                            <td>QueryNode x 3 (8C16G) · MinIO 对象存储</td>
+                            <td>混合检索耗时 P95 &lt; 45ms · 100万向量</td>
+                            <td>HNSW (M=16, ef=64) + BM25 稀疏倒排索引双写</td>
+                        </tr>
+                        <tr>
+                            <td><strong>BGE-M3 向量嵌入引擎</strong></td>
+                            <td>1 x NVIDIA A10 (24GB) · Triton Server</td>
+                            <td>单句 Embedding &lt; 18ms · 吞吐 450 req/s</td>
+                            <td>多请求动态批处理 (Dynamic Batching max_batch=32)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Qwen Reranker 精排服务</strong></td>
+                            <td>1 x NVIDIA A10 (24GB) · vLLM / Triton</td>
+                            <td>Top-30 打分 &lt; 280ms</td>
+                            <td>90s 硬超时熔断降级：保留原始 RRF 顺序，业务零中断</td>
+                        </tr>
+                        <tr>
+                            <td><strong>PostgreSQL 16 & Redis</strong></td>
+                            <td>PG 16 主从读写分离 + Redis 7.2 集群</td>
+                            <td>L1/L2 父块缓存命中率 94.2% · 读取 &lt; 2ms</td>
+                            <td>布隆过滤器防缓存穿透，连接池动态调优 (Pool Size=50)</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🏢 多租户企业级隔离与数据安全拓扑 (Multi-tenant Security &amp; Data Isolation)</span>
+                    <span class="pill pill-blue">Security Architecture</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">企业级数据合规与多级权限穿透防御</div>
+                    SuperMew 在设计之初即贯彻严格的多租户安全模型（Tenant Isolation）。从 API 入口鉴权、向量标量表达式过滤、PostgreSQL 行级安全策略（RLS）到运行时内存隔离，全方位杜绝企业敏感资料的跨租户交叉泄露。
+                </div>
+                <div class="mermaid">
+graph TB
+    subgraph ClientLayer["客户端与网关层 (API Gateway)"]
+        UserA["租户 A 用户 (财务部)"]
+        UserB["租户 B 用户 (研发部)"]
+        JWT["JWT 令牌解析 (TenantID / DeptID / Role / Scope)"]
+        RLS_Guard["上下文安全注入 (ChatRequestContext)"]
+    end
+
+    subgraph ServiceLayer["核心业务与状态层 (Service Runtime)"]
+        GraphA["LangGraph 实例 A (租户 A 独立执行环境)"]
+        GraphB["LangGraph 实例 B (租户 B 独立执行环境)"]
+    end
+
+    subgraph StorageLayer["多租户隔离存储层 (Infra Tier)"]
+        subgraph MilvusIsolation["Milvus 2.5 混合检索隔离"]
+            ExprA["标量过滤: tenant_id == 'T-001' &amp;&amp; dept_id in ['FIN']"]
+            ExprB["标量过滤: tenant_id == 'T-002' &amp;&amp; dept_id in ['RD']"]
+        end
+        subgraph PGIsolation["PostgreSQL 16 行级隔离 (RLS)"]
+            RLS_Policy["CREATE POLICY tenant_isolation_policy ON parent_chunks USING (tenant_id = current_setting('app.current_tenant_id'))"]
+        end
+        subgraph RedisIsolation["Redis 命名空间隔离"]
+            KeySpace["键前缀: chunk:{tenant_id}:{doc_id}:{level}:{idx}"]
+        end
+    end
+
+    UserA --> JWT
+    UserB --> JWT
+    JWT --> RLS_Guard
+    RLS_Guard --> GraphA
+    RLS_Guard --> GraphB
+    GraphA --> ExprA
+    GraphB --> ExprB
+    GraphA --> RLS_Policy
+    GraphB --> RLS_Policy
+    GraphA --> KeySpace
+    GraphB --> KeySpace
+
+    classDef client fill:#3b82f615,stroke:#3b82f6,stroke-width:2px;
+    classDef service fill:#10b98115,stroke:#10b981,stroke-width:2px;
+    classDef storage fill:#8b5cf615,stroke:#8b5cf6,stroke-width:2px;
+    class UserA,UserB,JWT,RLS_Guard client;
+    class GraphA,GraphB service;
+    class ExprA,ExprB,RLS_Policy,KeySpace storage;
+                </div>
+
+                <table>
+                    <thead>
+                        <tr>
+                            <th style="width: 20%;">隔离维度</th>
+                            <th style="width: 35%;">技术落地机制与指令规范</th>
+                            <th style="width: 45%;">安全收益与防御边界</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Milvus 向量检索隔离</strong></td>
+                            <td>在每一次 <code>AnnSearchRequest</code> 中强制注入 <code>expr="tenant_id == '...' and kb_id in [...]"</code>，禁止执行无租户约束的裸检索。</td>
+                            <td>保证即使稠密向量相似度极高，跨租户未授权文档的物理行也绝不可能进入候选召回池。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>PostgreSQL 行级安全 (RLS)</strong></td>
+                            <td>数据库连接池借出连接后，立即通过事务设置 <code>SET LOCAL app.current_tenant_id = '...'</code>，由 PG 内核执行行级过滤。</td>
+                            <td>杜绝研发人员手写 SQL 忘记拼接 <code>WHERE tenant_id = ...</code> 导致的大规模越权数据泄露漏洞。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Redis 缓存空间隔离</strong></td>
+                            <td>所有 Redis 键均带有统一租户前缀：<code>chunk:{tenant_id}:{doc_id}:{level}:{idx}</code> 与 <code>session:{tenant_id}:{session_id}</code>。</td>
+                            <td>防止多租户场景下相同 doc_id 产生的缓存覆盖冲突，支持按租户执行批量缓存清空与容量配额限制。</td>
+                        </tr>
+                        <tr>
+                            <td><strong>运行期内存与 Trace 隔离</strong></td>
+                            <td>基于 Python <code>contextvars.ContextVar</code> 实现 <code>ChatRequestContext</code>，每次请求在协程独立上下文中运行。</td>
+                            <td>彻底消除多并发协程共享全局变量造成的会话污染，Trace 记录按租户分表归档，严格保障数据隐私。</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+        </div>

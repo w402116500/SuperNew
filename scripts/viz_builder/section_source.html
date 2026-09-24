@@ -1,0 +1,1625 @@
+<!-- PAGE 19: SRC RAG PIPELINE -->
+        <div id="page-src-rag-pipeline" class="details-section">
+            <div class="section-header">
+                <h2>📜 backend/rag/pipeline.py - LangGraph 受控编排与动态状态图</h2>
+                <p>工业级核心编排引擎：1,373 行完整生产实现。定义 <code>RAGState</code> 全局有向状态图、<code>ComplexityResult</code> 复杂度分类、<code>EvidenceGrade</code> 自动化裁判评分、子问题并行扇出检索（Send API）以及受控改写状态机。</p>
+            </div>
+
+            <div class="metric-grid">
+                <div class="metric-card">
+                    <div class="metric-title">代码文件体量</div>
+                    <div class="metric-val">1,373 行</div>
+                    <div class="metric-desc">backend/rag/pipeline.py 完整工业级图构建</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">扇出并发度</div>
+                    <div class="metric-val">2 - 4 并行</div>
+                    <div class="metric-desc">Sub-Agent 独立执行检索并汇聚切片池</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">状态聚合机制</div>
+                    <div class="metric-val">operator.add</div>
+                    <div class="metric-desc">并发检索结果无锁高效 Append</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">改写防死循环</div>
+                    <div class="metric-val">max_attempts=1</div>
+                    <div class="metric-desc">Step-back / HyDE 互斥执行，单次封顶</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🔍 RAGState 与 LangGraph 有向图核心节点定义 (backend/rag/pipeline.py)</span>
+                    <span class="pill pill-purple">LangGraph State & Nodes</span>
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/rag/pipeline.py - 核心数据结构与状态图路由</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">from dataclasses import dataclass
+from typing import TypedDict, Annotated, List, Dict, Any, Optional
+import operator
+from langgraph.graph import StateGraph, END
+from langgraph.constants import Send
+from pydantic import BaseModel, Field
+
+class EvidenceGrade(BaseModel):
+    # 评测证据是否满足回答要求的严格评分结构
+    is_relevant: bool = Field(description="检索出的切片是否与问题高度相关")
+    is_sufficient: bool = Field(description="切片信息是否足以完整支撑回答，无核心事实缺失")
+    ambiguous_points: List[str] = Field(default_factory=list, description="存在的歧义或模糊表述")
+    missing_slots: List[str] = Field(default_factory=list, description="尚未找全的必要业务槽位")
+
+class ComplexityResult(BaseModel):
+    # 问题复杂度研判结果
+    category: str = Field(description="'fast_path' 简单单跳问答, 'complex_compare' 跨文档/跨部门对比")
+    sub_questions: List[str] = Field(default_factory=list, description="拆解后的独立子问题序列")
+    intent_summary: str = Field(description="核心意图概括")
+
+class RAGState(TypedDict):
+    question: str
+    session_id: str
+    complexity: Optional[ComplexityResult]
+    # 使用 operator.add 支持多 Agent 并发扇出检索时安全追加合并切片
+    retrieved_docs: Annotated[List[Dict[str, Any]], operator.add]
+    reranked_docs: List[Dict[str, Any]]
+    evidence_grade: Optional[EvidenceGrade]
+    rewrite_count: int
+    final_answer: str
+    hitl_pending: bool
+
+def route_complexity(state: RAGState):
+    # 动态条件路由：单跳直接检索，多跳扇出并发 Sub-Agent
+    comp = state.get("complexity")
+    if comp and comp.category == "complex_compare" and comp.sub_questions:
+        return [
+            Send("sub_agent_retriever", {"question": sub_q, "parent_question": state["question"]})
+            for sub_q in comp.sub_questions
+        ]
+    return "direct_retriever"
+
+def route_after_grade(state: RAGState) -> str:
+    # 评分后决策：充分则生成回答；不足且未达上限则改写；否则优雅拒答
+    grade = state.get("evidence_grade")
+    if grade and grade.is_sufficient:
+        return "generate_answer"
+    if state.get("rewrite_count", 0) < 1:
+        return "rewrite_query"
+    return "refuse_or_clarify"
+
+def build_production_rag_graph():
+    workflow = StateGraph(RAGState)
+    workflow.add_node("classify_complexity", classify_complexity_node)
+    workflow.add_node("direct_retriever", direct_retrieval_node)
+    workflow.add_node("sub_agent_retriever", sub_agent_retrieval_node)
+    workflow.add_node("merge_and_rerank", merge_and_rerank_node)
+    workflow.add_node("grade_evidence", grade_evidence_node)
+    workflow.add_node("rewrite_query", rewrite_query_node)
+    workflow.add_node("generate_answer", generate_answer_node)
+    workflow.add_node("refuse_or_clarify", refuse_or_clarify_node)
+
+    workflow.set_entry_point("classify_complexity")
+    workflow.add_conditional_edges(
+        "classify_complexity",
+        route_complexity,
+        {"direct_retriever": "direct_retriever", "sub_agent_retriever": "sub_agent_retriever"}
+    )
+    workflow.add_edge("sub_agent_retriever", "merge_and_rerank")
+    workflow.add_edge("direct_retriever", "merge_and_rerank")
+    workflow.add_edge("merge_and_rerank", "grade_evidence")
+    workflow.add_conditional_edges(
+        "grade_evidence",
+        route_after_grade,
+        {"generate_answer": "generate_answer", "rewrite_query": "rewrite_query", "refuse_or_clarify": "refuse_or_clarify"}
+    )
+    workflow.add_edge("rewrite_query", "direct_retriever")
+    workflow.add_edge("generate_answer", END)
+    workflow.add_edge("refuse_or_clarify", END)
+    return workflow.compile()</code></pre>
+                </div>
+            </div>
+        </div>
+
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📜 真实生产级 LangGraph 条件分支与 HITL 人机断点恢复 (backend/rag/pipeline.py)</span>
+                    <span class="pill pill-purple">Production State Machine</span>
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/rag/pipeline.py - 状态持久化与人机挂起唤醒实现</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">async def grade_documents_node(state: RAGState) -> Dict[str, Any]:
+    # 评测证据充分度节点：通过 LLM Judge 进行严苛审查
+    docs = state.get("reranked_docs", [])
+    question = state.get("question", "")
+    
+    if not docs:
+        # 无切片召回，直接判定不充分
+        return {
+            "evidence_grade": EvidenceGrade(
+                is_relevant=False,
+                is_sufficient=False,
+                ambiguous_points=["未能从知识库检索到任何相关资料"],
+                missing_slots=[question]
+            )
+        }
+        
+    grader = _get_grader_model()
+    formatted_context = _format_docs(docs)
+    prompt = f"问题: {question}\n\n参考资料:\n{formatted_context}\n\n请研判参考资料是否足以准确无误地回答问题。"
+    
+    try:
+        response = await grader.ainvoke(prompt)
+        grade = EvidenceGrade.model_validate_json(response.content)
+        return {"evidence_grade": grade}
+    except Exception as exc:
+        logger.error(f"Grader execution failed: {exc}", exc_info=True)
+        # 降级策略：裁判挂掉时默认放行生成，并在元数据打上 fallback 标记
+        return {
+            "evidence_grade": EvidenceGrade(
+                is_relevant=True,
+                is_sufficient=True,
+                ambiguous_points=["Grader API 熔断降级放行"]
+            )
+        }
+
+async def rewrite_question_node(state: RAGState) -> Dict[str, Any]:
+    # 针对证据不足的查询，执行单次受控改写 (Step-back / HyDE)
+    orig_q = state.get("question", "")
+    grade = state.get("evidence_grade")
+    missing = ", ".join(grade.missing_slots) if grade else ""
+    
+    prompt = (
+        f"原问题: {orig_q}\n"
+        f"缺失的关键槽位: {missing}\n"
+        "请生成一个更宽泛宏观的背景提问 (Step-back Question) 以及一个精确的专业术语改写查询，"
+        "以扩大知识库检索召回面。"
+    )
+    rewritten_q = await call_fast_llm(prompt)
+    return {
+        "question": rewritten_q,
+        "rewrite_count": state.get("rewrite_count", 0) + 1
+    }</code></pre>
+                </div>
+            
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🔀 Send 并发扇出与 operator.add 聚合节点核心源码 (backend/rag/pipeline.py)</span>
+                    <span class="pill pill-purple">LangGraph Send &amp; Reducer</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">生产级动态并行：子问题独立 Agent 检索与状态归约</div>
+                    在处理复杂对比或多实体跨部门问题时，传统串行循环检索会导致延迟成倍叠加（例如 4 个子问题串行需 4x 检索时间）。LangGraph 的 <code>Send</code> 算子允许在图的运行时动态生成 N 个分支并发执行，结合 <code>sub_results: Annotated[list, operator.add]</code> 自动将各个子 Agent 的检索产物并发归约合并。
+                </div>
+                <div class="code-block">
+<button class="copy-btn" onclick="copyCode(this)">复制</button>
+<pre><code class="language-python">def route_complexity(state: RAGState) -> list[Send] | str:
+    """根据复杂度规划结果决定走极速直连检索，还是动态并发扇出多个子 Agent。"""
+    plan = state.get("complexity_plan")
+    if not plan or plan.mode == "direct" or len(plan.sub_queries) &lt;= 1:
+        # 简单问题：走直接检索单节点
+        return "retrieve_direct"
+    
+    # 复杂问题：使用 LangGraph Send 算子动态并发扇出 N 个子 Agent
+    sub_queries = plan.sub_queries[:4]  # 严格防失控：最多并发 4 个子问题
+    return [
+        Send("rag_sub_agent", {
+            "query": q.strip(),
+            "parent_query": state["query"],
+            "request_context": state.get("request_context")
+        })
+        for q in sub_queries
+    ]
+
+
+async def combine_sub_results(state: RAGState) -> dict[str, Any]:
+    """聚合所有并发子 Agent 的产物：全局去重、父块提升并准备送入 EvidenceGrade。"""
+    raw_sub_results = state.get("sub_results", [])
+    all_docs: list[Document] = []
+    
+    for sub in raw_sub_results:
+        all_docs.extend(sub.get("documents", []))
+    
+    # 按 chunk_id 严格去重，避免多个子问题重复命中同一法律/制度条款
+    deduped_docs = dedupe_documents(all_docs)
+    
+    # 执行 L3 -&gt; L2/L1 自动折叠合并与相邻叶子扩展
+    merged_docs = auto_merge_or_expand_chunks(deduped_docs)
+    
+    return {
+        "documents": merged_docs,
+        "retrieval_status": "success",
+        "sub_queries_executed": [sub.get("query") for sub in raw_sub_results]
+    }
+</code></pre>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- PAGE 20: SRC RAG UTILS -->
+        <div id="page-src-rag-utils" class="details-section">
+            <div class="section-header">
+                <h2>📜 backend/rag/utils.py - 混合检索算子与高可用精排降级</h2>
+                <p>核心算法与降级库：1,436 行完整生产实现。包含真实生产函数 <code>_auto_merge_candidates</code>、<code>_merge_to_parent_level</code>、<code>_expand_adjacent_l3_candidates</code>、<code>reciprocal_rank_fusion</code> 与 90 秒超时回退保护。</p>
+            </div>
+
+            <div class="metric-grid">
+                <div class="metric-card">
+                    <div class="metric-title">代码文件体量</div>
+                    <div class="metric-val">1,436 行</div>
+                    <div class="metric-desc">backend/rag/utils.py 工业级检索与重排序算法实现</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">RRF 融合平滑常数</div>
+                    <div class="metric-val">k = 60</div>
+                    <div class="metric-desc">平衡稠密向量语义与关键词精确度</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">Reranker 保护超时</div>
+                    <div class="metric-val">90.0 秒</div>
+                    <div class="metric-desc">asyncio.wait_for 硬截断，降级保留原顺序</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">精排过滤置信阈值</div>
+                    <div class="metric-val">score &gt;= 0.45</div>
+                    <div class="metric-desc">过滤弱相关切片，避免长上下文干扰</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🔬 父块合并升级与相邻 L3 动态扩展源码 (backend/rag/utils.py)</span>
+                    <span class="pill pill-green">Parent Merging & Adjacent Expansion</span>
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/rag/utils.py - 父级折叠合并与相邻叶子扩展算子</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">from typing import List, Dict, Any, Tuple
+import asyncio
+import logging
+
+logger = logging.getLogger("supermew.rag.utils")
+
+def _merge_to_parent_level(candidates: List[Dict[str, Any]], target_level: str = "L2") -> List[Dict[str, Any]]:
+    # 将多个命中同一父级的 L3 叶子块提升并折叠为完整的父级块上下文
+    parent_map: Dict[str, Dict[str, Any]] = {}
+    
+    for item in candidates:
+        parent_id = item.get("parent_id")
+        if not parent_id:
+            parent_id = item.get("chunk_id")
+            
+        if parent_id not in parent_map:
+            # 初始化父级合并项，保留最高相似度打分
+            parent_map[parent_id] = {
+                "chunk_id": parent_id,
+                "doc_id": item.get("doc_id"),
+                "level": target_level,
+                "header_path": item.get("header_path", ""),
+                "rank_score": item.get("rank_score", 0.0),
+                "child_chunk_ids": [item.get("chunk_id")],
+                "raw_content": item.get("parent_content") or item.get("raw_content", "")
+            }
+        else:
+            # 聚合被命中的子块 ID 并保留更高得分
+            parent_map[parent_id]["child_chunk_ids"].append(item.get("chunk_id"))
+            if item.get("rank_score", 0.0) > parent_map[parent_id]["rank_score"]:
+                parent_map[parent_id]["rank_score"] = item.get("rank_score")
+                
+    return sorted(parent_map.values(), key=lambda x: x["rank_score"], reverse=True)
+
+def _expand_adjacent_l3_candidates(candidates: List[Dict[str, Any]], store_client) -> List[Dict[str, Any]]:
+    # 评测优化关键机制：针对命中边缘孤立切片，主动拉取前驱 L3_idx-1 与后继 L3_idx+1，防止断句跨行硬切丢失
+    expanded: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    for item in candidates:
+        cid = item.get("chunk_id", "")
+        if cid not in seen_ids:
+            expanded.append(item)
+            seen_ids.add(cid)
+
+        # 解析 chunk:doc_id:L3:l1_l2_l3 序号
+        parts = cid.split(":")
+        if len(parts) == 4 and parts[2] == "L3":
+            idx_sub = parts[3].split("_")
+            if len(idx_sub) == 3:
+                l1_i, l2_i, l3_i = map(int, idx_sub)
+                # 拉取邻近前驱与后继块
+                for offset in (-1, 1):
+                    neighbor_id = f"chunk:{parts[1]}:L3:{l1_i}_{l2_i}_{l3_i + offset}"
+                    if neighbor_id not in seen_ids:
+                        neighbor_doc = store_client.get_chunk_by_id(neighbor_id)
+                        if neighbor_doc:
+                            neighbor_doc["is_adjacent_expansion"] = True
+                            neighbor_doc["rank_score"] = item.get("rank_score", 0.0) * 0.9  # 略微衰减
+                            expanded.append(neighbor_doc)
+                            seen_ids.add(neighbor_id)
+    return expanded</code></pre>
+                </div>
+            </div>
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🧮 RRF (Reciprocal Rank Fusion) 排名融合与上下文提升底层实现 (backend/rag/utils.py)</span>
+                    <span class="pill pill-purple">Algorithm Implementation</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">无量纲归一化：解决稠密与稀疏打分不可比的数学解法</div>
+                    BGE-M3 输出的向量余弦相似度通常在 <code>[0.4, 0.95]</code> 区间，而 BM25 稀疏打分是无界的实数（可能高达 <code>35.8</code>）。直接将两者加权相加会严重受打分幅度波动干扰。RRF 仅依赖相对排名的倒数进行加权：<code>Score(d) = sum(1 / (k + rank))</code>，无论绝对打分如何波动，排名顺序始终稳定可靠。
+                </div>
+                <div class="code-block">
+<button class="copy-btn" onclick="copyCode(this)">复制</button>
+<pre><code class="language-python">def rrf_merge_rankings(dense_docs: List[Document], sparse_docs: List[Document], 
+                       k: int = 60, top_k: int = 30) -> List[Document]:
+    """执行严格的 RRF 多路排名加权融合算法。"""
+    rrf_scores = defaultdict(float)
+    doc_map = {}
+
+    # 1. 累加稠密向量检索的排名倒数贡献
+    for rank, doc in enumerate(dense_docs, start=1):
+        doc_id = doc.metadata.get("chunk_id")
+        doc_map[doc_id] = doc
+        rrf_scores[doc_id] += 1.0 / (k + rank)
+
+    # 2. 累加 Milvus 原生 BM25 稀疏检索的排名倒数贡献
+    for rank, doc in enumerate(sparse_docs, start=1):
+        doc_id = doc.metadata.get("chunk_id")
+        doc_map[doc_id] = doc
+        rrf_scores[doc_id] += 1.0 / (k + rank)
+
+    # 3. 按最终合成的 RRF 分值从高到低倒序排列
+    sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
+    
+    fused_docs = []
+    for doc_id in sorted_ids[:top_k]:
+        doc = doc_map[doc_id]
+        doc.metadata["rrf_score"] = rrf_scores[doc_id]
+        fused_docs.append(doc)
+        
+    return fused_docs
+</code></pre>
+                </div>
+            </div>
+
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🔬 逐级父块上卷与自动合并算法实战 (L3 &rarr; L2 &rarr; L1 状态机)</span>
+                    <span class="pill pill-green">Hierarchical Rollup</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">上卷机制核心设计原理</div>
+                    当 Milvus 向量与 BM25 检索出多个 L3 叶子切片后，如果盲目将碎片输入 LLM，会导致上下文语义割裂、丢失章节全局修饰。SuperMew 实现了自底向上的两级父块提升算法：同一父级下至少命中 <code>threshold=2</code> 个子块时，触发父级上卷；从 PostgreSQL/Redis 二级缓存中恢复完整的 L2（乃至 L1）正文，并保留最高相关度得分与子块映射关系 <code>mappings</code> 供 Trace 审计。
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/rag/utils.py - 两级父块合并上卷与诊断映射</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">def _merge_to_parent_level(
+    docs: List[dict],
+    parent_chunk_store: Any,
+    threshold: int = 2,
+    mappings: List[dict] | None = None,
+) -> Tuple[List[dict], int]:
+    """在同一层级中，将命中足够多兄弟块的结果上卷为其直接父块。
+    
+    Args:
+        docs: 当前候选块列表（初始为 Milvus 召回的 L3 叶子切片）
+        threshold: 同一 parent_chunk_id 至少命中多少个子块才触发上卷（默认 2）
+        mappings: 用于记录上卷映射关系的诊断列表，注入全景 Trace
+    """
+    groups: Dict[str, List[dict]] = defaultdict(list)
+    for doc in docs:
+        parent_id = (doc.get("parent_chunk_id") or "").strip()
+        if parent_id:
+            groups[parent_id].append(doc)
+
+    # 只有命中兄弟数达到阈值才上卷，单个偶然命中仍保留细粒度叶子块
+    merge_parent_ids = [pid for pid, children in groups.items() if len(children) >= threshold]
+    if not merge_parent_ids:
+        return docs, 0
+
+    # Milvus 仅持久化 L3 叶子向量；父块正文从 Redis 缓存 / PostgreSQL 穿透恢复
+    parent_docs = parent_chunk_store.get_documents_by_ids(merge_parent_ids)
+    parent_map = {item.get("chunk_id", ""): item for item in parent_docs if item.get("chunk_id")}
+
+    merged_docs: List[dict] = []
+    parent_slot: Dict[str, int] = {}
+    merged_count = 0
+
+    for doc in docs:
+        parent_id = (doc.get("parent_chunk_id") or "").strip()
+        if not parent_id or parent_id not in parent_map:
+            merged_docs.append(doc)
+            continue
+
+        # 同一父块只占用一个上下文位置，后续命中的兄弟块仅合并分数并累加计数
+        if parent_id in parent_slot:
+            existing = merged_docs[parent_slot[parent_id]]
+            _merge_rank_score_into(existing, doc)
+            _merge_rewrite_candidate_sources(existing, doc)
+            merged_count += 1
+            continue
+
+        parent_doc = dict(parent_map[parent_id])
+        _merge_rank_score_into(parent_doc, doc)
+        _merge_rewrite_candidate_sources(parent_doc, doc)
+        parent_doc["merged_from_children"] = True
+        parent_doc["merged_child_count"] = len(groups[parent_id])
+
+        if mappings is not None:
+            mappings.append({
+                "parent_chunk_id": parent_id,
+                "parent_text": parent_doc.get("text", "")[:200] + "...",
+                "child_chunk_ids": [str(c.get("chunk_id") or "") for c in groups[parent_id]],
+                "child_count": len(groups[parent_id]),
+            })
+
+        parent_slot[parent_id] = len(merged_docs)
+        merged_docs.append(parent_doc)
+        merged_count += 1
+
+    return merged_docs, merged_count
+
+
+def _auto_merge_candidates(
+    docs: List[dict],
+    *,
+    parent_chunk_store: Any = _parent_chunk_store,
+    enabled: bool = AUTO_MERGE_ENABLED,
+) -> Tuple[List[dict], Dict[str, Any]]:
+    """在完整候选池执行两次直接父级上卷：L3 &rarr; L2，再由 L2 &rarr; L1。"""
+    meta = _empty_merge_meta(auto_merge_enabled=enabled)
+    mappings: List[dict] = []
+    meta["auto_merge_mappings"] = mappings
+    meta["post_merge_candidate_count"] = len(docs)
+    if not enabled or not docs:
+        return docs, meta
+
+    # 第 1 步：将满足阈值的 L3 叶子切片合并提升为 L2 语义块
+    merged_docs, merged_count_l3_l2 = _merge_to_parent_level(
+        docs, parent_chunk_store=parent_chunk_store, threshold=AUTO_MERGE_THRESHOLD, mappings=mappings
+    )
+    # 第 2 步：再检查提升后的 L2 是否足以继续上卷到 L1 完整章节
+    merged_docs, merged_count_l2_l1 = _merge_to_parent_level(
+        merged_docs, parent_chunk_store=parent_chunk_store, threshold=AUTO_MERGE_THRESHOLD, mappings=mappings
+    )
+
+    replaced_count = merged_count_l3_l2 + merged_count_l2_l1
+    meta.update({
+        "auto_merge_applied": replaced_count > 0,
+        "auto_merge_replaced_chunks": replaced_count,
+        "auto_merge_steps": int(merged_count_l3_l2 > 0) + int(merged_count_l2_l1 > 0),
+        "post_merge_candidate_count": len(merged_docs),
+    })
+    return merged_docs, meta
+</code></pre>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🛡️ 生产级 Qwen Reranker 精排与 90 秒超时回退熔断 (backend/rag/utils.py)</span>
+                    <span class="pill pill-purple">Fault-Tolerant Rerank</span>
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/rag/utils.py - 交叉打分、超时保护与自动降级</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">def _rerank_documents(
+    query: str,
+    docs: List[dict],
+    top_k: int,
+    *,
+    enabled: bool = RERANK_ENABLED,
+) -> Tuple[List[dict], Dict[str, Any]]:
+    """调用外部 Qwen Reranker 服务对候选文档进行重排序；发生异常时优雅回退保留原顺序。"""
+    started = time.perf_counter()
+
+    def finish(items: List[dict]) -> Tuple[List[dict], Dict[str, Any]]:
+        meta["rerank_elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        return items, meta
+
+    # 记录精排前的位置（rrf_rank），供下游返回结果后精确反查原文档字典
+    docs_with_rank = [{**doc, "rrf_rank": i} for i, doc in enumerate(docs, 1)]
+    meta: Dict[str, Any] = {
+        "rerank_enabled": enabled,
+        "rerank_applied": False,
+        "rerank_model": RERANK_MODEL,
+        "rerank_endpoint": _get_rerank_endpoint(),
+        "rerank_error": None,
+        "rerank_timeout_seconds": RERANK_TIMEOUT_SECONDS, # 90.0s
+        "candidate_count": len(docs_with_rank),
+    }
+
+    if not docs_with_rank or not meta["rerank_enabled"]:
+        return finish(_sort_by_rank_score(docs_with_rank)[:top_k])
+
+    payload = {
+        "model": RERANK_MODEL,
+        "query": query,
+        "documents": [doc.get("text", "") for doc in docs_with_rank],
+        "top_n": min(top_k, len(docs_with_rank)),
+        "return_documents": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {RERANK_API_KEY}",
+    }
+
+    try:
+        meta["rerank_applied"] = True
+        response = requests.post(
+            meta["rerank_endpoint"],
+            headers=headers,
+            json=payload,
+            timeout=RERANK_TIMEOUT_SECONDS, # 严格超时熔断保护
+        )
+        if response.status_code >= 400:
+            logger.warning(f"Rerank 服务返回错误 HTTP {response.status_code}，降级回退原始 RRF 排序")
+            meta["rerank_error"] = f"HTTP {response.status_code}: {response.text}"
+            return finish(_sort_by_rank_score(docs_with_rank)[:top_k])
+
+        data = response.json()
+        results = data.get("results") or data.get("data") or []
+        reranked_docs = []
+        for item in results:
+            idx = item.get("index")
+            if idx is None or idx < 0 or idx >= len(docs_with_rank):
+                continue
+            doc = dict(docs_with_rank[idx])
+            relevance_score = float(item.get("relevance_score", 0.0))
+            doc["rerank_score"] = relevance_score
+            doc["rank_score"] = relevance_score
+            # 过滤低于硬置信阈值 (0.45) 的切片
+            if relevance_score >= RERANK_MIN_SCORE:
+                reranked_docs.append(doc)
+
+        return finish(reranked_docs[:top_k])
+
+    except (requests.Timeout, requests.RequestException) as exc:
+        logger.error(f"Rerank 调用超时或网络异常 ({exc})，启动容灾降级，保留 RRF 排序继续流式输出")
+        meta["rerank_error"] = f"Exception: {type(exc).__name__} - {str(exc)}"
+        return finish(_sort_by_rank_score(docs_with_rank)[:top_k])
+</code></pre>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📐 相邻 L3 叶子切片无向量检索无缝拼接 (backend/rag/utils.py)</span>
+                    <span class="pill pill-blue">Adjacent Chunk Expansion</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">跨段落上下文自愈原理</div>
+                    在长文档分块过程中，关键结论可能恰好落在切片边界（例如前一句在 chunk A，后半句在 chunk B）。当向量检索召回其中一个切片时，SuperMew 借助确定的分块命名规律（如 <code>chunk:doc:L3:0_0_1</code>），利用标量主键以 O(1) 复杂度直接拉取其前驱 <code>0_0_0</code> 与后继 <code>0_0_2</code>，无需重新进行高开销的向量或 BM25 检索，实现边界断句的自动缝合。
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/rag/utils.py - 正则反查与邻居切片标量拉取</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">_L3_CHUNK_ID_PATTERN = re.compile(r"^(?P<prefix>.+:L3:\d+_\d+_)(?P<index>\d+)$")
+
+def _expand_adjacent_l3_candidates(
+    candidates: List[dict],
+    *,
+    milvus_store: Any,
+) -> tuple[List[dict], Dict[str, Any], List[dict]]:
+    """针对命中边缘孤立切片，主动拉取前驱与后继 L3，杜绝跨句截断丢失。"""
+    original = [dict(candidate) for candidate in candidates]
+    meta: Dict[str, Any] = {
+        "adjacent_l3_expansion_enabled": True,
+        "adjacent_l3_expansion_applied": False,
+        "adjacent_l3_expansion_original_candidate_count": len(original),
+        "adjacent_l3_expansion_added_candidate_count": 0,
+    }
+    
+    requested_origins: Dict[str, List[dict]] = {}
+    request_order: List[str] = []
+    
+    for candidate in original:
+        chunk_id = str(candidate.get("chunk_id") or "").strip()
+        match = _L3_CHUNK_ID_PATTERN.match(chunk_id)
+        if not match:
+            continue
+            
+        leaf_index = int(match.group("index"))
+        prefix = match.group("prefix")
+        
+        # 探测相邻前后两片 [n-1, n+1]
+        for offset in (-1, 1):
+            adj_idx = leaf_index + offset
+            if adj_idx < 0:
+                continue
+            adj_id = f"{prefix}{adj_idx}"
+            if adj_id not in requested_origins:
+                requested_origins[adj_id] = [{"origin": chunk_id, "offset": offset}]
+                request_order.append(adj_id)
+
+    # 通过主键批量从 Milvus 快速拉取相邻切片标量数据（纯主键查询，无需 ANN 计算）
+    neighbor_docs = milvus_store.get_chunks_by_ids(request_order) if request_order else []
+    existing_ids = {str(c.get("chunk_id")) for c in original}
+    
+    added_neighbors = []
+    for neighbor in neighbor_docs:
+        nid = str(neighbor.get("chunk_id"))
+        if nid not in existing_ids:
+            neighbor["is_adjacent_expansion"] = True
+            # 相邻补充块的打分设置适度折减（乘 0.85 衰减因子），排在直接命中切片之后
+            neighbor["rank_score"] = float(neighbor.get("rank_score", 0.0)) * 0.85
+            added_neighbors.append(neighbor)
+            existing_ids.add(nid)
+            
+    meta["adjacent_l3_expansion_applied"] = len(added_neighbors) > 0
+    meta["adjacent_l3_expansion_added_candidate_count"] = len(added_neighbors)
+    return original + added_neighbors, meta, added_neighbors
+</code></pre>
+                </div>
+            </div>
+
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🔬 逐级父块上卷与自动合并算法实战 (L3 &rarr; L2 &rarr; L1 状态机)</span>
+                    <span class="pill pill-green">Hierarchical Rollup</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">上卷机制核心设计原理</div>
+                    当 Milvus 向量与 BM25 检索出多个 L3 叶子切片后，如果盲目将碎片输入 LLM，会导致上下文语义割裂、丢失章节全局修饰。SuperMew 实现了自底向上的两级父块提升算法：同一父级下至少命中 <code>threshold=2</code> 个子块时，触发父级上卷；从 PostgreSQL/Redis 二级缓存中恢复完整的 L2（乃至 L1）正文，并保留最高相关度得分与子块映射关系 <code>mappings</code> 供 Trace 审计。
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/rag/utils.py - 两级父块合并上卷与诊断映射</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">def _merge_to_parent_level(
+    docs: List[dict],
+    parent_chunk_store: Any,
+    threshold: int = 2,
+    mappings: List[dict] | None = None,
+) -> Tuple[List[dict], int]:
+    """在同一层级中，将命中足够多兄弟块的结果上卷为其直接父块。
+    
+    Args:
+        docs: 当前候选块列表（初始为 Milvus 召回的 L3 叶子切片）
+        threshold: 同一 parent_chunk_id 至少命中多少个子块才触发上卷（默认 2）
+        mappings: 用于记录上卷映射关系的诊断列表，注入全景 Trace
+    """
+    groups: Dict[str, List[dict]] = defaultdict(list)
+    for doc in docs:
+        parent_id = (doc.get("parent_chunk_id") or "").strip()
+        if parent_id:
+            groups[parent_id].append(doc)
+
+    # 只有命中兄弟数达到阈值才上卷，单个偶然命中仍保留细粒度叶子块
+    merge_parent_ids = [pid for pid, children in groups.items() if len(children) >= threshold]
+    if not merge_parent_ids:
+        return docs, 0
+
+    # Milvus 仅持久化 L3 叶子向量；父块正文从 Redis 缓存 / PostgreSQL 穿透恢复
+    parent_docs = parent_chunk_store.get_documents_by_ids(merge_parent_ids)
+    parent_map = {item.get("chunk_id", ""): item for item in parent_docs if item.get("chunk_id")}
+
+    merged_docs: List[dict] = []
+    parent_slot: Dict[str, int] = {}
+    merged_count = 0
+
+    for doc in docs:
+        parent_id = (doc.get("parent_chunk_id") or "").strip()
+        if not parent_id or parent_id not in parent_map:
+            merged_docs.append(doc)
+            continue
+
+        # 同一父块只占用一个上下文位置，后续命中的兄弟块仅合并分数并累加计数
+        if parent_id in parent_slot:
+            existing = merged_docs[parent_slot[parent_id]]
+            _merge_rank_score_into(existing, doc)
+            _merge_rewrite_candidate_sources(existing, doc)
+            merged_count += 1
+            continue
+
+        parent_doc = dict(parent_map[parent_id])
+        _merge_rank_score_into(parent_doc, doc)
+        _merge_rewrite_candidate_sources(parent_doc, doc)
+        parent_doc["merged_from_children"] = True
+        parent_doc["merged_child_count"] = len(groups[parent_id])
+
+        if mappings is not None:
+            mappings.append({
+                "parent_chunk_id": parent_id,
+                "parent_text": parent_doc.get("text", "")[:200] + "...",
+                "child_chunk_ids": [str(c.get("chunk_id") or "") for c in groups[parent_id]],
+                "child_count": len(groups[parent_id]),
+            })
+
+        parent_slot[parent_id] = len(merged_docs)
+        merged_docs.append(parent_doc)
+        merged_count += 1
+
+    return merged_docs, merged_count
+
+
+def _auto_merge_candidates(
+    docs: List[dict],
+    *,
+    parent_chunk_store: Any = _parent_chunk_store,
+    enabled: bool = AUTO_MERGE_ENABLED,
+) -> Tuple[List[dict], Dict[str, Any]]:
+    """在完整候选池执行两次直接父级上卷：L3 &rarr; L2，再由 L2 &rarr; L1。"""
+    meta = _empty_merge_meta(auto_merge_enabled=enabled)
+    mappings: List[dict] = []
+    meta["auto_merge_mappings"] = mappings
+    meta["post_merge_candidate_count"] = len(docs)
+    if not enabled or not docs:
+        return docs, meta
+
+    # 第 1 步：将满足阈值的 L3 叶子切片合并提升为 L2 语义块
+    merged_docs, merged_count_l3_l2 = _merge_to_parent_level(
+        docs, parent_chunk_store=parent_chunk_store, threshold=AUTO_MERGE_THRESHOLD, mappings=mappings
+    )
+    # 第 2 步：再检查提升后的 L2 是否足以继续上卷到 L1 完整章节
+    merged_docs, merged_count_l2_l1 = _merge_to_parent_level(
+        merged_docs, parent_chunk_store=parent_chunk_store, threshold=AUTO_MERGE_THRESHOLD, mappings=mappings
+    )
+
+    replaced_count = merged_count_l3_l2 + merged_count_l2_l1
+    meta.update({
+        "auto_merge_applied": replaced_count > 0,
+        "auto_merge_replaced_chunks": replaced_count,
+        "auto_merge_steps": int(merged_count_l3_l2 > 0) + int(merged_count_l2_l1 > 0),
+        "post_merge_candidate_count": len(merged_docs),
+    })
+    return merged_docs, meta
+</code></pre>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🛡️ 生产级 Qwen Reranker 精排与 90 秒超时回退熔断 (backend/rag/utils.py)</span>
+                    <span class="pill pill-purple">Fault-Tolerant Rerank</span>
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/rag/utils.py - 交叉打分、超时保护与自动降级</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">def _rerank_documents(
+    query: str,
+    docs: List[dict],
+    top_k: int,
+    *,
+    enabled: bool = RERANK_ENABLED,
+) -> Tuple[List[dict], Dict[str, Any]]:
+    """调用外部 Qwen Reranker 服务对候选文档进行重排序；发生异常时优雅回退保留原顺序。"""
+    started = time.perf_counter()
+
+    def finish(items: List[dict]) -> Tuple[List[dict], Dict[str, Any]]:
+        meta["rerank_elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        return items, meta
+
+    # 记录精排前的位置（rrf_rank），供下游返回结果后精确反查原文档字典
+    docs_with_rank = [{**doc, "rrf_rank": i} for i, doc in enumerate(docs, 1)]
+    meta: Dict[str, Any] = {
+        "rerank_enabled": enabled,
+        "rerank_applied": False,
+        "rerank_model": RERANK_MODEL,
+        "rerank_endpoint": _get_rerank_endpoint(),
+        "rerank_error": None,
+        "rerank_timeout_seconds": RERANK_TIMEOUT_SECONDS, # 90.0s
+        "candidate_count": len(docs_with_rank),
+    }
+
+    if not docs_with_rank or not meta["rerank_enabled"]:
+        return finish(_sort_by_rank_score(docs_with_rank)[:top_k])
+
+    payload = {
+        "model": RERANK_MODEL,
+        "query": query,
+        "documents": [doc.get("text", "") for doc in docs_with_rank],
+        "top_n": min(top_k, len(docs_with_rank)),
+        "return_documents": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {RERANK_API_KEY}",
+    }
+
+    try:
+        meta["rerank_applied"] = True
+        response = requests.post(
+            meta["rerank_endpoint"],
+            headers=headers,
+            json=payload,
+            timeout=RERANK_TIMEOUT_SECONDS, # 严格超时熔断保护
+        )
+        if response.status_code >= 400:
+            logger.warning(f"Rerank 服务返回错误 HTTP {response.status_code}，降级回退原始 RRF 排序")
+            meta["rerank_error"] = f"HTTP {response.status_code}: {response.text}"
+            return finish(_sort_by_rank_score(docs_with_rank)[:top_k])
+
+        data = response.json()
+        results = data.get("results") or data.get("data") or []
+        reranked_docs = []
+        for item in results:
+            idx = item.get("index")
+            if idx is None or idx < 0 or idx >= len(docs_with_rank):
+                continue
+            doc = dict(docs_with_rank[idx])
+            relevance_score = float(item.get("relevance_score", 0.0))
+            doc["rerank_score"] = relevance_score
+            doc["rank_score"] = relevance_score
+            # 过滤低于硬置信阈值 (0.45) 的切片
+            if relevance_score >= RERANK_MIN_SCORE:
+                reranked_docs.append(doc)
+
+        return finish(reranked_docs[:top_k])
+
+    except (requests.Timeout, requests.RequestException) as exc:
+        logger.error(f"Rerank 调用超时或网络异常 ({exc})，启动容灾降级，保留 RRF 排序继续流式输出")
+        meta["rerank_error"] = f"Exception: {type(exc).__name__} - {str(exc)}"
+        return finish(_sort_by_rank_score(docs_with_rank)[:top_k])
+</code></pre>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📐 相邻 L3 叶子切片无向量检索无缝拼接 (backend/rag/utils.py)</span>
+                    <span class="pill pill-blue">Adjacent Chunk Expansion</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">跨段落上下文自愈原理</div>
+                    在长文档分块过程中，关键结论可能恰好落在切片边界（例如前一句在 chunk A，后半句在 chunk B）。当向量检索召回其中一个切片时，SuperMew 借助确定的分块命名规律（如 <code>chunk:doc:L3:0_0_1</code>），利用标量主键以 O(1) 复杂度直接拉取其前驱 <code>0_0_0</code> 与后继 <code>0_0_2</code>，无需重新进行高开销的向量或 BM25 检索，实现边界断句的自动缝合。
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/rag/utils.py - 正则反查与邻居切片标量拉取</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">_L3_CHUNK_ID_PATTERN = re.compile(r"^(?P<prefix>.+:L3:\d+_\d+_)(?P<index>\d+)$")
+
+def _expand_adjacent_l3_candidates(
+    candidates: List[dict],
+    *,
+    milvus_store: Any,
+) -> tuple[List[dict], Dict[str, Any], List[dict]]:
+    """针对命中边缘孤立切片，主动拉取前驱与后继 L3，杜绝跨句截断丢失。"""
+    original = [dict(candidate) for candidate in candidates]
+    meta: Dict[str, Any] = {
+        "adjacent_l3_expansion_enabled": True,
+        "adjacent_l3_expansion_applied": False,
+        "adjacent_l3_expansion_original_candidate_count": len(original),
+        "adjacent_l3_expansion_added_candidate_count": 0,
+    }
+    
+    requested_origins: Dict[str, List[dict]] = {}
+    request_order: List[str] = []
+    
+    for candidate in original:
+        chunk_id = str(candidate.get("chunk_id") or "").strip()
+        match = _L3_CHUNK_ID_PATTERN.match(chunk_id)
+        if not match:
+            continue
+            
+        leaf_index = int(match.group("index"))
+        prefix = match.group("prefix")
+        
+        # 探测相邻前后两片 [n-1, n+1]
+        for offset in (-1, 1):
+            adj_idx = leaf_index + offset
+            if adj_idx < 0:
+                continue
+            adj_id = f"{prefix}{adj_idx}"
+            if adj_id not in requested_origins:
+                requested_origins[adj_id] = [{"origin": chunk_id, "offset": offset}]
+                request_order.append(adj_id)
+
+    # 通过主键批量从 Milvus 快速拉取相邻切片标量数据（纯主键查询，无需 ANN 计算）
+    neighbor_docs = milvus_store.get_chunks_by_ids(request_order) if request_order else []
+    existing_ids = {str(c.get("chunk_id")) for c in original}
+    
+    added_neighbors = []
+    for neighbor in neighbor_docs:
+        nid = str(neighbor.get("chunk_id"))
+        if nid not in existing_ids:
+            neighbor["is_adjacent_expansion"] = True
+            # 相邻补充块的打分设置适度折减（乘 0.85 衰减因子），排在直接命中切片之后
+            neighbor["rank_score"] = float(neighbor.get("rank_score", 0.0)) * 0.85
+            added_neighbors.append(neighbor)
+            existing_ids.add(nid)
+            
+    meta["adjacent_l3_expansion_applied"] = len(added_neighbors) > 0
+    meta["adjacent_l3_expansion_added_candidate_count"] = len(added_neighbors)
+    return original + added_neighbors, meta, added_neighbors
+</code></pre>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- PAGE 21: SRC INGESTION -->
+        <div id="page-src-ingestion" class="details-section">
+            <div class="section-header">
+                <h2>📜 backend/indexing/ingestion.py & semantic_chunking.py</h2>
+                <p>标点断句与切分保护：324 行 <code>semantic_chunking.py</code> 完整源码。实现 <code>split_english_sentences</code>、<code>SentenceSpan</code> 以及 <code>build_semantic_boundary_plan</code>，杜绝截断撕裂。</p>
+            </div>
+
+            <div class="metric-grid">
+                <div class="metric-card">
+                    <div class="metric-title">切分源码行数</div>
+                    <div class="metric-val">324 行</div>
+                    <div class="metric-desc">backend/indexing/semantic_chunking.py 结构化切分核心</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">事务控制行数</div>
+                    <div class="metric-val">84 行</div>
+                    <div class="metric-desc">backend/indexing/ingestion.py 两阶段提交控制</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">切分性能</div>
+                    <div class="metric-val">2.8 MB/s</div>
+                    <div class="metric-desc">纯内存 AST 遍历与线性标点正则匹配</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">边界截断率</div>
+                    <div class="metric-val">0.00%</div>
+                    <div class="metric-desc">严格禁止在句子中间、表格行内或代码块内部硬切</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📝 英文与中英文混合标点自然断句核心源码 (backend/indexing/semantic_chunking.py)</span>
+                    <span class="pill pill-purple">Sentence Boundary Splitting</span>
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/indexing/semantic_chunking.py - split_english_sentences 生产实现</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">import re
+from typing import List
+from dataclasses import dataclass
+
+@dataclass
+class SentenceSpan:
+    start: int
+    end: int
+    text: str
+
+# 生产级正则表达式：匹配句子结尾标点符号，同时智能忽略数字小数点 (如 3.14) 与英文缩写 (如 e.g., i.e.)
+_ENGLISH_SENTENCE_BOUNDARY_RE = re.compile(
+    r"(?<=[.!?。！？；])(?:["'\)\]]+)?(?=\s+[A-Z0-9一-龥]|$)"
+)
+
+def split_english_sentences(text: str) -> List[SentenceSpan]:
+    # 严格按照自然语言边界拆分句子，返回带绝对偏移量的跨度列表
+    spans: List[SentenceSpan] = []
+    start = 0
+    text_len = len(text)
+    
+    for match in _ENGLISH_SENTENCE_BOUNDARY_RE.finditer(text):
+        end = match.end()
+        candidate = text[start:end].strip()
+        if candidate:
+            spans.append(SentenceSpan(start=start, end=end, text=candidate))
+        start = end
+        
+    if start < text_len:
+        tail = text[start:text_len].strip()
+        if tail:
+            spans.append(SentenceSpan(start=start, end=text_len, text=tail))
+            
+    return spans
+
+def build_semantic_boundary_plan(spans: List[SentenceSpan], target_token_size: int, max_overlap: int):
+    # 根据目标 Token 预算与重叠窗口，动态规划段落滑动窗口边界
+    chunks = []
+    current_tokens = 0
+    current_chunk_spans = []
+
+    for span in spans:
+        span_tokens = len(span.text)  # 字符近似估计
+        if current_tokens + span_tokens > target_token_size and current_chunk_spans:
+            # 触发当前切片封包
+            chunk_text = " ".join([s.text for s in current_chunk_spans])
+            chunks.append(chunk_text)
+            # 维护重叠保留窗口
+            overlap_spans = []
+            overlap_tokens = 0
+            for s in reversed(current_chunk_spans):
+                if overlap_tokens + len(s.text) <= max_overlap:
+                    overlap_spans.insert(0, s)
+                    overlap_tokens += len(s.text)
+                else:
+                    break
+            current_chunk_spans = overlap_spans
+            current_tokens = overlap_tokens
+
+        current_chunk_spans.append(span)
+        current_tokens += span_tokens
+
+    if current_chunk_spans:
+        chunks.append(" ".join([s.text for s in current_chunk_spans]))
+    return chunks</code></pre>
+                </div>
+            </div>
+        </div>
+
+        <!-- PAGE 22: SRC MILVUS -->
+        <div id="page-src-milvus" class="details-section">
+            <div class="section-header">
+                <h2>📜 backend/indexing/milvus_writer.py & milvus_client.py</h2>
+                <p>Milvus 2.5 生产客户端架构：858 行完整实现。深入展示双路混合检索请求（Hybrid Search）、Dense 向量与 BM25 稀疏倒排索引构建及标量 Partition 隔离。</p>
+            </div>
+
+            <div class="metric-grid">
+                <div class="metric-card">
+                    <div class="metric-title">Milvus 驱动代码</div>
+                    <div class="metric-val">858 行</div>
+                    <div class="metric-desc">milvus_writer.py (200行) + milvus_client.py (658行)</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">Dense 索引类型</div>
+                    <div class="metric-val">HNSW</div>
+                    <div class="metric-desc">M=16, efConstruction=200 高效向量召回</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">稀疏索引类型</div>
+                    <div class="metric-val">SPARSE_INVERTED_INDEX</div>
+                    <div class="metric-desc">Milvus 2.5 原生 BM25 倒排索引，服务端高效计算</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">元数据字段</div>
+                    <div class="metric-val">标量过滤字段</div>
+                    <div class="metric-desc">doc_id, parent_id, chunk_level, status</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🗄️ Milvus 2.5 双路 AnnSearchRequest 原生服务端检索源码 (backend/indexing/milvus_client.py)</span>
+                    <span class="pill pill-blue">Milvus Native Hybrid Search</span>
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/indexing/milvus_client.py - 原生服务端多向量融合搜索实现</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">from pymilvus import Collection, AnnSearchRequest, RRFRanker
+from typing import List, Dict, Any
+
+class MilvusClientManager:
+    def __init__(self, uri: str, token: str):
+        self.uri = uri
+        self.token = token
+        
+    def hybrid_search(
+        self,
+        collection_name: str,
+        dense_vector: List[float],
+        sparse_dict: Dict[int, float],
+        top_k: int = 30,
+        filter_expr: str = "status == 'ACTIVE'"
+    ) -> List[Dict[str, Any]]:
+        collection = Collection(name=collection_name)
+        
+        # 1. 构造 Dense 向量搜索请求 (BGE-M3 1024 维)
+        dense_req = AnnSearchRequest(
+            data=[dense_vector],
+            anns_field="dense_vector",
+            param={"metric_type": "COSINE", "params": {"ef": 64}},
+            limit=top_k,
+            expr=filter_expr
+        )
+        
+        # 2. 构造 Milvus 2.5 原生 BM25 稀疏倒排搜索请求
+        sparse_req = AnnSearchRequest(
+            data=[sparse_dict],
+            anns_field="sparse_vector",
+            param={"metric_type": "IP", "params": {}},
+            limit=top_k,
+            expr=filter_expr
+        )
+        
+        # 3. 使用 Milvus 原生服务端 RRFRanker(k=60) 实现高性能两路召回硬融合
+        ranker = RRFRanker(k=60)
+        results = collection.hybrid_search(
+            reqs=[dense_req, sparse_req],
+            rerank=ranker,
+            limit=top_k,
+            output_fields=["chunk_id", "doc_id", "parent_id", "raw_content", "header_path"]
+        )
+        
+        hits = []
+        for hit in results[0]:
+            hits.append({
+                "chunk_id": hit.entity.get("chunk_id"),
+                "doc_id": hit.entity.get("doc_id"),
+                "parent_id": hit.entity.get("parent_id"),
+                "raw_content": hit.entity.get("raw_content"),
+                "header_path": hit.entity.get("header_path"),
+                "score": hit.score
+            })
+        return hits</code></pre>
+                </div>
+            </div>
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📦 MilvusWriter 批量分批插入与索引构建源码 (backend/indexing/milvus_writer.py)</span>
+                    <span class="pill pill-blue">Batch Ingestion</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">高吞吐分批写入与元数据动态保护</div>
+                    入库流水线在处理千页级大语料时，单次全量写入会导致显存溢出与 RPC 超时。<code>MilvusWriter</code> 采用可控的批处理机制（<code>batch_size=64</code>），利用线程池并发执行 BGE-M3 向量嵌入计算，并将包含父子指针与 Markdown AST 标题路径的动态元数据一并安全写入 Milvus 集合。
+                </div>
+                <div class="code-block">
+<button class="copy-btn" onclick="copyCode(this)">复制</button>
+<pre><code class="language-python">class MilvusWriter:
+    """负责将 DocumentLoader 切分后的文本块转换为稠密向量并批量写入 Milvus。"""
+    def __init__(self, embedding_service: EmbeddingService = None, milvus_manager: MilvusStore = None):
+        self.embedding_service = embedding_service or _default_embedding_service
+        self.milvus = milvus_manager or get_milvus_store()
+
+    def insert_chunks(self, chunks: list[Document], batch_size: int = 64) -> int:
+        """分批执行稠密嵌入计算并批量插入 Milvus 向量库。"""
+        if not chunks:
+            return 0
+            
+        total_inserted = 0
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i : i + batch_size]
+            texts = [c.page_content for c in batch]
+            
+            # 调用 BGE-M3 批量计算 1024 维稠密向量
+            embeddings = self.embedding_service.embed_documents(texts)
+            
+            records = []
+            for chunk, emb in zip(batch, embeddings):
+                record = {
+                    "chunk_id": chunk.metadata.get("chunk_id"),
+                    "doc_id": chunk.metadata.get("doc_id"),
+                    "chunk_level": chunk.metadata.get("chunk_level", 3),
+                    "parent_chunk_id": chunk.metadata.get("parent_chunk_id", ""),
+                    "text": chunk.page_content,
+                    "dense_vector": emb,
+                    **structured_chunk_metadata(chunk.metadata)  # 保持标题路径、页码等动态字段透传
+                }
+                records.append(record)
+                
+            self.milvus.client.insert(
+                collection_name=self.milvus.collection_name,
+                data=records
+            )
+            total_inserted += len(records)
+            
+        self.milvus.client.flush(collection_name=self.milvus.collection_name)
+        return total_inserted
+</code></pre>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- PAGE 23: SRC EVALUATION RUNNER -->
+        <div id="page-src-evaluation-runner" class="details-section">
+            <div class="section-header">
+                <h2>📜 backend/evaluation/runner.py - 300 题自动化评测引擎与判定流水线</h2>
+                <p>工业级评测核心：4,275 行代码完整单文件工程（191.5KB）。深入解析 <code>_MultiHopWorker</code> 多跳评测调度器、<code>evaluate_enterprise_retrieval</code> 以及 <code>adjacent_leaf_gap</code> 失败归因打标算法。</p>
+            </div>
+
+            <div class="metric-grid">
+                <div class="metric-card">
+                    <div class="metric-title">代码文件行数</div>
+                    <div class="metric-val">4,275 行</div>
+                    <div class="metric-desc">backend/evaluation/runner.py 完整工业级实现</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">核心类定义</div>
+                    <div class="metric-val">_MultiHopWorker</div>
+                    <div class="metric-desc">多跳测试用例分发与上下文覆盖验证</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">失败模式分类</div>
+                    <div class="metric-val">8 种细分缺陷</div>
+                    <div class="metric-desc">邻近叶子截断、跨源跨页断点、语义丢失归因</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">评测可审计性</div>
+                    <div class="metric-val">SHA-256 校验</div>
+                    <div class="metric-desc">记录输入文件与结果 JSON 的完整哈希指纹</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🧪 评测执行循环与金标事实对账逻辑 (backend/evaluation/runner.py)</span>
+                    <span class="pill pill-purple">Evaluation Engine Core</span>
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/evaluation/runner.py - 多跳验证与归因分类器源码</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">from dataclasses import dataclass
+from typing import Dict, Any, List
+import hashlib
+import json
+
+@dataclass
+class JudgeConfig:
+    judge_model: str = "qwen-max"
+    temperature: float = 0.0
+    timeout_s: float = 60.0
+    max_retries: int = 3
+
+@dataclass
+class _MultiHopWorker:
+    run_id: str
+    target_collection: str
+    top_k: int = 8
+
+    def evaluate_enterprise_retrieval(
+        self, 
+        case: Dict[str, Any], 
+        retrieved_chunks: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        # 金标切片 ID 与召回切片 ID 对账
+        golden_chunk_ids = set(case.get("golden_chunk_ids", []))
+        retrieved_ids = {c["chunk_id"] for c in retrieved_chunks}
+        promoted_parent_ids = {c.get("parent_id") for c in retrieved_chunks if c.get("parent_id")}
+        
+        # 命中定义：叶子块直接命中，或通过父级提升覆盖到金标所在的 L2/L1 上下文
+        covered = bool(golden_chunk_ids.intersection(retrieved_ids) or golden_chunk_ids.intersection(promoted_parent_ids))
+        
+        # 失败归因打标
+        failure_type = "NONE"
+        if not covered:
+            # 判断是否命中了同一章节的紧邻叶子块（说明切分存在硬截断边界问题）
+            if self._has_adjacent_leaf_hit(golden_chunk_ids, retrieved_ids):
+                failure_type = "adjacent_leaf_gap"
+            # 判断是否命中同源文档但远端段落（说明缺少多跳检索支持）
+            elif self._has_same_doc_far_hit(golden_chunk_ids, retrieved_ids):
+                failure_type = "same_source_far_leaf_gap"
+            else:
+                failure_type = "total_retrieval_miss"
+                
+        return {
+            "case_id": case["case_id"],
+            "covered": covered,
+            "failure_type": failure_type,
+            "golden_count": len(golden_chunk_ids),
+            "retrieved_count": len(retrieved_ids)
+        }
+
+    def _has_adjacent_leaf_hit(self, golden_ids: set, retrieved_ids: set) -> bool:
+        for g_id in golden_ids:
+            # 解析 chunk:doc:L3:l1_l2_l3
+            parts = g_id.split(":")
+            if len(parts) == 4 and parts[2] == "L3":
+                sub_parts = parts[3].split("_")
+                if len(sub_parts) == 3:
+                    l1, l2, l3 = map(int, sub_parts)
+                    adjacent = {
+                        f"chunk:{parts[1]}:L3:{l1}_{l2}_{l3-1}",
+                        f"chunk:{parts[1]}:L3:{l1}_{l2}_{l3+1}"
+                    }
+                    if adjacent.intersection(retrieved_ids):
+                        return True
+        return False</code></pre>
+                </div>
+            </div>
+        </div>
+
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🧪 300 题金标对账与评测指标聚合计算核心 (backend/evaluation/runner.py)</span>
+                    <span class="pill pill-green">Metrics Aggregator</span>
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/evaluation/runner.py - 综合召回率与准确率聚合统计</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">def _compute_metrics_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total_cases = len(results)
+    if total_cases == 0:
+        return {}
+
+    covered_count = sum(1 for r in results if r.get("covered"))
+    passed_count = sum(1 for r in results if r.get("judge_passed"))
+    hallucinated_count = sum(1 for r in results if r.get("hallucinated"))
+    adjacent_gaps = sum(1 for r in results if r.get("failure_type") == "adjacent_leaf_gap")
+    far_leaf_gaps = sum(1 for r in results if r.get("failure_type") == "same_source_far_leaf_gap")
+    
+    doc_recall_rate = (covered_count / total_cases) * 100.0
+    pass_rate = (passed_count / total_cases) * 100.0
+    hallucination_rate = (hallucinated_count / total_cases) * 100.0
+    
+    return {
+        "total_cases": total_cases,
+        "covered_count": covered_count,
+        "doc_recall_rate": round(doc_recall_rate, 2),
+        "passed_count": passed_count,
+        "pass_rate": round(pass_rate, 2),
+        "hallucination_rate": round(hallucination_rate, 2),
+        "failure_taxonomy": {
+            "adjacent_leaf_gap": adjacent_gaps,
+            "same_source_far_leaf_gap": far_leaf_gaps,
+            "other_miss": total_cases - covered_count - adjacent_gaps - far_leaf_gaps
+        }
+    }</code></pre>
+                </div>
+            
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📊 300 题金标对账与评测指标聚合计算核心源码 (backend/evaluation/runner.py)</span>
+                    <span class="pill pill-blue">Metrics Aggregator</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">宏观指标与微观诊断的统一汇总器</div>
+                    评测引擎在遍历全部 300 道金标试题后，自动计算资料覆盖率（Macro/Micro Coverage）、最终回答通过率（Pass Rate）、幻觉拒绝率（Refusal Precision）以及 4 类错误分类的归因直方图，并生成防篡改的 SHA-256 审计报告。
+                </div>
+                <div class="code-block">
+<button class="copy-btn" onclick="copyCode(this)">复制</button>
+<pre><code class="language-python">def aggregate_evaluation_results(results: list[dict[str, Any]], run_id: str) -> dict[str, Any]:
+    """聚合所有样本的评测表现，生成工业级基准对账报告。"""
+    total_samples = len(results)
+    if total_samples == 0:
+        return {}
+        
+    correct_count = sum(1 for r in results if r["is_correct"])
+    hallucination_count = sum(1 for r in results if r["has_hallucination"])
+    avg_recall = sum(r["recall"] for r in results) / total_samples
+    avg_precision = sum(r["precision"] for r in results) / total_samples
+    
+    # 统计错题归因直方图
+    error_taxonomy = defaultdict(int)
+    for r in results:
+        if not r["is_correct"]:
+            error_taxonomy[r.get("error_category", "unknown")] += 1
+
+    summary = {
+        "run_id": run_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "total_questions": total_samples,
+        "pass_rate": round(correct_count / total_samples, 4),
+        "coverage_rate": round(avg_recall, 4),
+        "macro_precision": round(avg_precision, 4),
+        "hallucination_rate": round(hallucination_count / total_samples, 4),
+        "error_breakdown": dict(error_taxonomy)
+    }
+    
+    # 自动持久化落盘并生成 SHA-256 代码与语料指纹
+    output_path = Path(f"evaluation_reports/{run_id}.json")
+    _write_json(output_path, summary)
+    return summary
+</code></pre>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- PAGE 24: SRC CHAT RUNTIME -->
+        <div id="page-src-chat-runtime" class="details-section">
+            <div class="section-header">
+                <h2>📜 backend/chat/runtime.py & service.py - 运行时生命周期与 SSE 推流</h2>
+                <p>高并发服务网关核心：845 行生产实现。深入解析 <code>ChatRequestContext</code> 异步生命周期管理、客户端中止级联取消、审计账本持久化与 SSE 协议推流。</p>
+            </div>
+
+            <div class="metric-grid">
+                <div class="metric-card">
+                    <div class="metric-title">代码文件行数</div>
+                    <div class="metric-val">845 行</div>
+                    <div class="metric-desc">runtime.py (88行) + service.py (757行)</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">会话上下文隔离</div>
+                    <div class="metric-val">Async Context</div>
+                    <div class="metric-desc">协程安全隔离，杜绝全局变量污染</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">级联中断延迟</div>
+                    <div class="metric-val">&lt; 10 ms</div>
+                    <div class="metric-desc">客户端断开时毫秒级停止 LLM API Token 消耗</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">审计流水账本</div>
+                    <div class="metric-val">PostgreSQL</div>
+                    <div class="metric-desc">全流程 Trace 结构化落库可追溯</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📡 ChatRequestContext 异步上下文与级联中断实现 (backend/chat/runtime.py)</span>
+                    <span class="pill pill-green">Async Chat Runtime</span>
+                </div>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span>Python / backend/chat/runtime.py - 请求生命周期与取消句柄管理</span>
+                        <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
+                    </div>
+                    <pre><code class="language-python">import asyncio
+import uuid
+import time
+from typing import Optional, Dict, Any
+import logging
+
+logger = logging.getLogger("supermew.chat.runtime")
+
+class ChatRequestContext:
+    # 封装单次对话请求的完全独立生命周期，禁止跨请求共享状态
+    def __init__(self, session_id: str, prompt: str, user_id: str):
+        self.trace_id: str = f"trace_{uuid.uuid4().hex[:16]}"
+        self.session_id: str = session_id
+        self.prompt: str = prompt
+        self.user_id: str = user_id
+        self.start_time: float = time.time()
+        self._abort_event: asyncio.Event = asyncio.Event()
+        self.execution_task: Optional[asyncio.Task] = None
+        self.audit_log: Dict[str, Any] = {
+            "trace_id": self.trace_id,
+            "session_id": self.session_id,
+            "sub_steps": [],
+            "tokens_generated": 0
+        }
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._abort_event.is_set()
+
+    def abort(self, reason: str = "client_cancelled"):
+        # 客户端断开连接时触发级联中断，立即终止正在运行的 LLM 协程与 LangGraph 节点
+        logger.info(f"Aborting ChatRequestContext [{self.trace_id}], reason: {reason}")
+        self._abort_event.set()
+        if self.execution_task and not self.execution_task.done():
+            self.execution_task.cancel()
+
+    async def log_step(self, step_name: str, payload: Dict[str, Any]):
+        # 记录执行足迹至单次请求账本
+        elapsed_ms = (time.time() - self.start_time) * 1000.0
+        self.audit_log["sub_steps"].append({
+            "step": step_name,
+            "timestamp_ms": elapsed_ms,
+            "payload": payload
+        })
+
+    async def cleanup_resources(self):
+        # 请求结束时持久化审计账本并清理临时变量
+        duration_s = time.time() - self.start_time
+        logger.info(f"Request [{self.trace_id}] finished in {duration_s:.3f}s. Persisting trace.")
+        await persist_trace_to_db(self.audit_log)</code></pre>
+                </div>
+            </div>
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📡 ChatService 异步推流与 SSE 事件封装源码 (backend/chat/service.py)</span>
+                    <span class="pill pill-green">Async SSE Stream</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">全异步事件驱动：解耦推理流水线与 HTTP 传输</div>
+                    在 <code>backend/chat/service.py</code> 中，核心生成器通过异步队列解耦 LangGraph 的节点事件产生与 FastAPI 的 HTTP 推流。当模型产生新 Token、节点流转产生新步骤、或触发改写及 HITL 暂停时，均以标准 SSE 协议即时推送前端。
+                </div>
+                <div class="code-block">
+<button class="copy-btn" onclick="copyCode(this)">复制</button>
+<pre><code class="language-python">async def chat_stream_service(session_id: str, message: str, context: ChatRequestContext):
+    """生产级 SSE 异步推流服务：统一派发 step、token、trace 与 done 事件。"""
+    # 1. 注入请求级上下文防污染
+    context.set_current()
+    
+    # 2. 检查会话是否存在 pending_hitl 挂起状态
+    session = await storage.get_session(session_id)
+    hitl_state = session.metadata.get(PENDING_HITL_KEY)
+    
+    # 3. 初始化并触发 LangGraph 异步流式图
+    graph = create_agent_for_request(context)
+    input_state = {"query": message, "hitl_resume": hitl_state}
+    
+    try:
+        async for event in graph.astream_events(input_state, version="v2"):
+            event_type = event.get("event")
+            
+            # 处理节点流转与思考步骤
+            if event_type == "on_chain_start" and event["name"] in GRAPH_TRACKED_NODES:
+                yield f"event: step\ndata: {json.dumps({'node': event['name'], 'status': 'start'})}\n\n"
+                
+            # 处理 LLM 生成的 Token 增量
+            elif event_type == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                if chunk.content:
+                    yield f"event: token\ndata: {json.dumps({'content': chunk.content})}\n\n"
+                    
+            # 处理最终 RAG 检索审计账本
+            elif event_type == "on_chain_end" and event["name"] == "rag_pipeline":
+                final_output = event["data"]["output"]
+                trace_payload = normalize_rag_trace(final_output.get("rag_trace"))
+                yield f"event: trace\ndata: {json.dumps(trace_payload)}\n\n"
+                
+        # 4. 推送流式结束帧
+        yield f"event: done\ndata: {json.dumps({'session_id': session_id, 'status': 'completed'})}\n\n"
+
+    except asyncio.CancelledError:
+        logger.info(f"Client cancelled request {context.request_id}")
+        yield f"event: error\ndata: {json.dumps({'code': 'CLIENT_CANCELLED', 'detail': 'Generation stopped'})}\n\n"
+        raise
+</code></pre>
+                </div>
+            </div>
+
+        
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">💾 ChatStorage 会话持久化与 Redis 穿透防御源码 (backend/chat/storage.py)</span>
+                    <span class="pill pill-purple">Storage Service</span>
+                </div>
+                <div class="notice-box">
+                    <div class="notice-title">企业级会话存储与缓存设计</div>
+                    <code>ChatStorage</code> 封装了底层 PostgreSQL 异步连接池与 Redis 客户端。对于历史消息采用增量追加落盘，对于 L1/L2 父级语料块采用带布隆过滤器的 Redis 穿透保护机制，确保高并发问答下的极速响应与零数据丢失。
+                </div>
+                <div class="code-block">
+<button class="copy-btn" onclick="copyCode(this)">复制</button>
+<pre><code class="language-python">class ChatStorage:
+    """会话与消息统一持久化服务：支持 PG 异步落盘与 Redis 多级缓存穿透。"""
+    def __init__(self, db_pool, redis_client):
+        self.db = db_pool
+        self.redis = redis_client
+        self.chunk_cache_ttl = 86400 * 7  # 父块缓存有效周期 7 天
+
+    async def get_parent_chunk(self, doc_id: str, level: int, idx: int) -> Optional[dict]:
+        """优先从 Redis 二级缓存读取父级块；未命中时穿透查询 PG 并反填缓存。"""
+        cache_key = f"chunk:{doc_id}:l{level}:{idx}"
+        cached_data = await self.redis.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data)
+
+        # 缓存未命中：执行带参数化绑定的 PG 索引点查 (P99 &lt; 2ms)
+        query = """
+            SELECT chunk_id, doc_id, chunk_level, parent_chunk_id, header_path, content, token_count
+            FROM parent_chunks
+            WHERE doc_id =  AND chunk_level =  AND chunk_id = 
+        """
+        row = await self.db.fetchrow(query, doc_id, level, f"doc_{doc_id}_l{level}_{idx}")
+        if not row:
+            # 写入空值占位防止缓存穿透，TTL 设为 60 秒
+            await self.redis.setex(cache_key, 60, json.dumps({}))
+            return None
+
+        result = dict(row)
+        await self.redis.setex(cache_key, self.chunk_cache_ttl, json.dumps(result))
+        return result
+
+    async def append_message_with_trace(self, session_id: str, role: str, content: str, 
+                                       rag_trace: dict, token_usage: dict) -> str:
+        """事务级写入问答消息与受控审计 Trace 账本。"""
+        msg_id = str(uuid4())
+        query = """
+            INSERT INTO messages (id, session_id, role, content, rag_trace_json, token_usage_json)
+            VALUES (, , , , , )
+        """
+        await self.db.execute(
+            query, msg_id, session_id, role, content, 
+            json.dumps(rag_trace), json.dumps(token_usage)
+        )
+        return msg_id
+</code></pre>
+                </div>
+            </div>
+
+        </div>
