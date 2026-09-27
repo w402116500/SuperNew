@@ -719,4 +719,318 @@ CSS_CONTENT = """
                 padding: 12px;
             }
         }
+
+        /* ===== 全屏图表/图片灯箱查看器 (Diagram & Image Lightbox) ===== */
+        .diagram-wrapper {
+            position: relative;
+            width: 100%;
+            border-radius: 10px;
+        }
+
+        .diagram-zoom-trigger {
+            position: absolute;
+            top: 10px;
+            right: 12px;
+            z-index: 8;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            font-size: 12px;
+            font-weight: 600;
+            line-height: 1;
+            color: #0284c7;
+            background: rgba(255, 255, 255, 0.92);
+            border: 1px solid rgba(2, 132, 199, 0.25);
+            border-radius: 8px;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+            transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+            backdrop-filter: blur(6px);
+            -webkit-backdrop-filter: blur(6px);
+            user-select: none;
+        }
+
+        .diagram-zoom-trigger:hover {
+            background: #0284c7;
+            color: #ffffff;
+            border-color: #0284c7;
+            box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);
+            transform: translateY(-1px);
+        }
+
+        .diagram-zoom-trigger:active {
+            transform: translateY(0);
+        }
+
+        .diagram-zoom-trigger svg {
+            width: 13px;
+            height: 13px;
+            stroke-width: 2.2;
+        }
+
+        /* 全屏灯箱主体 */
+        .lightbox-modal {
+            position: fixed;
+            inset: 0;
+            z-index: 100000;
+            display: flex;
+            flex-direction: column;
+            background: rgba(8, 12, 22, 0.92);
+            backdrop-filter: blur(18px);
+            -webkit-backdrop-filter: blur(18px);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .lightbox-modal.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .lightbox-backdrop {
+            position: absolute;
+            inset: 0;
+            z-index: 1;
+        }
+
+        /* 顶部导航控制 */
+        .lightbox-header {
+            position: relative;
+            z-index: 10;
+            height: 54px;
+            padding: 0 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: rgba(15, 23, 42, 0.7);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            color: #f8fafc;
+        }
+
+        .lightbox-title-area {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+            max-width: 70%;
+        }
+
+        .lightbox-icon {
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+
+        .lightbox-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: #f1f5f9;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .lightbox-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+
+        .lightbox-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            font-size: 13px;
+            font-weight: 550;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            color: #e2e8f0;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .lightbox-btn:hover {
+            background: rgba(255, 255, 255, 0.18);
+            color: #ffffff;
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+
+        .lightbox-btn-close:hover {
+            background: rgba(239, 68, 68, 0.25);
+            color: #fca5a5;
+            border-color: rgba(239, 68, 68, 0.4);
+        }
+
+        /* 视口舞台 */
+        .lightbox-viewport {
+            flex: 1;
+            position: relative;
+            z-index: 5;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: grab;
+            user-select: none;
+            touch-action: none;
+        }
+
+        .lightbox-viewport.grabbing {
+            cursor: grabbing;
+        }
+
+        .lightbox-stage {
+            position: absolute;
+            transform-origin: center center;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            will-change: transform;
+            transition: transform 0.05s ease-out;
+        }
+
+        .lightbox-stage-canvas {
+            background: #ffffff;
+            padding: 28px;
+            border-radius: 14px;
+            box-shadow: 0 25px 60px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.15);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            max-width: none;
+            max-height: none;
+        }
+
+        .lightbox-stage-canvas svg,
+        .lightbox-stage-canvas img {
+            display: block;
+            max-width: none !important;
+            height: auto;
+        }
+
+        /* 底部悬浮工具栏 */
+        .lightbox-toolbar {
+            position: absolute;
+            bottom: 22px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 16px;
+            background: rgba(15, 23, 42, 0.85);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 9999px;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+        }
+
+        .tb-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 5px 10px;
+            font-size: 13px;
+            font-weight: 550;
+            color: #e2e8f0;
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .tb-btn:hover {
+            background: rgba(255, 255, 255, 0.12);
+            color: #ffffff;
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .tb-zoom-text {
+            min-width: 52px;
+            text-align: center;
+            font-size: 13px;
+            font-weight: 700;
+            color: #38bdf8;
+            cursor: pointer;
+            padding: 3px 6px;
+            border-radius: 4px;
+        }
+
+        .tb-zoom-text:hover {
+            background: rgba(56, 189, 248, 0.15);
+        }
+
+        .tb-divider {
+            width: 1px;
+            height: 18px;
+            background: rgba(255, 255, 255, 0.15);
+            margin: 0 4px;
+        }
+
+        /* 快捷键提示条 */
+        .lightbox-hint {
+            position: absolute;
+            bottom: 74px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 9;
+            padding: 4px 12px;
+            font-size: 11px;
+            color: rgba(226, 232, 240, 0.7);
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 9999px;
+            pointer-events: none;
+            white-space: nowrap;
+        }
+
+        @media (max-width: 768px) {
+            .diagram-zoom-trigger {
+                top: 8px;
+                right: 8px;
+                padding: 4px 8px;
+                font-size: 11px;
+            }
+
+            .diagram-zoom-trigger span {
+                display: none;
+            }
+
+            .lightbox-header {
+                height: 48px;
+                padding: 0 12px;
+            }
+
+            .lightbox-title {
+                font-size: 13px;
+            }
+
+            .lightbox-toolbar {
+                bottom: 14px;
+                padding: 5px 10px;
+                gap: 4px;
+            }
+
+            .tb-btn {
+                padding: 4px 7px;
+                font-size: 12px;
+            }
+
+            .tb-label {
+                display: none;
+            }
+
+            .lightbox-hint {
+                display: none;
+            }
+        }
+
 """

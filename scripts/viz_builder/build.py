@@ -54,6 +54,59 @@ def build(output_path="../../supermew_visualization.html"):
     <script>
 {scripts_js.JS_CONTENT}
     </script>
+
+    <!-- 全屏图表/图片灯箱查看器 (Diagram & Image Lightbox Modal) -->
+    <div id="diagram-lightbox-modal" class="lightbox-modal" style="display: none;" aria-hidden="true">
+        <div class="lightbox-backdrop" onclick="closeLightbox()"></div>
+        <div class="lightbox-header">
+            <div class="lightbox-title-area">
+                <span class="lightbox-icon">🔍</span>
+                <span id="lightbox-title" class="lightbox-title">全景架构图全屏查看</span>
+            </div>
+            <div class="lightbox-actions">
+                <button type="button" class="lightbox-btn" onclick="toggleLightboxFullscreen()" title="切换全屏模式">
+                    <span class="btn-icon">⛶</span>
+                    <span class="btn-text">全屏</span>
+                </button>
+                <button type="button" class="lightbox-btn lightbox-btn-close" onclick="closeLightbox()" title="关闭 (Esc)">
+                    <span class="btn-icon">✕</span>
+                    <span class="btn-text">关闭</span>
+                </button>
+            </div>
+        </div>
+        <div class="lightbox-viewport" id="lightbox-viewport">
+            <div class="lightbox-stage" id="lightbox-stage">
+                <div class="lightbox-stage-canvas" id="lightbox-stage-canvas">
+                    <!-- 动态克隆的 SVG 或 IMG -->
+                </div>
+            </div>
+        </div>
+        <div class="lightbox-toolbar">
+            <button type="button" class="tb-btn" onclick="zoomLightbox(-0.25)" title="缩小 (-)">
+                <span>➖</span>
+            </button>
+            <span id="lightbox-zoom-display" class="tb-zoom-text" onclick="resetLightboxZoom()" title="点击重置为 100%">100%</span>
+            <button type="button" class="tb-btn" onclick="zoomLightbox(0.25)" title="放大 (+)">
+                <span>➕</span>
+            </button>
+            <div class="tb-divider"></div>
+            <button type="button" class="tb-btn" onclick="fitLightbox()" title="自适应窗口大小">
+                <span>🎯</span>
+                <span class="tb-label">适应</span>
+            </button>
+            <button type="button" class="tb-btn" onclick="resetLightboxZoom()" title="还原原始比例 (1:1)">
+                <span>1:1</span>
+            </button>
+            <button type="button" class="tb-btn" onclick="downloadLightboxContent()" title="保存导出为矢量图/图片">
+                <span>💾</span>
+                <span class="tb-label">导出</span>
+            </button>
+        </div>
+        <div class="lightbox-hint">
+            <span>💡 提示：按住鼠标左键可拖拽平移 · 滚轮可缩放 · 按 Esc 退出</span>
+        </div>
+    </div>
+
 </body>
 </html>
 """
