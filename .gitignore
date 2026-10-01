@@ -19,6 +19,7 @@ docker-compose.prod.yml
 .dockerignore
 deploy-*.tar
 .playwright-cli/
+.playwright-mcp/
 test_shots/
 
 # personal / private local notes
