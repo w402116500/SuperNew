@@ -2,7 +2,7 @@
         <div id="page-security-guardrails" class="details-section">
             <div class="section-header">
                 <h2>🛡️ 安全审计、防注入与幻觉拒答防线</h2>
-                <p>企业级 RAG 最核心的要求不仅是“答对”，更是“安全、合规、绝不编造”。SuperMew 构筑了覆盖输入、检索、编排、输出的全流程四重安全防线。</p>
+                <p>企业级 RAG 最核心的要求不仅是“答对”，更是“安全、合规、绝不编造”。RagTrail 构筑了覆盖输入、检索、编排、输出的全流程四重安全防线。</p>
             </div>
 
             <div class="metric-grid">
@@ -62,7 +62,7 @@ graph LR
 
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">⚔️ 典型攻击场景与 SuperMew 防御机制对照</span>
+                    <span class="card-title">⚔️ 典型攻击场景与 RagTrail 防御机制对照</span>
                     <span class="pill pill-blue">Attack & Defense</span>
                 </div>
                 <table>
@@ -71,7 +71,7 @@ graph LR
                             <th>攻击类型</th>
                             <th>典型载荷示例</th>
                             <th>传统 RAG 失效点</th>
-                            <th>SuperMew 防御策略</th>
+                            <th>RagTrail 防御策略</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -583,12 +583,12 @@ const highlightedContent = computed(() => {
                 </div>
                 <div class="code-block">
                     <div class="code-header">
-                        <span>Nginx / /etc/nginx/conf.d/supermew.conf - 生产级 SSE 流式反向代理配置</span>
+                        <span>Nginx / /etc/nginx/conf.d/ragtrail.conf - 生产级 SSE 流式反向代理配置</span>
                         <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
                     </div>
                     <pre><code class="language-nginx">server {
     listen 80;
-    server_name rag.supermew.enterprise.internal;
+    server_name rag.ragtrail.enterprise.internal;
 
     # 静态资源与 Vue 3 前端 SPA
     location / {
@@ -598,7 +598,7 @@ const highlightedContent = computed(() => {
 
     # 核心 SSE 流式问答接口（必须禁用代理缓冲与缓存）
     location /api/v1/chat/stream {
-        proxy_pass http://supermew-backend:8000;
+        proxy_pass http://ragtrail-backend:8000;
         proxy_http_version 1.1;
 
         # 核心关键参数：禁用缓冲区，确保上游产生每个 Token 立即推送到客户端
@@ -820,12 +820,12 @@ const highlightedContent = computed(() => {
                 </div>
                 <div class="code-block">
                     <div class="code-header">
-                        <span>Nginx / /etc/nginx/conf.d/supermew.conf - 生产级 SSE 流式反向代理配置</span>
+                        <span>Nginx / /etc/nginx/conf.d/ragtrail.conf - 生产级 SSE 流式反向代理配置</span>
                         <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
                     </div>
                     <pre><code class="language-nginx">server {
     listen 80;
-    server_name rag.supermew.enterprise.internal;
+    server_name rag.ragtrail.enterprise.internal;
 
     # 静态资源与 Vue 3 前端 SPA
     location / {
@@ -835,7 +835,7 @@ const highlightedContent = computed(() => {
 
     # 核心 SSE 流式问答接口（必须禁用代理缓冲与缓存）
     location /api/v1/chat/stream {
-        proxy_pass http://supermew-backend:8000;
+        proxy_pass http://ragtrail-backend:8000;
         proxy_http_version 1.1;
 
         # 核心关键参数：禁用缓冲区，确保上游产生每个 Token 立即推送到客户端
@@ -899,7 +899,7 @@ const highlightedContent = computed(() => {
                         <tr>
                             <th>评测指标项 (Metrics)</th>
                             <th>旧版 baseline (固定长度切分 512/50)</th>
-                            <th>SuperMew (Markdown AST 保护 + L1/L2/L3 父子分块)</th>
+                            <th>RagTrail (Markdown AST 保护 + L1/L2/L3 父子分块)</th>
                             <th>绝对提升幅度 (Delta)</th>
                             <th>工业落地工程意义</th>
                         </tr>
@@ -970,7 +970,7 @@ const highlightedContent = computed(() => {
         <div id="page-evaluation-runner" class="details-section">
             <div class="section-header">
                 <h2>🧪 196KB 评测执行器与判定流水线</h2>
-                <p>工业级 RAG 系统的核心底气来自可审计、可复现的自动化评测工程。SuperMew 自研了 4,275 行代码、191.5KB 体量的自动化评测引擎（<code>backend/evaluation/runner.py</code>），支持并发压力测试、多跳逻辑验证与 LLM Judge 双盲裁判。</p>
+                <p>工业级 RAG 系统的核心底气来自可审计、可复现的自动化评测工程。RagTrail 自研了 4,275 行代码、191.5KB 体量的自动化评测引擎（<code>backend/evaluation/runner.py</code>），支持并发压力测试、多跳逻辑验证与 LLM Judge 双盲裁判。</p>
             </div>
 
             <div class="metric-grid">
@@ -1007,7 +1007,7 @@ graph TB
     
     subgraph Execution_Loop ["单题端到端执行与监控"]
         WorkerPool --> QueryDispatch["问题分发与耗时打点 (Timer Start)"]
-        QueryDispatch --> RAGCall["调用 SuperMew LangGraph RAG 管线"]
+        QueryDispatch --> RAGCall["调用 RagTrail LangGraph RAG 管线"]
         RAGCall --> RawResponse["获取回答、引用列表与完整 Trace 账本"]
     end
 
@@ -1042,7 +1042,7 @@ graph TB
                             <th>评测指标</th>
                             <th>计算逻辑与判定契约</th>
                             <th>基线版本表现</th>
-                            <th>SuperMew 优化后</th>
+                            <th>RagTrail 优化后</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -1171,7 +1171,7 @@ class _MultiHopWorker:
 
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">🔄 SuperMew API 交互全双工时序图 (Full-Duplex API Sequence)</span>
+                    <span class="card-title">🔄 RagTrail API 交互全双工时序图 (Full-Duplex API Sequence)</span>
                     <span class="pill pill-blue">API Sequence</span>
                 </div>
                 <div class="mermaid">
@@ -1255,7 +1255,7 @@ class RagTraceFields(StrictSchema):
                             <th>案例编号</th>
                             <th>测试用例问题类型</th>
                             <th>基线版本失效原因 (Root Cause)</th>
-                            <th>SuperMew 核心修复机制</th>
+                            <th>RagTrail 核心修复机制</th>
                             <th>优化后对账结果</th>
                         </tr>
                     </thead>
@@ -1342,13 +1342,13 @@ class RagTraceFields(StrictSchema):
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">为什么很多团队的 SSE 在生产上线后“完全不流”？</div>
-                    在生产架构中，SSE 必须穿透 Nginx 反向代理与云厂商负载均衡器。如果未显式禁用缓冲（<code>proxy_buffering off</code>），Nginx 默认会积攒满 4KB 或等到请求完全结束才一次性刷新，打字机即时感彻底丧失；同时，超过 60 秒无数据传输时防火墙会静默掐断连接。SuperMew 规范了标准的生产代理指令集与 15s 保活心跳：
+                    在生产架构中，SSE 必须穿透 Nginx 反向代理与云厂商负载均衡器。如果未显式禁用缓冲（<code>proxy_buffering off</code>），Nginx 默认会积攒满 4KB 或等到请求完全结束才一次性刷新，打字机即时感彻底丧失；同时，超过 60 秒无数据传输时防火墙会静默掐断连接。RagTrail 规范了标准的生产代理指令集与 15s 保活心跳：
                 </div>
                 <div class="code-block">
 <button class="copy-btn" onclick="copyCode(this)">复制</button>
-<pre><code class="language-nginx"># /etc/nginx/conf.d/supermew_sse.conf
+<pre><code class="language-nginx"># /etc/nginx/conf.d/ragtrail_sse.conf
 location /api/v1/chat/stream {
-    proxy_pass http://supermew_fastapi_cluster;
+    proxy_pass http://ragtrail_fastapi_cluster;
     proxy_http_version 1.1;
     proxy_set_header Connection "";               # 启用 HTTP/1.1 长连接连接池
     proxy_set_header Host System.Management.Automation.Internal.Host.InternalHost;
@@ -1440,7 +1440,7 @@ CREATE INDEX idx_docs_hash ON documents(tenant_id, file_hash);
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">前端组件化：复杂思考折叠与学术级证据气泡</div>
-                    为兼顾“极简极速的阅读体验”与“透明可穿透的工程可信度”，SuperMew 前端设计了两个关键组件：<code>ThinkingTrace.vue</code>（展示 Agent 规划与多跳执行的折叠动效面板）与 <code>References.vue</code>（展示正文中 <code>[1]</code>, <code>[2]</code> 引用来源的悬浮卡片与抽屉）。
+                    为兼顾“极简极速的阅读体验”与“透明可穿透的工程可信度”，RagTrail 前端设计了两个关键组件：<code>ThinkingTrace.vue</code>（展示 Agent 规划与多跳执行的折叠动效面板）与 <code>References.vue</code>（展示正文中 <code>[1]</code>, <code>[2]</code> 引用来源的悬浮卡片与抽屉）。
                 </div>
                 <div class="code-block">
 <button class="copy-btn" onclick="copyCode(this)">复制</button>
@@ -1530,14 +1530,14 @@ const statusTitle = computed(() =&gt; {
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">企业受控环境下的防御纵深</div>
-                    在企业级问答场景中，外部用户或内部低权限员工可能尝试通过精心构造的恶劣提示词诱导模型泄露机密文档、绕过安全规则或执行越权操作。SuperMew 在请求前置、推理中置与响应后置建立了三重过滤网，对以下 12 类典型攻击实现了 100% 拦截率：
+                    在企业级问答场景中，外部用户或内部低权限员工可能尝试通过精心构造的恶劣提示词诱导模型泄露机密文档、绕过安全规则或执行越权操作。RagTrail 在请求前置、推理中置与响应后置建立了三重过滤网，对以下 12 类典型攻击实现了 100% 拦截率：
                 </div>
                 <table>
                     <thead>
                         <tr>
                             <th style="width: 18%;">攻击类型</th>
                             <th style="width: 32%;">典型恶意攻击 Payload 样本</th>
-                            <th style="width: 32%;">SuperMew 防御拦截机制</th>
+                            <th style="width: 32%;">RagTrail 防御拦截机制</th>
                             <th style="width: 18%;">拦截防线</th>
                         </tr>
                     </thead>

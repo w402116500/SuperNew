@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Builder for SuperMew Visualization (24-page enterprise full edition)."""
+"""Builder for RagTrail Visualization (24-page enterprise full edition)."""
 import os
 import sys
 
@@ -9,7 +9,7 @@ import styles
 import header_sidebar
 import scripts_js
 
-def build(output_path="../../supermew_visualization.html"):
+def build(output_path="../../ragtrail_visualization.html"):
     base_dir = os.path.dirname(__file__)
     resolved_path = os.path.abspath(os.path.join(base_dir, output_path))
 
@@ -34,7 +34,7 @@ def build(output_path="../../supermew_visualization.html"):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SuperMew 企业级受控 RAG 问答系统架构与核心源码全景解析</title>
+    <title>RagTrail 企业级受控 RAG 问答系统架构与核心源码全景解析</title>
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
     <style>
 {styles.CSS_CONTENT}

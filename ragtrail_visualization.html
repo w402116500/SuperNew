@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SuperMew 企业级受控 RAG 问答系统架构与核心源码全景解析</title>
+    <title>RagTrail 企业级受控 RAG 问答系统架构与核心源码全景解析</title>
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
     <style>
 
@@ -1054,7 +1054,7 @@
             </button>
             <div class="brand-icon">S</div>
             <div class="brand-text">
-                <h1>SuperMew <span class="header-tag">企业级受控 RAG 问答系统</span></h1>
+                <h1>RagTrail <span class="header-tag">企业级受控 RAG 问答系统</span></h1>
                 <p>L1/L2/L3 三级父子分块 · BGE-M3 + Milvus 2.5 原生 BM25 混合检索 · LangGraph 复杂规划 · 300 题评测闭环</p>
             </div>
         </div>
@@ -1235,7 +1235,7 @@
 
         <!-- PAGE 1: 🌐 项目架构全景概览 -->
         <div id="page-overview" class="details-section active">
-            <div class="section-title">🌐 SuperMew 企业级受控 RAG 问答系统架构全景</div>
+            <div class="section-title">🌐 RagTrail 企业级受控 RAG 问答系统架构全景</div>
             <div class="section-desc">基于 LangGraph 受控状态机、三级父子分块（L1/L2/L3）、BGE-M3 + Milvus 2.5 原生 BM25 混合检索与 Qwen Reranker 精排的工业级全链路知识库问答系统</div>
 
             <div class="metric-grid">
@@ -1262,8 +1262,8 @@
             </div>
 
             <div class="notice-box">
-                <div class="notice-title">💡 为什么构建 SuperMew：解决传统 RAG 的核心致命伤</div>
-                传统 RAG 普遍存在“固定切分打碎表格与层级上下文”、“向量召回在专有名词与编号检索上命中率低”、“单 Agent 链式调用无法应对复杂多跳对比问题”以及“模型幻觉与不可信引用”四大难题。SuperMew 通过自建 <strong>L1/L2/L3 三级父子分块索引</strong>、<strong>BGE-M3 密集向量 + Milvus 2.5 原生 BM25 稀疏检索 RRF 双路融合</strong>、<strong>LangGraph Send 扇出并行多 Agent 规划</strong> 以及 <strong>全链路可复现 300 题评测闭环</strong>，打造真正面向生产的受控问答基座。
+                <div class="notice-title">💡 为什么构建 RagTrail：解决传统 RAG 的核心致命伤</div>
+                传统 RAG 普遍存在“固定切分打碎表格与层级上下文”、“向量召回在专有名词与编号检索上命中率低”、“单 Agent 链式调用无法应对复杂多跳对比问题”以及“模型幻觉与不可信引用”四大难题。RagTrail 通过自建 <strong>L1/L2/L3 三级父子分块索引</strong>、<strong>BGE-M3 密集向量 + Milvus 2.5 原生 BM25 稀疏检索 RRF 双路融合</strong>、<strong>LangGraph Send 扇出并行多 Agent 规划</strong> 以及 <strong>全链路可复现 300 题评测闭环</strong>，打造真正面向生产的受控问答基座。
             </div>
 
             <!-- 架构卡片 1: 智能受控问答与多 Agent 规划流水线 -->
@@ -1363,7 +1363,7 @@ flowchart TD
 
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">⚖️ SuperMew 核心技术决策与设计权衡矩阵</span>
+                    <span class="card-title">⚖️ RagTrail 核心技术决策与设计权衡矩阵</span>
                     <span class="pill pill-green">Production Architectural Trade-offs</span>
                 </div>
                 <table>
@@ -1371,7 +1371,7 @@ flowchart TD
                         <tr>
                             <th>核心维度</th>
                             <th>传统朴素 RAG 方案 (Baseline)</th>
-                            <th>SuperMew 企业级落地决策</th>
+                            <th>RagTrail 企业级落地决策</th>
                             <th>工程权衡与收益 (Trade-offs &amp; Benefits)</th>
                         </tr>
                     </thead>
@@ -1417,7 +1417,7 @@ flowchart TD
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">全链路 P99 时延与可用性控制目标</div>
-                    SuperMew 在生产部署环境中严格执行全链路 SLA 契约。针对分布式检索与推理各个核心组件，均定义了毫秒级超时熔断预算与非阻塞自愈机制，确保即使在单点故障或显卡突发 OOM 时，终端用户仍能获得优雅降级的安全回答。
+                    RagTrail 在生产部署环境中严格执行全链路 SLA 契约。针对分布式检索与推理各个核心组件，均定义了毫秒级超时熔断预算与非阻塞自愈机制，确保即使在单点故障或显卡突发 OOM 时，终端用户仍能获得优雅降级的安全回答。
                 </div>
                 <table>
                     <thead>
@@ -1503,7 +1503,7 @@ flowchart TD
         
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">📦 SuperMew 全栈生产技术选型与版本清单 (Technology Inventory)</span>
+                    <span class="card-title">📦 RagTrail 全栈生产技术选型与版本清单 (Technology Inventory)</span>
                     <span class="pill pill-blue">Dependencies</span>
                 </div>
                 <div class="notice-box">
@@ -1704,7 +1704,7 @@ sequenceDiagram
         
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">⚙️ SuperMew 生产环境硬件拓扑与性能压测基线</span>
+                    <span class="card-title">⚙️ RagTrail 生产环境硬件拓扑与性能压测基线</span>
                     <span class="pill pill-green">Production Baseline</span>
                 </div>
                 <table>
@@ -1759,7 +1759,7 @@ sequenceDiagram
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">企业级数据合规与多级权限穿透防御</div>
-                    SuperMew 在设计之初即贯彻严格的多租户安全模型（Tenant Isolation）。从 API 入口鉴权、向量标量表达式过滤、PostgreSQL 行级安全策略（RLS）到运行时内存隔离，全方位杜绝企业敏感资料的跨租户交叉泄露。
+                    RagTrail 在设计之初即贯彻严格的多租户安全模型（Tenant Isolation）。从 API 入口鉴权、向量标量表达式过滤、PostgreSQL 行级安全策略（RLS）到运行时内存隔离，全方位杜绝企业敏感资料的跨租户交叉泄露。
                 </div>
                 <div class="mermaid">
 graph TB
@@ -1847,7 +1847,7 @@ graph TB
         <div id="page-code-map" class="details-section">
             <div class="section-header">
                 <h2>🗺️ 项目代码地图与边界职责架构</h2>
-                <p>SuperMew 严格遵循分层架构防污染原则（Layered Boundary Principle），确保各模块职责清晰、解耦彻底、具备工业级高可用与可测试性。</p>
+                <p>RagTrail 严格遵循分层架构防污染原则（Layered Boundary Principle），确保各模块职责清晰、解耦彻底、具备工业级高可用与可测试性。</p>
             </div>
 
             <div class="metric-grid">
@@ -1875,7 +1875,7 @@ graph TB
 
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">📐 SuperMew 端到端分层拓扑与跨层调用规约</span>
+                    <span class="card-title">📐 RagTrail 端到端分层拓扑与跨层调用规约</span>
                     <span class="pill pill-blue">Layered Architecture</span>
                 </div>
                 <div class="mermaid">
@@ -1985,7 +1985,7 @@ graph TB
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">严格禁止循环依赖与跨层反向调用</div>
-                    为保证企业级项目的可维护性与测试独立性，SuperMew 制定了严格的单向依赖拓扑规则。CI/CD 流水线中内置了静态 AST 依赖分析扫描（<code>lint_imports.py</code>），一旦发现跨层违规导入立即打断构建。
+                    为保证企业级项目的可维护性与测试独立性，RagTrail 制定了严格的单向依赖拓扑规则。CI/CD 流水线中内置了静态 AST 依赖分析扫描（<code>lint_imports.py</code>），一旦发现跨层违规导入立即打断构建。
                 </div>
                 <table>
                     <thead>
@@ -2043,7 +2043,7 @@ graph TB
         <div id="page-ingestion-lifecycle" class="details-section">
             <div class="section-header">
                 <h2>📥 多格式文档入库与原子暂存事务</h2>
-                <p>生产环境中最致命的隐患是入库解析中途崩溃导致残缺脏数据污染检索库。SuperMew 设计了五重安全隔离暂存机制，确保入库过程具备完整的 ACID 事务级安全。</p>
+                <p>生产环境中最致命的隐患是入库解析中途崩溃导致残缺脏数据污染检索库。RagTrail 设计了五重安全隔离暂存机制，确保入库过程具备完整的 ACID 事务级安全。</p>
             </div>
 
             <div class="metric-grid">
@@ -2147,7 +2147,7 @@ stateDiagram-v2
         <div id="page-mineru-pipeline" class="details-section">
             <div class="section-header">
                 <h2>📑 MinerU 多模态解析与跨页还原</h2>
-                <p>企业知识库最大的痛点是扫描件、双栏排版 PDF 以及跨页大表格。SuperMew 深度集成 MinerU 多模态解析流水线，实现复杂版面高保真还原。</p>
+                <p>企业知识库最大的痛点是扫描件、双栏排版 PDF 以及跨页大表格。RagTrail 深度集成 MinerU 多模态解析流水线，实现复杂版面高保真还原。</p>
             </div>
 
             <div class="metric-grid">
@@ -2218,7 +2218,7 @@ graph LR
                         <tr>
                             <th>对比维度</th>
                             <th>传统基于规则切分 (PyPDF / TextSplitter)</th>
-                            <th>SuperMew 集成 MinerU 多模态解析</th>
+                            <th>RagTrail 集成 MinerU 多模态解析</th>
                             <th>业务实测收益</th>
                         </tr>
                     </thead>
@@ -2252,14 +2252,14 @@ graph LR
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">复杂版面提取为何是 RAG 质量的真正命门？</div>
-                    在企业级知识库中，超过 70% 的核心专业知识深埋于非标准排版文档中：多栏排版错读、跨页大表表头丢失、模糊扫描件文字断裂。若入库阶段解析错乱，下游无论做多强的 Agent 和 Reranker 也只能“垃圾进，垃圾出”。SuperMew 依托 MinerU 深度定制了解析流水线，攻坚了以下五类极端场景：
+                    在企业级知识库中，超过 70% 的核心专业知识深埋于非标准排版文档中：多栏排版错读、跨页大表表头丢失、模糊扫描件文字断裂。若入库阶段解析错乱，下游无论做多强的 Agent 和 Reranker 也只能“垃圾进，垃圾出”。RagTrail 依托 MinerU 深度定制了解析流水线，攻坚了以下五类极端场景：
                 </div>
                 <table>
                     <thead>
                         <tr>
                             <th style="width: 18%;">极端版面场景</th>
                             <th style="width: 32%;">传统 PyPDF / 规则提取的致命缺陷</th>
-                            <th style="width: 32%;">MinerU + SuperMew 攻坚解决方案</th>
+                            <th style="width: 32%;">MinerU + RagTrail 攻坚解决方案</th>
                             <th style="width: 18%;">测试集评测收益</th>
                         </tr>
                     </thead>
@@ -2337,7 +2337,7 @@ graph LR
         <div id="page-hierarchical-chunking" class="details-section">
             <div class="section-header">
                 <h2>🧩 L1/L2/L3 三级父子分块与 AST 结构保护</h2>
-                <p>大模型检索中最经典的矛盾：<b>块切得太小，LLM 缺乏上下文无法推理；块切得太大，向量匹配度被稀释无法精准命中</b>。SuperMew 创新提出 L1/L2/L3 三级父子分块体系，实现“精细粒度检索，宏观语义推理”。</p>
+                <p>大模型检索中最经典的矛盾：<b>块切得太小，LLM 缺乏上下文无法推理；块切得太大，向量匹配度被稀释无法精准命中</b>。RagTrail 创新提出 L1/L2/L3 三级父子分块体系，实现“精细粒度检索，宏观语义推理”。</p>
             </div>
 
             <div class="metric-grid">
@@ -2479,7 +2479,7 @@ def split_sentences_with_spans(text: str) -> List[SentenceSpan]:
                             <td>中等长度表格与政策仍偶发越界，缺少微观关键词尖锐度。</td>
                         </tr>
                         <tr>
-                            <td><strong>SuperMew 三级父子分块 (最优)</strong></td>
+                            <td><strong>RagTrail 三级父子分块 (最优)</strong></td>
                             <td><strong>2400/400 + 1600/200 + 800/100</strong></td>
                             <td><strong>83.68%</strong></td>
                             <td><strong>69.33%</strong></td>
@@ -2535,7 +2535,7 @@ def split_sentences_with_spans(text: str) -> List[SentenceSpan]:
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">语义向量断点算法 (Semantic Window Breakpoint)</div>
-                    在段落长度超过 L3 上限（800 字符）且存在多意群时，SuperMew 启动滑动窗口语义切分。以连续 <code>W=3</code> 个句子构成左窗口与右窗口，计算两者的余弦相似度距离。当距离出现局部峰值（即语义剧烈转折）且超过整篇段落的 20th 百分位数时，标记为最佳切分断点。
+                    在段落长度超过 L3 上限（800 字符）且存在多意群时，RagTrail 启动滑动窗口语义切分。以连续 <code>W=3</code> 个句子构成左窗口与右窗口，计算两者的余弦相似度距离。当距离出现局部峰值（即语义剧烈转折）且超过整篇段落的 20th 百分位数时，标记为最佳切分断点。
                 </div>
                 
                 <div class="code-block">
@@ -2725,7 +2725,7 @@ sequenceDiagram
                         <span class="pill pill-green">Mathematical Rigor</span>
                     </div>
                     <div style="font-size: 14px; line-height: 1.8; color: var(--text-color);">
-                        <p>传统打分加权（如 <code>0.7*dense + 0.3*sparse</code>）受两路检索得分量纲、分布方差不一致影响，极其不稳定。SuperMew 采用 <strong>RRF (倒数排名融合)</strong>，纯基于<strong>两路结果的相对位次</strong>进行稳定融合：</p>
+                        <p>传统打分加权（如 <code>0.7*dense + 0.3*sparse</code>）受两路检索得分量纲、分布方差不一致影响，极其不稳定。RagTrail 采用 <strong>RRF (倒数排名融合)</strong>，纯基于<strong>两路结果的相对位次</strong>进行稳定融合：</p>
                         <div style="background: #f1f5f9; padding: 12px; border-radius: 8px; margin: 10px 0; font-family: monospace; font-size: 15px; text-align: center; color: var(--primary-dark);">
                             RRF_Score(d) = Σ<sub>m ∈ {dense, bm25}</sub> [ 1 / (60 + rank<sub>m</sub>(d)) ]
                         </div>
@@ -2939,7 +2939,7 @@ flowchart TD
                         <span class="pill pill-amber">State Reducer Design</span>
                     </div>
                     <div style="font-size: 14px; line-height: 1.8; color: var(--text-color);">
-                        <p>传统多 Agent 框架常采用嵌套循环，无法并行且容易丢失局部状态。SuperMew 利用 LangGraph 核心特性：</p>
+                        <p>传统多 Agent 框架常采用嵌套循环，无法并行且容易丢失局部状态。RagTrail 利用 LangGraph 核心特性：</p>
                         <ol style="padding-left: 20px; font-size: 13px; color: var(--text-muted);">
                             <li><strong>条件边动态返回 Send 对象</strong>：<code>_fanout_sub_questions</code> 根据拆分出的子问题列表，动态返回 <code>[Send("rag_sub_agent", {"sub_question": q}) for q in sub_questions]</code>。</li>
                             <li><strong>并发非阻塞执行</strong>：LangGraph 引擎在同一 Step 内并发调度执行各个 <code>rag_sub_agent</code> 实例，网络 I/O 完美重叠，响应耗时从 3x 压缩至 1x。</li>
@@ -3128,7 +3128,7 @@ flowchart TD
                 </div>
                 <div class="callout callout-amber" style="margin-top:14px;">
                     <div class="callout-title">⚠️ 防死循环铁律：严格单次改写熔断</div>
-                    <p style="font-size:13px; margin:0;">业内很多 RAG 系统因允许多次反思循环，导致在遇到语料库中不存在的知识时陷入 3-5 次持续改写，造成请求超时（超 60 秒）并浪费巨额 Token。SuperMew 在图状态中硬编码 <code>state["rewrite_count"] &lt; 1</code>，改写一次后若仍未命中即直接走向澄清或优雅拒答，<strong>全链路耗时严格可控</strong>。</p>
+                    <p style="font-size:13px; margin:0;">业内很多 RAG 系统因允许多次反思循环，导致在遇到语料库中不存在的知识时陷入 3-5 次持续改写，造成请求超时（超 60 秒）并浪费巨额 Token。RagTrail 在图状态中硬编码 <code>state["rewrite_count"] &lt; 1</code>，改写一次后若仍未命中即直接走向澄清或优雅拒答，<strong>全链路耗时严格可控</strong>。</p>
                 </div>
             </div>
         
@@ -3142,7 +3142,7 @@ flowchart TD
                         <tr>
                             <th>对比维度</th>
                             <th>线性加权评分 (Linear Score Fusion)</th>
-                            <th>SuperMew RRF 倒数排名融合 (k=60)</th>
+                            <th>RagTrail RRF 倒数排名融合 (k=60)</th>
                             <th>工程设计优势</th>
                         </tr>
                     </thead>
@@ -3207,11 +3207,11 @@ flowchart TD
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">告别应用层维护 BM25，迈向 Milvus 2.5 原生全文检索时代</div>
-                    传统 RAG 方案通常在 Python 内存或 Elasticsearch 中额外维护 BM25 倒排索引，面临双写不一致、内存暴涨、跨网络合并繁琐等重大痛点。SuperMew 全面拥抱 Milvus 2.5，利用其内建的 <code>FunctionType.BM25</code>，在数据写入时由向量引擎自动分词并构建稀疏索引，极大简化了运维复杂度并提升了检索吞吐。
+                    传统 RAG 方案通常在 Python 内存或 Elasticsearch 中额外维护 BM25 倒排索引，面临双写不一致、内存暴涨、跨网络合并繁琐等重大痛点。RagTrail 全面拥抱 Milvus 2.5，利用其内建的 <code>FunctionType.BM25</code>，在数据写入时由向量引擎自动分词并构建稀疏索引，极大简化了运维复杂度并提升了检索吞吐。
                 </div>
                 <div class="code-block">
 <button class="copy-btn" onclick="copyCode(this)">复制</button>
-<pre><code class="language-python">def init_milvus_hybrid_collection(collection_name: str = "supermew_chunks"):
+<pre><code class="language-python">def init_milvus_hybrid_collection(collection_name: str = "ragtrail_chunks"):
     """在 Milvus 2.5 中定义支持 Dense 向量 + 原生 BM25 稀疏索引的统一集合。"""
     schema = CollectionSchema(fields=[
         FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, max_length=64, is_primary=True),
@@ -3275,7 +3275,7 @@ flowchart TD
                             <td>26ms</td>
                         </tr>
                         <tr>
-                            <td><strong>SuperMew 原生 RRF 排名融合 (k=60)</strong></td>
+                            <td><strong>RagTrail 原生 RRF 排名融合 (k=60)</strong></td>
                             <td><strong>85.93%</strong> <span class="text-green">(+9.51%)</span></td>
                             <td><strong>0.718</strong></td>
                             <td><strong>92.80%</strong> <span class="text-green">(无量纲抗噪最佳)</span></td>
@@ -3381,7 +3381,7 @@ flowchart TD
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">为什么拒绝无限制循环改写？</div>
-                    在早期 RAG 原型中，检索不足便自动改写往往导致“死循环”。SuperMew 设定了严格的 <strong>单次改写硬上限（Max 1 Loop）</strong>，并在 Step-back 与 HyDE 之间执行互斥仲裁，杜绝无效漂移。
+                    在早期 RAG 原型中，检索不足便自动改写往往导致“死循环”。RagTrail 设定了严格的 <strong>单次改写硬上限（Max 1 Loop）</strong>，并在 Step-back 与 HyDE 之间执行互斥仲裁，杜绝无效漂移。
                 </div>
 
                 <table>
@@ -3416,7 +3416,7 @@ flowchart TD
         <div id="page-security-guardrails" class="details-section">
             <div class="section-header">
                 <h2>🛡️ 安全审计、防注入与幻觉拒答防线</h2>
-                <p>企业级 RAG 最核心的要求不仅是“答对”，更是“安全、合规、绝不编造”。SuperMew 构筑了覆盖输入、检索、编排、输出的全流程四重安全防线。</p>
+                <p>企业级 RAG 最核心的要求不仅是“答对”，更是“安全、合规、绝不编造”。RagTrail 构筑了覆盖输入、检索、编排、输出的全流程四重安全防线。</p>
             </div>
 
             <div class="metric-grid">
@@ -3476,7 +3476,7 @@ graph LR
 
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">⚔️ 典型攻击场景与 SuperMew 防御机制对照</span>
+                    <span class="card-title">⚔️ 典型攻击场景与 RagTrail 防御机制对照</span>
                     <span class="pill pill-blue">Attack & Defense</span>
                 </div>
                 <table>
@@ -3485,7 +3485,7 @@ graph LR
                             <th>攻击类型</th>
                             <th>典型载荷示例</th>
                             <th>传统 RAG 失效点</th>
-                            <th>SuperMew 防御策略</th>
+                            <th>RagTrail 防御策略</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -3997,12 +3997,12 @@ const highlightedContent = computed(() => {
                 </div>
                 <div class="code-block">
                     <div class="code-header">
-                        <span>Nginx / /etc/nginx/conf.d/supermew.conf - 生产级 SSE 流式反向代理配置</span>
+                        <span>Nginx / /etc/nginx/conf.d/ragtrail.conf - 生产级 SSE 流式反向代理配置</span>
                         <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
                     </div>
                     <pre><code class="language-nginx">server {
     listen 80;
-    server_name rag.supermew.enterprise.internal;
+    server_name rag.ragtrail.enterprise.internal;
 
     # 静态资源与 Vue 3 前端 SPA
     location / {
@@ -4012,7 +4012,7 @@ const highlightedContent = computed(() => {
 
     # 核心 SSE 流式问答接口（必须禁用代理缓冲与缓存）
     location /api/v1/chat/stream {
-        proxy_pass http://supermew-backend:8000;
+        proxy_pass http://ragtrail-backend:8000;
         proxy_http_version 1.1;
 
         # 核心关键参数：禁用缓冲区，确保上游产生每个 Token 立即推送到客户端
@@ -4234,12 +4234,12 @@ const highlightedContent = computed(() => {
                 </div>
                 <div class="code-block">
                     <div class="code-header">
-                        <span>Nginx / /etc/nginx/conf.d/supermew.conf - 生产级 SSE 流式反向代理配置</span>
+                        <span>Nginx / /etc/nginx/conf.d/ragtrail.conf - 生产级 SSE 流式反向代理配置</span>
                         <button class="copy-btn" onclick="copyCode(this)">复制代码</button>
                     </div>
                     <pre><code class="language-nginx">server {
     listen 80;
-    server_name rag.supermew.enterprise.internal;
+    server_name rag.ragtrail.enterprise.internal;
 
     # 静态资源与 Vue 3 前端 SPA
     location / {
@@ -4249,7 +4249,7 @@ const highlightedContent = computed(() => {
 
     # 核心 SSE 流式问答接口（必须禁用代理缓冲与缓存）
     location /api/v1/chat/stream {
-        proxy_pass http://supermew-backend:8000;
+        proxy_pass http://ragtrail-backend:8000;
         proxy_http_version 1.1;
 
         # 核心关键参数：禁用缓冲区，确保上游产生每个 Token 立即推送到客户端
@@ -4313,7 +4313,7 @@ const highlightedContent = computed(() => {
                         <tr>
                             <th>评测指标项 (Metrics)</th>
                             <th>旧版 baseline (固定长度切分 512/50)</th>
-                            <th>SuperMew (Markdown AST 保护 + L1/L2/L3 父子分块)</th>
+                            <th>RagTrail (Markdown AST 保护 + L1/L2/L3 父子分块)</th>
                             <th>绝对提升幅度 (Delta)</th>
                             <th>工业落地工程意义</th>
                         </tr>
@@ -4384,7 +4384,7 @@ const highlightedContent = computed(() => {
         <div id="page-evaluation-runner" class="details-section">
             <div class="section-header">
                 <h2>🧪 196KB 评测执行器与判定流水线</h2>
-                <p>工业级 RAG 系统的核心底气来自可审计、可复现的自动化评测工程。SuperMew 自研了 4,275 行代码、191.5KB 体量的自动化评测引擎（<code>backend/evaluation/runner.py</code>），支持并发压力测试、多跳逻辑验证与 LLM Judge 双盲裁判。</p>
+                <p>工业级 RAG 系统的核心底气来自可审计、可复现的自动化评测工程。RagTrail 自研了 4,275 行代码、191.5KB 体量的自动化评测引擎（<code>backend/evaluation/runner.py</code>），支持并发压力测试、多跳逻辑验证与 LLM Judge 双盲裁判。</p>
             </div>
 
             <div class="metric-grid">
@@ -4421,7 +4421,7 @@ graph TB
     
     subgraph Execution_Loop ["单题端到端执行与监控"]
         WorkerPool --> QueryDispatch["问题分发与耗时打点 (Timer Start)"]
-        QueryDispatch --> RAGCall["调用 SuperMew LangGraph RAG 管线"]
+        QueryDispatch --> RAGCall["调用 RagTrail LangGraph RAG 管线"]
         RAGCall --> RawResponse["获取回答、引用列表与完整 Trace 账本"]
     end
 
@@ -4456,7 +4456,7 @@ graph TB
                             <th>评测指标</th>
                             <th>计算逻辑与判定契约</th>
                             <th>基线版本表现</th>
-                            <th>SuperMew 优化后</th>
+                            <th>RagTrail 优化后</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -4585,7 +4585,7 @@ class _MultiHopWorker:
 
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">🔄 SuperMew API 交互全双工时序图 (Full-Duplex API Sequence)</span>
+                    <span class="card-title">🔄 RagTrail API 交互全双工时序图 (Full-Duplex API Sequence)</span>
                     <span class="pill pill-blue">API Sequence</span>
                 </div>
                 <div class="mermaid">
@@ -4669,7 +4669,7 @@ class RagTraceFields(StrictSchema):
                             <th>案例编号</th>
                             <th>测试用例问题类型</th>
                             <th>基线版本失效原因 (Root Cause)</th>
-                            <th>SuperMew 核心修复机制</th>
+                            <th>RagTrail 核心修复机制</th>
                             <th>优化后对账结果</th>
                         </tr>
                     </thead>
@@ -4756,13 +4756,13 @@ class RagTraceFields(StrictSchema):
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">为什么很多团队的 SSE 在生产上线后“完全不流”？</div>
-                    在生产架构中，SSE 必须穿透 Nginx 反向代理与云厂商负载均衡器。如果未显式禁用缓冲（<code>proxy_buffering off</code>），Nginx 默认会积攒满 4KB 或等到请求完全结束才一次性刷新，打字机即时感彻底丧失；同时，超过 60 秒无数据传输时防火墙会静默掐断连接。SuperMew 规范了标准的生产代理指令集与 15s 保活心跳：
+                    在生产架构中，SSE 必须穿透 Nginx 反向代理与云厂商负载均衡器。如果未显式禁用缓冲（<code>proxy_buffering off</code>），Nginx 默认会积攒满 4KB 或等到请求完全结束才一次性刷新，打字机即时感彻底丧失；同时，超过 60 秒无数据传输时防火墙会静默掐断连接。RagTrail 规范了标准的生产代理指令集与 15s 保活心跳：
                 </div>
                 <div class="code-block">
 <button class="copy-btn" onclick="copyCode(this)">复制</button>
-<pre><code class="language-nginx"># /etc/nginx/conf.d/supermew_sse.conf
+<pre><code class="language-nginx"># /etc/nginx/conf.d/ragtrail_sse.conf
 location /api/v1/chat/stream {
-    proxy_pass http://supermew_fastapi_cluster;
+    proxy_pass http://ragtrail_fastapi_cluster;
     proxy_http_version 1.1;
     proxy_set_header Connection "";               # 启用 HTTP/1.1 长连接连接池
     proxy_set_header Host System.Management.Automation.Internal.Host.InternalHost;
@@ -4854,7 +4854,7 @@ CREATE INDEX idx_docs_hash ON documents(tenant_id, file_hash);
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">前端组件化：复杂思考折叠与学术级证据气泡</div>
-                    为兼顾“极简极速的阅读体验”与“透明可穿透的工程可信度”，SuperMew 前端设计了两个关键组件：<code>ThinkingTrace.vue</code>（展示 Agent 规划与多跳执行的折叠动效面板）与 <code>References.vue</code>（展示正文中 <code>[1]</code>, <code>[2]</code> 引用来源的悬浮卡片与抽屉）。
+                    为兼顾“极简极速的阅读体验”与“透明可穿透的工程可信度”，RagTrail 前端设计了两个关键组件：<code>ThinkingTrace.vue</code>（展示 Agent 规划与多跳执行的折叠动效面板）与 <code>References.vue</code>（展示正文中 <code>[1]</code>, <code>[2]</code> 引用来源的悬浮卡片与抽屉）。
                 </div>
                 <div class="code-block">
 <button class="copy-btn" onclick="copyCode(this)">复制</button>
@@ -4944,14 +4944,14 @@ const statusTitle = computed(() =&gt; {
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">企业受控环境下的防御纵深</div>
-                    在企业级问答场景中，外部用户或内部低权限员工可能尝试通过精心构造的恶劣提示词诱导模型泄露机密文档、绕过安全规则或执行越权操作。SuperMew 在请求前置、推理中置与响应后置建立了三重过滤网，对以下 12 类典型攻击实现了 100% 拦截率：
+                    在企业级问答场景中，外部用户或内部低权限员工可能尝试通过精心构造的恶劣提示词诱导模型泄露机密文档、绕过安全规则或执行越权操作。RagTrail 在请求前置、推理中置与响应后置建立了三重过滤网，对以下 12 类典型攻击实现了 100% 拦截率：
                 </div>
                 <table>
                     <thead>
                         <tr>
                             <th style="width: 18%;">攻击类型</th>
                             <th style="width: 32%;">典型恶意攻击 Payload 样本</th>
-                            <th style="width: 32%;">SuperMew 防御拦截机制</th>
+                            <th style="width: 32%;">RagTrail 防御拦截机制</th>
                             <th style="width: 18%;">拦截防线</th>
                         </tr>
                     </thead>
@@ -5312,7 +5312,7 @@ async def combine_sub_results(state: RAGState) -> dict[str, Any]:
 import asyncio
 import logging
 
-logger = logging.getLogger("supermew.rag.utils")
+logger = logging.getLogger("ragtrail.rag.utils")
 
 def _merge_to_parent_level(candidates: List[Dict[str, Any]], target_level: str = "L2") -> List[Dict[str, Any]]:
     # 将多个命中同一父级的 L3 叶子块提升并折叠为完整的父级块上下文
@@ -5424,7 +5424,7 @@ def _expand_adjacent_l3_candidates(candidates: List[Dict[str, Any]], store_clien
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">上卷机制核心设计原理</div>
-                    当 Milvus 向量与 BM25 检索出多个 L3 叶子切片后，如果盲目将碎片输入 LLM，会导致上下文语义割裂、丢失章节全局修饰。SuperMew 实现了自底向上的两级父块提升算法：同一父级下至少命中 <code>threshold=2</code> 个子块时，触发父级上卷；从 PostgreSQL/Redis 二级缓存中恢复完整的 L2（乃至 L1）正文，并保留最高相关度得分与子块映射关系 <code>mappings</code> 供 Trace 审计。
+                    当 Milvus 向量与 BM25 检索出多个 L3 叶子切片后，如果盲目将碎片输入 LLM，会导致上下文语义割裂、丢失章节全局修饰。RagTrail 实现了自底向上的两级父块提升算法：同一父级下至少命中 <code>threshold=2</code> 个子块时，触发父级上卷；从 PostgreSQL/Redis 二级缓存中恢复完整的 L2（乃至 L1）正文，并保留最高相关度得分与子块映射关系 <code>mappings</code> 供 Trace 审计。
                 </div>
                 <div class="code-block">
                     <div class="code-header">
@@ -5629,7 +5629,7 @@ def _auto_merge_candidates(
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">跨段落上下文自愈原理</div>
-                    在长文档分块过程中，关键结论可能恰好落在切片边界（例如前一句在 chunk A，后半句在 chunk B）。当向量检索召回其中一个切片时，SuperMew 借助确定的分块命名规律（如 <code>chunk:doc:L3:0_0_1</code>），利用标量主键以 O(1) 复杂度直接拉取其前驱 <code>0_0_0</code> 与后继 <code>0_0_2</code>，无需重新进行高开销的向量或 BM25 检索，实现边界断句的自动缝合。
+                    在长文档分块过程中，关键结论可能恰好落在切片边界（例如前一句在 chunk A，后半句在 chunk B）。当向量检索召回其中一个切片时，RagTrail 借助确定的分块命名规律（如 <code>chunk:doc:L3:0_0_1</code>），利用标量主键以 O(1) 复杂度直接拉取其前驱 <code>0_0_0</code> 与后继 <code>0_0_2</code>，无需重新进行高开销的向量或 BM25 检索，实现边界断句的自动缝合。
                 </div>
                 <div class="code-block">
                     <div class="code-header">
@@ -5703,7 +5703,7 @@ def _expand_adjacent_l3_candidates(
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">上卷机制核心设计原理</div>
-                    当 Milvus 向量与 BM25 检索出多个 L3 叶子切片后，如果盲目将碎片输入 LLM，会导致上下文语义割裂、丢失章节全局修饰。SuperMew 实现了自底向上的两级父块提升算法：同一父级下至少命中 <code>threshold=2</code> 个子块时，触发父级上卷；从 PostgreSQL/Redis 二级缓存中恢复完整的 L2（乃至 L1）正文，并保留最高相关度得分与子块映射关系 <code>mappings</code> 供 Trace 审计。
+                    当 Milvus 向量与 BM25 检索出多个 L3 叶子切片后，如果盲目将碎片输入 LLM，会导致上下文语义割裂、丢失章节全局修饰。RagTrail 实现了自底向上的两级父块提升算法：同一父级下至少命中 <code>threshold=2</code> 个子块时，触发父级上卷；从 PostgreSQL/Redis 二级缓存中恢复完整的 L2（乃至 L1）正文，并保留最高相关度得分与子块映射关系 <code>mappings</code> 供 Trace 审计。
                 </div>
                 <div class="code-block">
                     <div class="code-header">
@@ -5908,7 +5908,7 @@ def _auto_merge_candidates(
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">跨段落上下文自愈原理</div>
-                    在长文档分块过程中，关键结论可能恰好落在切片边界（例如前一句在 chunk A，后半句在 chunk B）。当向量检索召回其中一个切片时，SuperMew 借助确定的分块命名规律（如 <code>chunk:doc:L3:0_0_1</code>），利用标量主键以 O(1) 复杂度直接拉取其前驱 <code>0_0_0</code> 与后继 <code>0_0_2</code>，无需重新进行高开销的向量或 BM25 检索，实现边界断句的自动缝合。
+                    在长文档分块过程中，关键结论可能恰好落在切片边界（例如前一句在 chunk A，后半句在 chunk B）。当向量检索召回其中一个切片时，RagTrail 借助确定的分块命名规律（如 <code>chunk:doc:L3:0_0_1</code>），利用标量主键以 O(1) 复杂度直接拉取其前驱 <code>0_0_0</code> 与后继 <code>0_0_2</code>，无需重新进行高开销的向量或 BM25 检索，实现边界断句的自动缝合。
                 </div>
                 <div class="code-block">
                     <div class="code-header">
@@ -6487,7 +6487,7 @@ import time
 from typing import Optional, Dict, Any
 import logging
 
-logger = logging.getLogger("supermew.chat.runtime")
+logger = logging.getLogger("ragtrail.chat.runtime")
 
 class ChatRequestContext:
     # 封装单次对话请求的完全独立生命周期，禁止跨请求共享状态

@@ -6,7 +6,7 @@
 
 | 脚本 | 用途 |
 | --- | --- |
-| `supermew.ps1` | 启动、停止、重启、查看状态和日志；远程模型模式使用 `-NoOllama`。 |
+| `ragtrail.ps1` | 启动、停止、重启、查看状态和日志；远程模型模式使用 `-NoOllama`。 |
 
 根目录的 `start.bat`、`stop.bat` 是 Windows 入口；`start.sh`、`stop.sh` 与 `server-start.sh`、`server-stop.sh` 是服务器入口。
 
@@ -14,7 +14,7 @@
 
 | 脚本或目录 | 用途 |
 | --- | --- |
-| `build_supermew_visualization.py` | 构建根目录的 `supermew_visualization.html`。 |
+| `build_ragtrail_visualization.py` | 构建根目录的 `ragtrail_visualization.html`。 |
 | `viz_builder/` | 上述可视化文档所需的 HTML、样式与交互源码。 |
 
 ## 评测与分析

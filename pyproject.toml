@@ -1,5 +1,5 @@
 [project]
-name = "ai-customer-service"
+name = "ragtrail"
 version = "0.1.0"
 description = "面向企业资料的智能知识库问答系统"
 readme = "README.md"

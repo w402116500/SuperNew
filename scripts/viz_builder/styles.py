@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""CSS Styles for SuperMew Visualization Dashboard (Enterprise Responsive Edition)."""
+"""CSS Styles for RagTrail Visualization Dashboard (Enterprise Responsive Edition)."""
 
 CSS_CONTENT = """
         :root {

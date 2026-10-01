@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 启动服务器上的 SuperMew：只拉起 app、PostgreSQL、Redis。
+# 启动服务器上的 RagTrail：只拉起 app、PostgreSQL、Redis。
 # 不会启动本地 Milvus，也不会重建或删除数据卷。
 set -euo pipefail
 
@@ -40,7 +40,7 @@ for arg in "$@"; do
 done
 
 if [[ ! -f "$compose_file" ]]; then
-  echo "找不到 $compose_file，请在 /opt/supermew 下运行。" >&2
+  echo "找不到 $compose_file，请在 /opt/ragtrail 下运行。" >&2
   exit 1
 fi
 
@@ -66,7 +66,7 @@ if app_port_value="$(grep -E '^APP_HOST_PORT=' .env | tail -n 1 | cut -d= -f2- |
   fi
 fi
 
-echo "正在启动 SuperMew（$compose_file）..."
+echo "正在启动 RagTrail（$compose_file）..."
 if [[ "$rebuild" -eq 1 ]]; then
   docker compose -f "$compose_file" up -d --build
 else

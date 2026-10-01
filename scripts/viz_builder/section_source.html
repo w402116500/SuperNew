@@ -286,7 +286,7 @@ async def combine_sub_results(state: RAGState) -> dict[str, Any]:
 import asyncio
 import logging
 
-logger = logging.getLogger("supermew.rag.utils")
+logger = logging.getLogger("ragtrail.rag.utils")
 
 def _merge_to_parent_level(candidates: List[Dict[str, Any]], target_level: str = "L2") -> List[Dict[str, Any]]:
     # 将多个命中同一父级的 L3 叶子块提升并折叠为完整的父级块上下文
@@ -398,7 +398,7 @@ def _expand_adjacent_l3_candidates(candidates: List[Dict[str, Any]], store_clien
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">上卷机制核心设计原理</div>
-                    当 Milvus 向量与 BM25 检索出多个 L3 叶子切片后，如果盲目将碎片输入 LLM，会导致上下文语义割裂、丢失章节全局修饰。SuperMew 实现了自底向上的两级父块提升算法：同一父级下至少命中 <code>threshold=2</code> 个子块时，触发父级上卷；从 PostgreSQL/Redis 二级缓存中恢复完整的 L2（乃至 L1）正文，并保留最高相关度得分与子块映射关系 <code>mappings</code> 供 Trace 审计。
+                    当 Milvus 向量与 BM25 检索出多个 L3 叶子切片后，如果盲目将碎片输入 LLM，会导致上下文语义割裂、丢失章节全局修饰。RagTrail 实现了自底向上的两级父块提升算法：同一父级下至少命中 <code>threshold=2</code> 个子块时，触发父级上卷；从 PostgreSQL/Redis 二级缓存中恢复完整的 L2（乃至 L1）正文，并保留最高相关度得分与子块映射关系 <code>mappings</code> 供 Trace 审计。
                 </div>
                 <div class="code-block">
                     <div class="code-header">
@@ -603,7 +603,7 @@ def _auto_merge_candidates(
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">跨段落上下文自愈原理</div>
-                    在长文档分块过程中，关键结论可能恰好落在切片边界（例如前一句在 chunk A，后半句在 chunk B）。当向量检索召回其中一个切片时，SuperMew 借助确定的分块命名规律（如 <code>chunk:doc:L3:0_0_1</code>），利用标量主键以 O(1) 复杂度直接拉取其前驱 <code>0_0_0</code> 与后继 <code>0_0_2</code>，无需重新进行高开销的向量或 BM25 检索，实现边界断句的自动缝合。
+                    在长文档分块过程中，关键结论可能恰好落在切片边界（例如前一句在 chunk A，后半句在 chunk B）。当向量检索召回其中一个切片时，RagTrail 借助确定的分块命名规律（如 <code>chunk:doc:L3:0_0_1</code>），利用标量主键以 O(1) 复杂度直接拉取其前驱 <code>0_0_0</code> 与后继 <code>0_0_2</code>，无需重新进行高开销的向量或 BM25 检索，实现边界断句的自动缝合。
                 </div>
                 <div class="code-block">
                     <div class="code-header">
@@ -677,7 +677,7 @@ def _expand_adjacent_l3_candidates(
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">上卷机制核心设计原理</div>
-                    当 Milvus 向量与 BM25 检索出多个 L3 叶子切片后，如果盲目将碎片输入 LLM，会导致上下文语义割裂、丢失章节全局修饰。SuperMew 实现了自底向上的两级父块提升算法：同一父级下至少命中 <code>threshold=2</code> 个子块时，触发父级上卷；从 PostgreSQL/Redis 二级缓存中恢复完整的 L2（乃至 L1）正文，并保留最高相关度得分与子块映射关系 <code>mappings</code> 供 Trace 审计。
+                    当 Milvus 向量与 BM25 检索出多个 L3 叶子切片后，如果盲目将碎片输入 LLM，会导致上下文语义割裂、丢失章节全局修饰。RagTrail 实现了自底向上的两级父块提升算法：同一父级下至少命中 <code>threshold=2</code> 个子块时，触发父级上卷；从 PostgreSQL/Redis 二级缓存中恢复完整的 L2（乃至 L1）正文，并保留最高相关度得分与子块映射关系 <code>mappings</code> 供 Trace 审计。
                 </div>
                 <div class="code-block">
                     <div class="code-header">
@@ -882,7 +882,7 @@ def _auto_merge_candidates(
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">跨段落上下文自愈原理</div>
-                    在长文档分块过程中，关键结论可能恰好落在切片边界（例如前一句在 chunk A，后半句在 chunk B）。当向量检索召回其中一个切片时，SuperMew 借助确定的分块命名规律（如 <code>chunk:doc:L3:0_0_1</code>），利用标量主键以 O(1) 复杂度直接拉取其前驱 <code>0_0_0</code> 与后继 <code>0_0_2</code>，无需重新进行高开销的向量或 BM25 检索，实现边界断句的自动缝合。
+                    在长文档分块过程中，关键结论可能恰好落在切片边界（例如前一句在 chunk A，后半句在 chunk B）。当向量检索召回其中一个切片时，RagTrail 借助确定的分块命名规律（如 <code>chunk:doc:L3:0_0_1</code>），利用标量主键以 O(1) 复杂度直接拉取其前驱 <code>0_0_0</code> 与后继 <code>0_0_2</code>，无需重新进行高开销的向量或 BM25 检索，实现边界断句的自动缝合。
                 </div>
                 <div class="code-block">
                     <div class="code-header">
@@ -1461,7 +1461,7 @@ import time
 from typing import Optional, Dict, Any
 import logging
 
-logger = logging.getLogger("supermew.chat.runtime")
+logger = logging.getLogger("ragtrail.chat.runtime")
 
 class ChatRequestContext:
     # 封装单次对话请求的完全独立生命周期，禁止跨请求共享状态

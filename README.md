@@ -1,8 +1,8 @@
-# SuperMew
+# RagTrail
 
 企业知识库智能问答系统，面向制度、流程、项目文档、产品手册和 FAQ 等内部资料。
 
-SuperMew 的核心不是“让模型凭记忆回答”，而是把一次问答拆成一条可观察、可追溯的证据链：先把资料解析成可检索的 Markdown，使用分层分块建立索引；用户提问后进行混合检索、上下文恢复和证据判断；最后生成带 `[1]`、`[2]` 引用的回答，并在前端展示本次运行的检索过程、证据片段和评分信息。
+RagTrail 的核心不是“让模型凭记忆回答”，而是把一次问答拆成一条可观察、可追溯的证据链：先把资料解析成可检索的 Markdown，使用分层分块建立索引；用户提问后进行混合检索、上下文恢复和证据判断；最后生成带 `[1]`、`[2]` 引用的回答，并在前端展示本次运行的检索过程、证据片段和评分信息。
 
 ## 你可以用它做什么
 
@@ -93,7 +93,7 @@ flowchart TB
 
 ## 前端能看到什么
 
-SuperMew 把 RAG 的中间过程作为产品界面的一部分，而不是只展示一个黑盒答案。
+RagTrail 把 RAG 的中间过程作为产品界面的一部分，而不是只展示一个黑盒答案。
 
 | 页面或区域 | 可见内容 |
 | --- | --- |
@@ -233,22 +233,22 @@ MINERU_URL=http://127.0.0.1:7860
 默认启动脚本会依次启动 Docker 依赖、Ollama、后端和前端：
 
 ```powershell
-pwsh -NoLogo -NoProfile -File .\scripts\supermew.ps1 -Action start
+pwsh -NoLogo -NoProfile -File .\scripts\ragtrail.ps1 -Action start
 ```
 
 如果使用远程 OpenAI-compatible 模型服务，不需要启动本地 Ollama：
 
 ```powershell
-pwsh -NoLogo -NoProfile -File .\scripts\supermew.ps1 -Action start -NoOllama
+pwsh -NoLogo -NoProfile -File .\scripts\ragtrail.ps1 -Action start -NoOllama
 ```
 
 常用操作：
 
 ```powershell
-pwsh -NoLogo -NoProfile -File .\scripts\supermew.ps1 -Action status
-pwsh -NoLogo -NoProfile -File .\scripts\supermew.ps1 -Action logs
-pwsh -NoLogo -NoProfile -File .\scripts\supermew.ps1 -Action restart
-pwsh -NoLogo -NoProfile -File .\scripts\supermew.ps1 -Action stop
+pwsh -NoLogo -NoProfile -File .\scripts\ragtrail.ps1 -Action status
+pwsh -NoLogo -NoProfile -File .\scripts\ragtrail.ps1 -Action logs
+pwsh -NoLogo -NoProfile -File .\scripts\ragtrail.ps1 -Action restart
+pwsh -NoLogo -NoProfile -File .\scripts\ragtrail.ps1 -Action stop
 ```
 
 启动后访问：
@@ -371,7 +371,7 @@ README 不宣称固定准确率。比较不同模型或不同检索策略时，�
 ## 项目结构
 
 ```text
-SuperMew/
+RagTrail/
 ├── backend/                 # FastAPI、认证、会话、RAG 与上传流程
 ├── frontend/                # Vue 3 + Vite + TypeScript 前端
 ├── database/                # 数据库模型、迁移或初始化逻辑

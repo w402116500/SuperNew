@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Header and Sidebar definitions for SuperMew Visualization (24-page enterprise full edition)."""
+"""Header and Sidebar definitions for RagTrail Visualization (24-page enterprise full edition)."""
 
 HEADER_HTML = """
     <header class="header">
@@ -13,7 +13,7 @@ HEADER_HTML = """
             </button>
             <div class="brand-icon">S</div>
             <div class="brand-text">
-                <h1>SuperMew <span class="header-tag">企业级受控 RAG 问答系统</span></h1>
+                <h1>RagTrail <span class="header-tag">企业级受控 RAG 问答系统</span></h1>
                 <p>L1/L2/L3 三级父子分块 · BGE-M3 + Milvus 2.5 原生 BM25 混合检索 · LangGraph 复杂规划 · 300 题评测闭环</p>
             </div>
         </div>

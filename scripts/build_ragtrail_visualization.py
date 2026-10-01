@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Generate supermew_visualization.html for SuperMew Enterprise RAG System."""
+"""Generate ragtrail_visualization.html for RagTrail Enterprise RAG System."""
 import os
 import sys
 

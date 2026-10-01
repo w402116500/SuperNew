@@ -1,7 +1,7 @@
 
         <!-- PAGE 1: 🌐 项目架构全景概览 -->
         <div id="page-overview" class="details-section active">
-            <div class="section-title">🌐 SuperMew 企业级受控 RAG 问答系统架构全景</div>
+            <div class="section-title">🌐 RagTrail 企业级受控 RAG 问答系统架构全景</div>
             <div class="section-desc">基于 LangGraph 受控状态机、三级父子分块（L1/L2/L3）、BGE-M3 + Milvus 2.5 原生 BM25 混合检索与 Qwen Reranker 精排的工业级全链路知识库问答系统</div>
 
             <div class="metric-grid">
@@ -28,8 +28,8 @@
             </div>
 
             <div class="notice-box">
-                <div class="notice-title">💡 为什么构建 SuperMew：解决传统 RAG 的核心致命伤</div>
-                传统 RAG 普遍存在“固定切分打碎表格与层级上下文”、“向量召回在专有名词与编号检索上命中率低”、“单 Agent 链式调用无法应对复杂多跳对比问题”以及“模型幻觉与不可信引用”四大难题。SuperMew 通过自建 <strong>L1/L2/L3 三级父子分块索引</strong>、<strong>BGE-M3 密集向量 + Milvus 2.5 原生 BM25 稀疏检索 RRF 双路融合</strong>、<strong>LangGraph Send 扇出并行多 Agent 规划</strong> 以及 <strong>全链路可复现 300 题评测闭环</strong>，打造真正面向生产的受控问答基座。
+                <div class="notice-title">💡 为什么构建 RagTrail：解决传统 RAG 的核心致命伤</div>
+                传统 RAG 普遍存在“固定切分打碎表格与层级上下文”、“向量召回在专有名词与编号检索上命中率低”、“单 Agent 链式调用无法应对复杂多跳对比问题”以及“模型幻觉与不可信引用”四大难题。RagTrail 通过自建 <strong>L1/L2/L3 三级父子分块索引</strong>、<strong>BGE-M3 密集向量 + Milvus 2.5 原生 BM25 稀疏检索 RRF 双路融合</strong>、<strong>LangGraph Send 扇出并行多 Agent 规划</strong> 以及 <strong>全链路可复现 300 题评测闭环</strong>，打造真正面向生产的受控问答基座。
             </div>
 
             <!-- 架构卡片 1: 智能受控问答与多 Agent 规划流水线 -->
@@ -129,7 +129,7 @@ flowchart TD
 
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">⚖️ SuperMew 核心技术决策与设计权衡矩阵</span>
+                    <span class="card-title">⚖️ RagTrail 核心技术决策与设计权衡矩阵</span>
                     <span class="pill pill-green">Production Architectural Trade-offs</span>
                 </div>
                 <table>
@@ -137,7 +137,7 @@ flowchart TD
                         <tr>
                             <th>核心维度</th>
                             <th>传统朴素 RAG 方案 (Baseline)</th>
-                            <th>SuperMew 企业级落地决策</th>
+                            <th>RagTrail 企业级落地决策</th>
                             <th>工程权衡与收益 (Trade-offs &amp; Benefits)</th>
                         </tr>
                     </thead>
@@ -183,7 +183,7 @@ flowchart TD
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">全链路 P99 时延与可用性控制目标</div>
-                    SuperMew 在生产部署环境中严格执行全链路 SLA 契约。针对分布式检索与推理各个核心组件，均定义了毫秒级超时熔断预算与非阻塞自愈机制，确保即使在单点故障或显卡突发 OOM 时，终端用户仍能获得优雅降级的安全回答。
+                    RagTrail 在生产部署环境中严格执行全链路 SLA 契约。针对分布式检索与推理各个核心组件，均定义了毫秒级超时熔断预算与非阻塞自愈机制，确保即使在单点故障或显卡突发 OOM 时，终端用户仍能获得优雅降级的安全回答。
                 </div>
                 <table>
                     <thead>
@@ -269,7 +269,7 @@ flowchart TD
         
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">📦 SuperMew 全栈生产技术选型与版本清单 (Technology Inventory)</span>
+                    <span class="card-title">📦 RagTrail 全栈生产技术选型与版本清单 (Technology Inventory)</span>
                     <span class="pill pill-blue">Dependencies</span>
                 </div>
                 <div class="notice-box">
@@ -470,7 +470,7 @@ sequenceDiagram
         
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">⚙️ SuperMew 生产环境硬件拓扑与性能压测基线</span>
+                    <span class="card-title">⚙️ RagTrail 生产环境硬件拓扑与性能压测基线</span>
                     <span class="pill pill-green">Production Baseline</span>
                 </div>
                 <table>
@@ -525,7 +525,7 @@ sequenceDiagram
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">企业级数据合规与多级权限穿透防御</div>
-                    SuperMew 在设计之初即贯彻严格的多租户安全模型（Tenant Isolation）。从 API 入口鉴权、向量标量表达式过滤、PostgreSQL 行级安全策略（RLS）到运行时内存隔离，全方位杜绝企业敏感资料的跨租户交叉泄露。
+                    RagTrail 在设计之初即贯彻严格的多租户安全模型（Tenant Isolation）。从 API 入口鉴权、向量标量表达式过滤、PostgreSQL 行级安全策略（RLS）到运行时内存隔离，全方位杜绝企业敏感资料的跨租户交叉泄露。
                 </div>
                 <div class="mermaid">
 graph TB

@@ -268,7 +268,7 @@ class MineruClient:
         base_url = self._settings.api_base_url.rstrip("/")
         headers = {"Authorization": f"Bearer {self._settings.api_key}", "Content-Type": "application/json"}
         # data_id 只允许 ASCII 字母、数字、下划线、短横线和句点；文件名可能包含中文或空格，不能直接拿来作为 data_id。
-        file_spec: dict[str, Any] = {"name": source.name, "data_id": f"supermew-{uuid4().hex}"}
+        file_spec: dict[str, Any] = {"name": source.name, "data_id": f"ragtrail-{uuid4().hex}"}
         if page_range and source.suffix.lower() == ".pdf":
             file_spec["page_ranges"] = page_range
         payload = {

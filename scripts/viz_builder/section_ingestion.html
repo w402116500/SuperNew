@@ -2,7 +2,7 @@
         <div id="page-code-map" class="details-section">
             <div class="section-header">
                 <h2>🗺️ 项目代码地图与边界职责架构</h2>
-                <p>SuperMew 严格遵循分层架构防污染原则（Layered Boundary Principle），确保各模块职责清晰、解耦彻底、具备工业级高可用与可测试性。</p>
+                <p>RagTrail 严格遵循分层架构防污染原则（Layered Boundary Principle），确保各模块职责清晰、解耦彻底、具备工业级高可用与可测试性。</p>
             </div>
 
             <div class="metric-grid">
@@ -30,7 +30,7 @@
 
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title">📐 SuperMew 端到端分层拓扑与跨层调用规约</span>
+                    <span class="card-title">📐 RagTrail 端到端分层拓扑与跨层调用规约</span>
                     <span class="pill pill-blue">Layered Architecture</span>
                 </div>
                 <div class="mermaid">
@@ -140,7 +140,7 @@ graph TB
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">严格禁止循环依赖与跨层反向调用</div>
-                    为保证企业级项目的可维护性与测试独立性，SuperMew 制定了严格的单向依赖拓扑规则。CI/CD 流水线中内置了静态 AST 依赖分析扫描（<code>lint_imports.py</code>），一旦发现跨层违规导入立即打断构建。
+                    为保证企业级项目的可维护性与测试独立性，RagTrail 制定了严格的单向依赖拓扑规则。CI/CD 流水线中内置了静态 AST 依赖分析扫描（<code>lint_imports.py</code>），一旦发现跨层违规导入立即打断构建。
                 </div>
                 <table>
                     <thead>
@@ -198,7 +198,7 @@ graph TB
         <div id="page-ingestion-lifecycle" class="details-section">
             <div class="section-header">
                 <h2>📥 多格式文档入库与原子暂存事务</h2>
-                <p>生产环境中最致命的隐患是入库解析中途崩溃导致残缺脏数据污染检索库。SuperMew 设计了五重安全隔离暂存机制，确保入库过程具备完整的 ACID 事务级安全。</p>
+                <p>生产环境中最致命的隐患是入库解析中途崩溃导致残缺脏数据污染检索库。RagTrail 设计了五重安全隔离暂存机制，确保入库过程具备完整的 ACID 事务级安全。</p>
             </div>
 
             <div class="metric-grid">
@@ -302,7 +302,7 @@ stateDiagram-v2
         <div id="page-mineru-pipeline" class="details-section">
             <div class="section-header">
                 <h2>📑 MinerU 多模态解析与跨页还原</h2>
-                <p>企业知识库最大的痛点是扫描件、双栏排版 PDF 以及跨页大表格。SuperMew 深度集成 MinerU 多模态解析流水线，实现复杂版面高保真还原。</p>
+                <p>企业知识库最大的痛点是扫描件、双栏排版 PDF 以及跨页大表格。RagTrail 深度集成 MinerU 多模态解析流水线，实现复杂版面高保真还原。</p>
             </div>
 
             <div class="metric-grid">
@@ -373,7 +373,7 @@ graph LR
                         <tr>
                             <th>对比维度</th>
                             <th>传统基于规则切分 (PyPDF / TextSplitter)</th>
-                            <th>SuperMew 集成 MinerU 多模态解析</th>
+                            <th>RagTrail 集成 MinerU 多模态解析</th>
                             <th>业务实测收益</th>
                         </tr>
                     </thead>
@@ -407,14 +407,14 @@ graph LR
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">复杂版面提取为何是 RAG 质量的真正命门？</div>
-                    在企业级知识库中，超过 70% 的核心专业知识深埋于非标准排版文档中：多栏排版错读、跨页大表表头丢失、模糊扫描件文字断裂。若入库阶段解析错乱，下游无论做多强的 Agent 和 Reranker 也只能“垃圾进，垃圾出”。SuperMew 依托 MinerU 深度定制了解析流水线，攻坚了以下五类极端场景：
+                    在企业级知识库中，超过 70% 的核心专业知识深埋于非标准排版文档中：多栏排版错读、跨页大表表头丢失、模糊扫描件文字断裂。若入库阶段解析错乱，下游无论做多强的 Agent 和 Reranker 也只能“垃圾进，垃圾出”。RagTrail 依托 MinerU 深度定制了解析流水线，攻坚了以下五类极端场景：
                 </div>
                 <table>
                     <thead>
                         <tr>
                             <th style="width: 18%;">极端版面场景</th>
                             <th style="width: 32%;">传统 PyPDF / 规则提取的致命缺陷</th>
-                            <th style="width: 32%;">MinerU + SuperMew 攻坚解决方案</th>
+                            <th style="width: 32%;">MinerU + RagTrail 攻坚解决方案</th>
                             <th style="width: 18%;">测试集评测收益</th>
                         </tr>
                     </thead>
@@ -492,7 +492,7 @@ graph LR
         <div id="page-hierarchical-chunking" class="details-section">
             <div class="section-header">
                 <h2>🧩 L1/L2/L3 三级父子分块与 AST 结构保护</h2>
-                <p>大模型检索中最经典的矛盾：<b>块切得太小，LLM 缺乏上下文无法推理；块切得太大，向量匹配度被稀释无法精准命中</b>。SuperMew 创新提出 L1/L2/L3 三级父子分块体系，实现“精细粒度检索，宏观语义推理”。</p>
+                <p>大模型检索中最经典的矛盾：<b>块切得太小，LLM 缺乏上下文无法推理；块切得太大，向量匹配度被稀释无法精准命中</b>。RagTrail 创新提出 L1/L2/L3 三级父子分块体系，实现“精细粒度检索，宏观语义推理”。</p>
             </div>
 
             <div class="metric-grid">
@@ -634,7 +634,7 @@ def split_sentences_with_spans(text: str) -> List[SentenceSpan]:
                             <td>中等长度表格与政策仍偶发越界，缺少微观关键词尖锐度。</td>
                         </tr>
                         <tr>
-                            <td><strong>SuperMew 三级父子分块 (最优)</strong></td>
+                            <td><strong>RagTrail 三级父子分块 (最优)</strong></td>
                             <td><strong>2400/400 + 1600/200 + 800/100</strong></td>
                             <td><strong>83.68%</strong></td>
                             <td><strong>69.33%</strong></td>
@@ -690,7 +690,7 @@ def split_sentences_with_spans(text: str) -> List[SentenceSpan]:
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">语义向量断点算法 (Semantic Window Breakpoint)</div>
-                    在段落长度超过 L3 上限（800 字符）且存在多意群时，SuperMew 启动滑动窗口语义切分。以连续 <code>W=3</code> 个句子构成左窗口与右窗口，计算两者的余弦相似度距离。当距离出现局部峰值（即语义剧烈转折）且超过整篇段落的 20th 百分位数时，标记为最佳切分断点。
+                    在段落长度超过 L3 上限（800 字符）且存在多意群时，RagTrail 启动滑动窗口语义切分。以连续 <code>W=3</code> 个句子构成左窗口与右窗口，计算两者的余弦相似度距离。当距离出现局部峰值（即语义剧烈转折）且超过整篇段落的 20th 百分位数时，标记为最佳切分断点。
                 </div>
                 
                 <div class="code-block">

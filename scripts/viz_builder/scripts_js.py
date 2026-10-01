@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-JavaScript interactive logic for SuperMew Visualization
+JavaScript interactive logic for RagTrail Visualization
 """
 
 JS_CONTENT = r"""

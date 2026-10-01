@@ -17,7 +17,7 @@
 
 ```powershell
 uv sync
-pwsh .\scripts\supermew.ps1 -Action start
+pwsh .\scripts\ragtrail.ps1 -Action start
 uv run python -m unittest discover -s tests
 Set-Location frontend; npm run build; npm test
 ```

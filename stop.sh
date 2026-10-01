@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 停止服务器上的 SuperMew 容器。
+# 停止服务器上的 RagTrail 容器。
 # 只停止，不删除容器、镜像或 volumes/postgres、volumes/redis。
 set -euo pipefail
 
@@ -37,7 +37,7 @@ for arg in "$@"; do
 done
 
 if [[ ! -f "$compose_file" ]]; then
-  echo "找不到 $compose_file，请在 /opt/supermew 下运行。" >&2
+  echo "找不到 $compose_file，请在 /opt/ragtrail 下运行。" >&2
   exit 1
 fi
 
@@ -46,7 +46,7 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "正在停止 SuperMew（只停止容器，保留数据卷）..."
+echo "正在停止 RagTrail（只停止容器，保留数据卷）..."
 docker compose -f "$compose_file" stop
 docker compose -f "$compose_file" ps
 echo "已停止。再次启动请运行: ./start.sh"

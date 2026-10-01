@@ -74,7 +74,7 @@ sequenceDiagram
                         <span class="pill pill-green">Mathematical Rigor</span>
                     </div>
                     <div style="font-size: 14px; line-height: 1.8; color: var(--text-color);">
-                        <p>传统打分加权（如 <code>0.7*dense + 0.3*sparse</code>）受两路检索得分量纲、分布方差不一致影响，极其不稳定。SuperMew 采用 <strong>RRF (倒数排名融合)</strong>，纯基于<strong>两路结果的相对位次</strong>进行稳定融合：</p>
+                        <p>传统打分加权（如 <code>0.7*dense + 0.3*sparse</code>）受两路检索得分量纲、分布方差不一致影响，极其不稳定。RagTrail 采用 <strong>RRF (倒数排名融合)</strong>，纯基于<strong>两路结果的相对位次</strong>进行稳定融合：</p>
                         <div style="background: #f1f5f9; padding: 12px; border-radius: 8px; margin: 10px 0; font-family: monospace; font-size: 15px; text-align: center; color: var(--primary-dark);">
                             RRF_Score(d) = Σ<sub>m ∈ {dense, bm25}</sub> [ 1 / (60 + rank<sub>m</sub>(d)) ]
                         </div>
@@ -288,7 +288,7 @@ flowchart TD
                         <span class="pill pill-amber">State Reducer Design</span>
                     </div>
                     <div style="font-size: 14px; line-height: 1.8; color: var(--text-color);">
-                        <p>传统多 Agent 框架常采用嵌套循环，无法并行且容易丢失局部状态。SuperMew 利用 LangGraph 核心特性：</p>
+                        <p>传统多 Agent 框架常采用嵌套循环，无法并行且容易丢失局部状态。RagTrail 利用 LangGraph 核心特性：</p>
                         <ol style="padding-left: 20px; font-size: 13px; color: var(--text-muted);">
                             <li><strong>条件边动态返回 Send 对象</strong>：<code>_fanout_sub_questions</code> 根据拆分出的子问题列表，动态返回 <code>[Send("rag_sub_agent", {"sub_question": q}) for q in sub_questions]</code>。</li>
                             <li><strong>并发非阻塞执行</strong>：LangGraph 引擎在同一 Step 内并发调度执行各个 <code>rag_sub_agent</code> 实例，网络 I/O 完美重叠，响应耗时从 3x 压缩至 1x。</li>
@@ -477,7 +477,7 @@ flowchart TD
                 </div>
                 <div class="callout callout-amber" style="margin-top:14px;">
                     <div class="callout-title">⚠️ 防死循环铁律：严格单次改写熔断</div>
-                    <p style="font-size:13px; margin:0;">业内很多 RAG 系统因允许多次反思循环，导致在遇到语料库中不存在的知识时陷入 3-5 次持续改写，造成请求超时（超 60 秒）并浪费巨额 Token。SuperMew 在图状态中硬编码 <code>state["rewrite_count"] &lt; 1</code>，改写一次后若仍未命中即直接走向澄清或优雅拒答，<strong>全链路耗时严格可控</strong>。</p>
+                    <p style="font-size:13px; margin:0;">业内很多 RAG 系统因允许多次反思循环，导致在遇到语料库中不存在的知识时陷入 3-5 次持续改写，造成请求超时（超 60 秒）并浪费巨额 Token。RagTrail 在图状态中硬编码 <code>state["rewrite_count"] &lt; 1</code>，改写一次后若仍未命中即直接走向澄清或优雅拒答，<strong>全链路耗时严格可控</strong>。</p>
                 </div>
             </div>
         
@@ -491,7 +491,7 @@ flowchart TD
                         <tr>
                             <th>对比维度</th>
                             <th>线性加权评分 (Linear Score Fusion)</th>
-                            <th>SuperMew RRF 倒数排名融合 (k=60)</th>
+                            <th>RagTrail RRF 倒数排名融合 (k=60)</th>
                             <th>工程设计优势</th>
                         </tr>
                     </thead>
@@ -556,11 +556,11 @@ flowchart TD
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">告别应用层维护 BM25，迈向 Milvus 2.5 原生全文检索时代</div>
-                    传统 RAG 方案通常在 Python 内存或 Elasticsearch 中额外维护 BM25 倒排索引，面临双写不一致、内存暴涨、跨网络合并繁琐等重大痛点。SuperMew 全面拥抱 Milvus 2.5，利用其内建的 <code>FunctionType.BM25</code>，在数据写入时由向量引擎自动分词并构建稀疏索引，极大简化了运维复杂度并提升了检索吞吐。
+                    传统 RAG 方案通常在 Python 内存或 Elasticsearch 中额外维护 BM25 倒排索引，面临双写不一致、内存暴涨、跨网络合并繁琐等重大痛点。RagTrail 全面拥抱 Milvus 2.5，利用其内建的 <code>FunctionType.BM25</code>，在数据写入时由向量引擎自动分词并构建稀疏索引，极大简化了运维复杂度并提升了检索吞吐。
                 </div>
                 <div class="code-block">
 <button class="copy-btn" onclick="copyCode(this)">复制</button>
-<pre><code class="language-python">def init_milvus_hybrid_collection(collection_name: str = "supermew_chunks"):
+<pre><code class="language-python">def init_milvus_hybrid_collection(collection_name: str = "ragtrail_chunks"):
     """在 Milvus 2.5 中定义支持 Dense 向量 + 原生 BM25 稀疏索引的统一集合。"""
     schema = CollectionSchema(fields=[
         FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, max_length=64, is_primary=True),
@@ -624,7 +624,7 @@ flowchart TD
                             <td>26ms</td>
                         </tr>
                         <tr>
-                            <td><strong>SuperMew 原生 RRF 排名融合 (k=60)</strong></td>
+                            <td><strong>RagTrail 原生 RRF 排名融合 (k=60)</strong></td>
                             <td><strong>85.93%</strong> <span class="text-green">(+9.51%)</span></td>
                             <td><strong>0.718</strong></td>
                             <td><strong>92.80%</strong> <span class="text-green">(无量纲抗噪最佳)</span></td>
@@ -730,7 +730,7 @@ flowchart TD
                 </div>
                 <div class="notice-box">
                     <div class="notice-title">为什么拒绝无限制循环改写？</div>
-                    在早期 RAG 原型中，检索不足便自动改写往往导致“死循环”。SuperMew 设定了严格的 <strong>单次改写硬上限（Max 1 Loop）</strong>，并在 Step-back 与 HyDE 之间执行互斥仲裁，杜绝无效漂移。
+                    在早期 RAG 原型中，检索不足便自动改写往往导致“死循环”。RagTrail 设定了严格的 <strong>单次改写硬上限（Max 1 Loop）</strong>，并在 Step-back 与 HyDE 之间执行互斥仲裁，杜绝无效漂移。
                 </div>
 
                 <table>

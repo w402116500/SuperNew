@@ -5,9 +5,9 @@ cd /d "%~dp0"
 
 where.exe pwsh.exe >nul 2>&1
 if %errorlevel% equ 0 (
-    pwsh.exe -NoLogo -NoProfile -File "%~dp0scripts\supermew.ps1" -Action stop %*
+    pwsh.exe -NoLogo -NoProfile -File "%~dp0scripts\ragtrail.ps1" -Action stop %*
 ) else (
-    powershell.exe -NoLogo -NoProfile -File "%~dp0scripts\supermew.ps1" -Action stop %*
+    powershell.exe -NoLogo -NoProfile -File "%~dp0scripts\ragtrail.ps1" -Action stop %*
 )
 
 set "EXIT_CODE=%errorlevel%"

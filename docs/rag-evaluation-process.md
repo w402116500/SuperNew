@@ -108,7 +108,7 @@ flowchart TD
 
 ## 3. 指标是怎么算的
 
-指标实现位于 [backend/evaluation/metrics.py](E:/mystudy/agent_study/SuperMew/backend/evaluation/metrics.py)。
+指标实现位于 [backend/evaluation/metrics.py](backend/evaluation/metrics.py)。
 
 ### 3.1 回答通过率：52.40%
 
