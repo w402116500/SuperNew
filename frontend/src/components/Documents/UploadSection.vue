@@ -35,12 +35,18 @@
       </span>
     </button>
 
-    <div v-if="documentStore.selectedFiles.length" class="selected-file">
+    <div
+      v-if="documentStore.selectedFiles.length"
+      :class="['selected-file', { 'selected-file-batch': documentStore.selectedFiles.length > 1 }]"
+    >
       <span class="selected-file-icon"><i class="fa-regular fa-file-lines"></i></span>
       <span class="selected-file-copy">
         <strong>{{ documentStore.selectedFiles.length === 1 ? documentStore.selectedFiles[0].name : `${documentStore.selectedFiles.length} 个文件` }}</strong>
         <small>{{ documentStore.selectedFiles.length === 1 ? formatFileSize(documentStore.selectedFiles[0].size) : '批量文件 · 等待上传' }}</small>
       </span>
+      <div v-if="documentStore.selectedFiles.length > 1" class="selected-file-names">
+        <span v-for="file in documentStore.selectedFiles" :key="file.name + file.size">{{ file.name }}</span>
+      </div>
       <button
         type="button"
         class="btn-primary"
@@ -53,7 +59,7 @@
     </div>
 
     <div
-      v-if="documentStore.uploadSteps.length"
+      v-if="!hasBatchJobs && documentStore.selectedFiles.length <= 1 && documentStore.uploadSteps.length"
       :class="['upload-progress', { collapsed: documentStore.uploadProgressCollapsed }]"
     >
       <button type="button" class="upload-progress-header" @click="onToggleCollapse">
@@ -88,11 +94,50 @@
       </div>
     </div>
 
-    <div v-if="documentStore.uploadJobs.length > 1" class="upload-batch-list">
-      <div v-for="job in documentStore.uploadJobs" :key="job.job_id" class="upload-batch-item">
-        <strong>{{ job.filename }}</strong>
-        <span>{{ job.status === 'completed' ? '已完成' : job.status === 'failed' ? '失败' : job.status === 'interrupted' ? '已中断' : '处理中' }}</span>
-        <small>{{ job.message }}</small>
+    <div
+      v-if="hasBatchJobs"
+      :class="['upload-progress', 'upload-progress-batch', { collapsed: documentStore.uploadProgressCollapsed }]"
+    >
+      <button type="button" class="upload-progress-header" @click="onToggleCollapse">
+        <span>
+          <strong>批量处理 {{ documentStore.uploadJobs.length }} 个文件</strong>
+          <small>{{ completedJobCount }} / {{ documentStore.uploadJobs.length }} 个文件完成 · {{ batchProgress }}%</small>
+        </span>
+        <span class="upload-toggle">
+          {{ documentStore.uploadProgressCollapsed ? '展开' : '收起' }}
+          <i :class="documentStore.uploadProgressCollapsed ? 'fa-solid fa-chevron-down' : 'fa-solid fa-chevron-up'"></i>
+        </span>
+      </button>
+
+      <div v-show="!documentStore.uploadProgressCollapsed" class="batch-overall-progress">
+        <div class="batch-overall-track">
+          <div class="batch-overall-fill" :style="{ width: batchProgress + '%' }"></div>
+        </div>
+        <span>{{ batchStatusLabel }}</span>
+      </div>
+
+      <div v-show="!documentStore.uploadProgressCollapsed" class="upload-batch-list">
+        <article
+          v-for="job in documentStore.uploadJobs"
+          :key="job.job_id"
+          :class="['upload-batch-item', 'upload-batch-item-' + job.status]"
+        >
+          <span class="batch-file-icon"><i :class="jobIcon(job.status)"></i></span>
+          <div class="batch-file-body">
+            <div class="batch-file-heading">
+              <strong :title="job.filename">{{ job.filename }}</strong>
+              <span class="batch-file-status">{{ jobStatusLabel(job.status) }}</span>
+            </div>
+            <div class="batch-file-meta">
+              <span>{{ jobStepLabel(job) }}</span>
+              <span>{{ jobProgress(job) }}%</span>
+            </div>
+            <div class="batch-file-track">
+              <div class="batch-file-fill" :style="{ width: jobProgress(job) + '%' }"></div>
+            </div>
+            <small v-if="job.status === 'failed' || job.status === 'interrupted'">{{ job.error || job.message }}</small>
+          </div>
+        </article>
       </div>
     </div>
 
@@ -111,6 +156,36 @@ import type { UploadStep } from '@/types/document';
 
 const documentStore = useDocumentStore();
 const fileInputRef = ref<HTMLInputElement | null>(null);
+
+const hasBatchJobs = computed(() => documentStore.uploadJobs.length > 1);
+
+const completedJobCount = computed(() =>
+  documentStore.uploadJobs.filter((job: any) => job.status === 'completed').length
+);
+
+const jobProgress = (job: any) => {
+  if (job.status === 'completed') return 100;
+  if (job.status === 'failed' || job.status === 'interrupted') {
+    const current = job.steps?.find((step: UploadStep) => step.key === job.current_step);
+    return Math.max(0, Math.min(100, Number(current?.percent || 0)));
+  }
+  const current = job.steps?.find((step: UploadStep) => step.status === 'running')
+    || job.steps?.find((step: UploadStep) => step.key === job.current_step);
+  return Math.max(0, Math.min(100, Number(current?.percent || 0)));
+};
+
+const batchProgress = computed(() => {
+  if (!documentStore.uploadJobs.length) return 0;
+  const total = documentStore.uploadJobs.reduce((sum: number, job: any) => sum + jobProgress(job), 0);
+  return Math.round(total / documentStore.uploadJobs.length);
+});
+
+const batchStatusLabel = computed(() => {
+  const failed = documentStore.uploadJobs.filter((job: any) => ['failed', 'interrupted'].includes(job.status)).length;
+  if (failed) return `${failed} 个文件需要处理`;
+  if (completedJobCount.value === documentStore.uploadJobs.length) return '全部文件处理完成';
+  return '文件正在依次处理';
+});
 
 onMounted(() => {
   documentStore.loadUploadJobs();
@@ -167,5 +242,29 @@ const stepIcon = (status: UploadStep['status']) => {
   if (status === 'running') return 'fa-solid fa-spinner fa-spin';
   if (status === 'failed') return 'fa-solid fa-xmark';
   return 'fa-solid fa-circle';
+};
+
+const jobStatusLabel = (status: string) => {
+  if (status === 'completed') return '已完成';
+  if (status === 'failed') return '失败';
+  if (status === 'interrupted') return '已中断';
+  if (status === 'pending') return '排队中';
+  return '处理中';
+};
+
+const jobStepLabel = (job: any) => {
+  if (job.status === 'completed') return '处理完成';
+  if (job.status === 'failed' || job.status === 'interrupted') return job.message || '处理未完成';
+  const current = job.steps?.find((step: UploadStep) => step.status === 'running')
+    || job.steps?.find((step: UploadStep) => step.key === job.current_step);
+  return current?.label || '等待处理';
+};
+
+const jobIcon = (status: string) => {
+  if (status === 'completed') return 'fa-solid fa-check';
+  if (status === 'failed') return 'fa-solid fa-xmark';
+  if (status === 'interrupted') return 'fa-solid fa-pause';
+  if (status === 'running') return 'fa-solid fa-spinner fa-spin';
+  return 'fa-solid fa-clock';
 };
 </script>
